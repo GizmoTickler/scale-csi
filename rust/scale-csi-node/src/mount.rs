@@ -63,6 +63,8 @@ pub struct Mounter {
     pub timeouts: Timeouts,
     /// `/proc/self/mounts`.
     pub proc_mounts: PathBuf,
+    /// `/proc/self/mountinfo`.
+    pub mountinfo: PathBuf,
 }
 
 const BLOCK_FILESYSTEMS: [&str; 4] = ["ext4", "ext3", "xfs", "btrfs"];
@@ -95,6 +97,17 @@ impl Mounter {
             runner: Arc::new(HostRunner),
             timeouts,
             proc_mounts: PathBuf::from("/proc/self/mounts"),
+            mountinfo: PathBuf::from("/proc/self/mountinfo"),
+        }
+    }
+
+    /// Every mount in this mount namespace (Go ListMountInfo); none where
+    /// there is no procfs.
+    pub fn list_mounts(&self) -> Result<Vec<MountInfo>> {
+        match std::fs::read_to_string(&self.mountinfo) {
+            Ok(text) => Ok(parse_mountinfo(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow!("failed to open mountinfo: {e}")),
         }
     }
 
@@ -464,6 +477,35 @@ pub fn parse_proc_mounts(text: &str, target: &str) -> Result<ProcMountEntry> {
     bail!("mountpoint {target} not found in proc mounts")
 }
 
+/// `/proc/self/mountinfo` lines: the mount point is field 5, the filesystem
+/// and source follow the `-` separator; options are the mount's then the
+/// superblock's. Malformed lines are skipped.
+pub fn parse_mountinfo(text: &str) -> Vec<MountInfo> {
+    let mut mounts = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(separator) = fields.iter().position(|f| *f == "-") else {
+            continue;
+        };
+        if fields.len() < 6 || separator + 3 >= fields.len() {
+            continue;
+        }
+        let options: Vec<String> = fields[5]
+            .split(',')
+            .chain(fields[separator + 3].split(','))
+            .map(str::to_string)
+            .collect();
+        mounts.push(MountInfo {
+            source: unescape_proc_field(fields[separator + 2]),
+            target: unescape_proc_field(fields[4]),
+            fs_type: fields[separator + 1].to_string(),
+            read_only: options.iter().any(|o| o == "ro"),
+            options,
+        });
+    }
+    mounts
+}
+
 pub fn is_nfs_mount_source(source: &str) -> bool {
     source.rfind(":/").is_some_and(|i| i > 0)
 }
@@ -518,6 +560,7 @@ mod tests {
                 runner,
                 timeouts: Timeouts::default(),
                 proc_mounts: file.path().to_path_buf(),
+                mountinfo: PathBuf::from("/nonexistent/mountinfo"),
             },
             file,
         )
@@ -679,5 +722,21 @@ mod tests {
         assert!(parse_proc_mounts(proc, "/nope").is_err());
         assert!(is_nfs_mount_source("192.0.2.1:/mnt/s") && is_nfs_mount_source("[2001:db8::1]:/s"));
         assert!(!is_nfs_mount_source("/dev/sda") && !is_nfs_mount_source(":/x"));
+    }
+
+    #[test]
+    fn mountinfo_lines() {
+        let text = "36 35 98:0 /mnt1 /var/lib/kubelet/pods/p/volumes/x\\040y rw,noatime master:1 - ext4 /dev/ublkb3 rw,errors=continue\n\
+                    37 35 0:5 / /dev/shm ro shared:2 - tmpfs tmpfs rw\n\
+                    garbage\n\
+                    38 35 0:6 / /x rw - nfs4\n";
+        let mounts = parse_mountinfo(text);
+        assert_eq!(mounts.len(), 2, "{mounts:?}");
+        assert_eq!(mounts[0].source, "/dev/ublkb3");
+        assert_eq!(mounts[0].target, "/var/lib/kubelet/pods/p/volumes/x y");
+        assert_eq!(mounts[0].fs_type, "ext4");
+        assert_eq!(mounts[0].options, ["rw", "noatime", "rw", "errors=continue"]);
+        assert!(!mounts[0].read_only);
+        assert!(mounts[1].read_only, "a read-only mount option counts");
     }
 }

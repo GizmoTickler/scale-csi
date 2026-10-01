@@ -21,6 +21,8 @@ use crate::ublk_client::{AttachRequest, Daemon, Device, DevicePath, Error};
 pub struct HostState {
     /// target -> (source, fs type, options)
     pub mounts: BTreeMap<String, (String, String, String)>,
+    /// Kept in step with `mounts` as /proc/self/mountinfo would be.
+    pub mountinfo: Option<PathBuf>,
     /// device -> filesystem
     pub filesystems: HashMap<String, String>,
     pub calls: Vec<String>,
@@ -39,13 +41,35 @@ fn output(code: i32, stdout: &str) -> Output {
     }
 }
 
+impl HostState {
+    fn sync_mountinfo(&self) {
+        let Some(path) = &self.mountinfo else { return };
+        let text: String = self
+            .mounts
+            .iter()
+            .enumerate()
+            .map(|(i, (target, (source, fs, options)))| {
+                format!(
+                    "{} 1 0:{i} / {} {options} - {fs} {source} rw\n",
+                    100 + i,
+                    target.replace(' ', "\\040")
+                )
+            })
+            .collect();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
 impl FakeHost {
     pub fn mount(&self, target: &str, source: &str, fs: &str) {
-        self.0
-            .lock()
-            .unwrap()
-            .mounts
-            .insert(target.into(), (source.into(), fs.into(), "rw".into()));
+        self.mount_with(target, source, fs, "rw");
+    }
+
+    pub fn mount_with(&self, target: &str, source: &str, fs: &str, options: &str) {
+        let mut host = self.0.lock().unwrap();
+        host.mounts
+            .insert(target.into(), (source.into(), fs.into(), options.into()));
+        host.sync_mountinfo();
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -99,6 +123,13 @@ impl Runner for FakeHost {
                 host.filesystems.insert((*device).into(), fs);
                 output(0, "")
             }
+            ("mount", ["-o", "remount,bind,ro", target]) => {
+                if let Some(entry) = host.mounts.get_mut(*target) {
+                    entry.2 = "ro".into();
+                }
+                host.sync_mountinfo();
+                output(0, "")
+            }
             ("mount", _) => {
                 let fs = args
                     .iter()
@@ -106,11 +137,24 @@ impl Runner for FakeHost {
                     .map(|i| args[i + 1].to_string())
                     .unwrap_or_default();
                 let (source, target) = (args[args.len() - 2], last);
-                host.mounts.insert(target.into(), (source.into(), fs, "rw".into()));
+                // A bind mount shows the bound mount's source and filesystem;
+                // a bound device node shows the device.
+                let bound = args
+                    .iter()
+                    .position(|a| *a == "-o")
+                    .is_some_and(|i| args[i + 1].split(',').any(|o| o == "bind"));
+                let entry = match host.mounts.get(source) {
+                    Some((src, fs, _)) if bound => (src.clone(), fs.clone(), "rw".to_string()),
+                    _ if bound => (source.to_string(), "devtmpfs".to_string(), "rw".to_string()),
+                    _ => (source.to_string(), fs, "rw".to_string()),
+                };
+                host.mounts.insert(target.into(), entry);
+                host.sync_mountinfo();
                 output(0, "")
             }
             ("umount", [target]) => {
                 host.mounts.remove(*target);
+                host.sync_mountinfo();
                 output(0, "")
             }
             _ => output(127, ""),
@@ -311,7 +355,9 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
         runner,
         timeouts: Timeouts::default(),
         proc_mounts: dir.path().join("no-proc-mounts"),
+        mountinfo: dir.path().join("mountinfo"),
     };
+    host.0.lock().unwrap().mountinfo = Some(dir.path().join("mountinfo"));
     state.ublk = daemon.clone();
     state.events = events.clone();
     state.host = Host {
