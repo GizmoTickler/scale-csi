@@ -212,3 +212,37 @@ func renderJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// The Rust agent records Kubernetes Events with the node ServiceAccount: it
+// creates them and patches a repeat's count, so the node ClusterRole must
+// grant both, and the pod must get its ServiceAccount token.
+func TestChartRustNodeMayRecordEvents(t *testing.T) {
+	rendered := helmTemplate(t, withArgs(rustNodeArgs, "--set", "node.implementation=rust")...)
+	manifests := decodeManifests(t, rendered)
+	role := findManifest(t, manifests, "ClusterRole", "-node")
+	granted := map[string]bool{}
+	rules, _ := role["rules"].([]any)
+	for _, r := range rules {
+		rule, ok := asManifest(r)
+		if !ok || !equalStrings(asStringSlice(rule["apiGroups"]), []string{""}) {
+			continue
+		}
+		for _, res := range asStringSlice(rule["resources"]) {
+			if res != "events" {
+				continue
+			}
+			for _, verb := range asStringSlice(rule["verbs"]) {
+				granted[verb] = true
+			}
+		}
+	}
+	for _, verb := range []string{"create", "patch"} {
+		if !granted[verb] {
+			t.Errorf("the node ClusterRole must grant %s on core events (granted: %v)", verb, granted)
+		}
+	}
+	daemonSet := findManifest(t, manifests, "DaemonSet", "-node")
+	if automount, set := podSpecOf(t, daemonSet, "node DaemonSet")["automountServiceAccountToken"]; set && automount != true {
+		t.Errorf("the node pod must mount its ServiceAccount token, got automountServiceAccountToken=%v", automount)
+	}
+}

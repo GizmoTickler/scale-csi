@@ -13,6 +13,8 @@ pub mod exec;
 pub mod health;
 pub mod iscsi;
 pub mod iscsi_stage;
+pub mod kube_api;
+pub mod kube_events;
 pub mod locks;
 pub mod metrics;
 pub mod mount;
@@ -39,6 +41,8 @@ mod iscsi_stage_tests;
 mod iscsi_testing;
 #[cfg(test)]
 mod iscsi_tests;
+#[cfg(test)]
+mod kube_events_tests;
 #[cfg(test)]
 mod nfs_tests;
 #[cfg(test)]

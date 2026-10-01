@@ -1,6 +1,7 @@
 //! Kubernetes events the node emits, with the Go node's reasons and the object
-//! it attaches them to (`pkg/driver/events.go`). The sink is a seam: the agent
-//! logs them until the API client lands, the tests record them.
+//! it attaches them to (`pkg/driver/events.go`). The sink is a seam: in a
+//! cluster the agent writes them to the API (`kube_events`), outside one it
+//! logs them, the tests record them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -19,12 +20,46 @@ const PVC_NAME: &str = "csi.storage.k8s.io/pvc/name";
 const PVC_NAMESPACE: &str = "csi.storage.k8s.io/pvc/namespace";
 const PV_NAME: &str = "csi.storage.k8s.io/pv/name";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectRef {
     Pod { namespace: String, name: String },
     Pvc { namespace: String, name: String },
     Pv { name: String },
     Node { name: String },
+}
+
+impl ObjectRef {
+    /// The involved object's kind, as Go's PodRef/PVCRef/PVRef/NodeRef set it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ObjectRef::Pod { .. } => "Pod",
+            ObjectRef::Pvc { .. } => "PersistentVolumeClaim",
+            ObjectRef::Pv { .. } => "PersistentVolume",
+            ObjectRef::Node { .. } => "Node",
+        }
+    }
+
+    /// Every object the node refers to is in the core group.
+    pub fn api_version(&self) -> &'static str {
+        "v1"
+    }
+
+    /// The object's namespace; empty for cluster-scoped objects.
+    pub fn namespace(&self) -> &str {
+        match self {
+            ObjectRef::Pod { namespace, .. } | ObjectRef::Pvc { namespace, .. } => namespace,
+            ObjectRef::Pv { .. } | ObjectRef::Node { .. } => "",
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            ObjectRef::Pod { name, .. }
+            | ObjectRef::Pvc { name, .. }
+            | ObjectRef::Pv { name }
+            | ObjectRef::Node { name } => name,
+        }
+    }
 }
 
 impl std::fmt::Display for ObjectRef {
