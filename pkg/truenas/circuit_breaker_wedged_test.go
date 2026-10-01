@@ -141,11 +141,11 @@ func TestClient_CanceledHalfOpenProbeRecordsNoOutcome(t *testing.T) {
 
 	// Fill the semaphore so the canceled call parks on the acquire, the earliest
 	// client-side-cancellation exit below the admission.
-	client.semaphore <- struct{}{}
+	require.NoError(t, client.semaphore.acquire(context.Background()))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := client.Call(ctx, "pool.dataset.query")
-	<-client.semaphore
+	client.semaphore.release()
 	require.ErrorIs(t, err, context.Canceled)
 
 	stats := client.circuitBreaker.Stats()
