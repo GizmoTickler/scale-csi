@@ -66,6 +66,14 @@ type startupAttachment struct {
 // four-worker bound. The TrueNAS client has ten request slots, so this leaves
 // capacity for live CSI calls while startup convergence runs in the background.
 func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
+	return d.reconcilePublishedAttachmentsFor(ctx, nil)
+}
+
+// reconcilePublishedAttachmentsFor is one pass over every attached volume
+// (targets nil), or over only the volumes whose dataset is in targets: a
+// re-run signal (a deferred fence, a revoked stale record) names the volumes
+// it concerns, and the rest of the cluster is left alone.
+func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets map[string]struct{}) error {
 	if d.config == nil || !d.config.Fencing.Enabled() {
 		return nil
 	}
@@ -167,20 +175,46 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 
 	volumeIDs := make([]string, 0, len(volumes))
 	for volumeID := range volumes {
+		if targets != nil {
+			datasetName, err := d.datasetForID(volumeID)
+			if err != nil {
+				continue
+			}
+			if _, targeted := targets[datasetName]; !targeted {
+				continue
+			}
+		}
 		volumeIDs = append(volumeIDs, volumeID)
 	}
 	sort.Strings(volumeIDs)
+	if targets != nil {
+		// Collection errors about volumes this pass does not touch are not
+		// this pass's to report; the next full pass still sees them.
+		collectionErrors = nil
+		attachmentCount = 0
+		for _, volumeID := range volumeIDs {
+			attachmentCount += len(volumes[volumeID].publications)
+		}
+	}
 	// (C11) Reset ONCE, before any worker can call RecordStartupFencingUnconverged,
 	// so a volume that converges on THIS pass drops out of the gauge instead of
 	// latching a stale 1 forever (mirrors ResetVolumeUsageMetrics). Must not run
 	// concurrently with the per-volume Set calls below, which is why it happens
-	// here rather than inside a worker. startupReconcileQuarantineCount is reset
-	// the same way and for the same reason: it must report ONLY this pass's
-	// quarantines to startStartupAttachmentReconcile, not an accumulation across
-	// passes (see quarantineStaleStartupFencingVolume and the field's doc comment
-	// in driver.go).
-	ResetStartupFencingUnconvergedVolumes()
-	d.startupReconcileQuarantineCount.Store(0)
+	// here rather than inside a worker. The quarantine set (startupQuarantined)
+	// is reset the same way and for the same reason, so it never carries a
+	// verdict a later pass over the same volume has replaced (see
+	// quarantineStaleStartupFencingVolume and the field's doc comment in
+	// driver.go).
+	//
+	// A targeted pass clears only its own volumes' quarantine verdicts: a
+	// volume it does not touch keeps its quarantine (and its gauge) until a
+	// pass that does re-runs it.
+	if targets == nil {
+		ResetStartupFencingUnconvergedVolumes()
+		d.resetStartupQuarantine()
+	} else {
+		d.clearStartupQuarantine(targets)
+	}
 	jobs := make(chan *startupFencingVolume)
 	results := make(chan error, len(volumeIDs))
 	workerCount := startupReconcileWorkers
@@ -212,7 +246,7 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 		return errors.Join(collectionErrors...)
 	}
 	klog.Infof("Startup fencing reconciliation converged: %d attached publication(s) across %d volume(s)",
-		attachmentCount, len(volumes))
+		attachmentCount, len(volumeIDs))
 	return nil
 }
 
@@ -272,14 +306,15 @@ func startupNodeIdentity(
 // different distinction: that carve-out is PERMANENT (no retry clears it,
 // there is nothing to fence), while this one is a DEFERRAL. This volume's own
 // publication record and backend fence are not written on this pass — the
-// caller returns here before ever reaching that code — so
-// startupReconcileQuarantineCount is incremented below: it is how
+// caller returns here before ever reaching that code — so the volume is
+// recorded in startupQuarantined below: it is how
 // startStartupAttachmentReconcile's strict branch knows to keep its reconcile
 // goroutine alive on an otherwise-nil-error pass instead of exiting, so that a
 // later requestStartupAttachmentReconcile signal — fired by
 // revokeStalePublicationRecord once the stale record named above is actually
-// revoked — has a live goroutine to wake and retry this volume.
-func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolume, staleNode string, cause error) error {
+// revoked — has a live goroutine to wake and retry this volume. That signal
+// names this volume's dataset, and the retry re-runs only it.
+func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolume, datasetName, staleNode string, cause error) error {
 	klog.Warningf("Startup fencing for volume %s is blocked by a stale publication record for node %s "+
 		"(no live VolumeAttachment); not holding cluster-wide readiness on it. This volume's own publication "+
 		"record and backend fence are deferred, not abandoned: convergence is retried automatically once the "+
@@ -289,8 +324,50 @@ func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolum
 		fmt.Sprintf("startup fencing quarantined (stale publication record for node %s, no live VolumeAttachment): %v",
 			staleNode, cause))
 	RecordStartupFencingUnconverged(volume.volumeID)
-	d.startupReconcileQuarantineCount.Add(1)
+	d.startupReconcileTargetsMu.Lock()
+	if d.startupQuarantined == nil {
+		d.startupQuarantined = make(map[string]string)
+	}
+	d.startupQuarantined[volume.volumeID] = datasetName
+	d.startupReconcileTargetsMu.Unlock()
 	return nil
+}
+
+// resetStartupQuarantine forgets every quarantine before a full pass.
+func (d *Driver) resetStartupQuarantine() {
+	d.startupReconcileTargetsMu.Lock()
+	d.startupQuarantined = nil
+	d.startupReconcileTargetsMu.Unlock()
+}
+
+// clearStartupQuarantine forgets the quarantines of the targeted datasets
+// before a targeted pass re-runs them.
+func (d *Driver) clearStartupQuarantine(targets map[string]struct{}) {
+	d.startupReconcileTargetsMu.Lock()
+	defer d.startupReconcileTargetsMu.Unlock()
+	for volumeID, datasetName := range d.startupQuarantined {
+		if _, targeted := targets[datasetName]; targeted {
+			delete(d.startupQuarantined, volumeID)
+			ClearStartupFencingUnconverged(volumeID)
+		}
+	}
+}
+
+// startupQuarantineCount is the number of volumes currently quarantined.
+func (d *Driver) startupQuarantineCount() int {
+	d.startupReconcileTargetsMu.Lock()
+	defer d.startupReconcileTargetsMu.Unlock()
+	return len(d.startupQuarantined)
+}
+
+// takeStartupReconcileTargets returns and forgets the datasets re-run signals
+// have named since the last call.
+func (d *Driver) takeStartupReconcileTargets() map[string]struct{} {
+	d.startupReconcileTargetsMu.Lock()
+	defer d.startupReconcileTargetsMu.Unlock()
+	pending := d.startupReconcilePending
+	d.startupReconcilePending = nil
+	return pending
 }
 
 func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *startupFencingVolume) error {
@@ -365,7 +442,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	// so an unchanged record is recognized and not rewritten.
 	stored := make(map[string]publicationRecord, len(volume.publications))
 	for _, publication := range volume.publications {
-		isDeferred, identityErr := d.validateOrDeferFencingIdentity(publication.identity, shareType)
+		isDeferred, identityErr := d.validateOrDeferFencingIdentity(datasetName, publication.identity, shareType)
 		if identityErr != nil {
 			return fmt.Errorf("cannot reconcile attached volume %s on node %s: %w",
 				volume.volumeID, publication.identity.Name, identityErr)
@@ -390,7 +467,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 			if staleNode, found, staleErr := d.confirmedStaleStartupRecord(ctx, volume.volumeID, compatibilityRecords, liveNodes); staleErr != nil {
 				return staleErr
 			} else if found {
-				return d.quarantineStaleStartupFencingVolume(volume, staleNode, compatibilityErr)
+				return d.quarantineStaleStartupFencingVolume(volume, datasetName, staleNode, compatibilityErr)
 			}
 			// Transient dual-VA states are normal during migration. Both modes retry
 			// this volume; strict readiness remains false, but the process stays up.
@@ -403,7 +480,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 			if staleNode, found, staleErr := d.confirmedStaleStartupRecord(ctx, volume.volumeID, compatibilityRecords, liveNodes); staleErr != nil {
 				return staleErr
 			} else if found {
-				return d.quarantineStaleStartupFencingVolume(volume, staleNode, compatibilityErr)
+				return d.quarantineStaleStartupFencingVolume(volume, datasetName, staleNode, compatibilityErr)
 			}
 			return fmt.Errorf("startup fencing for volume %s has not converged: %w", volume.volumeID, compatibilityErr)
 		}
@@ -649,7 +726,7 @@ func accessModeForPersistentVolume(pv *corev1.PersistentVolume) (csi.VolumeCapab
 	return csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false
 }
 
-func (d *Driver) runStartupAttachmentReconcile(parent context.Context) error {
+func (d *Driver) runStartupAttachmentReconcile(parent context.Context, targets map[string]struct{}) error {
 	timeout, err := d.config.Fencing.StartupReconcileTimeoutDuration()
 	if err != nil {
 		return fmt.Errorf("invalid fencing.startupReconcileTimeout: %w", err)
@@ -668,7 +745,7 @@ func (d *Driver) runStartupAttachmentReconcile(parent context.Context) error {
 	// must too. Internally gated on encryption.enabled and in-cluster client
 	// access, so it is a strict no-op for every deployment that does not encrypt.
 	d.reconcileEncryptedUnlocks(ctx)
-	return d.reconcilePublishedAttachments(ctx)
+	return d.reconcilePublishedAttachmentsFor(ctx, targets)
 }
 
 func (d *Driver) startStartupAttachmentReconcile() {
@@ -704,6 +781,11 @@ func (d *Driver) startStartupAttachmentReconcile() {
 		defer d.startupReconcileWg.Done()
 		backoff := startupReconcileInitialBackoff
 		waitForSignal := false
+		// full is true until a full pass has converged; after that, each
+		// signal re-runs only the volumes it named (targets), and a failed
+		// targeted pass retries those same volumes.
+		full := true
+		var targets map[string]struct{}
 		for {
 			if waitForSignal {
 				// A converged additive controller, or a strict controller with
@@ -721,11 +803,33 @@ func (d *Driver) startStartupAttachmentReconcile() {
 					return
 				}
 			}
-			err := d.runStartupAttachmentReconcile(ctx)
+			pending := d.takeStartupReconcileTargets()
+			if !full {
+				if targets == nil {
+					targets = make(map[string]struct{}, len(pending))
+				}
+				for datasetName := range pending {
+					targets[datasetName] = struct{}{}
+				}
+				if len(targets) == 0 {
+					// The volumes this signal named were already taken by an
+					// earlier pass; nothing is left to re-run.
+					targets = nil
+					waitForSignal = true
+					continue
+				}
+			}
+			var passTargets map[string]struct{}
+			if !full {
+				passTargets = targets
+			}
+			err := d.runStartupAttachmentReconcile(ctx, passTargets)
 			if err == nil {
+				full = false
+				targets = nil
 				if d.config.Fencing.Mode == FencingModeStrict {
 					d.ready.Store(true)
-					if d.startupReconcileQuarantineCount.Load() == 0 {
+					if d.startupQuarantineCount() == 0 {
 						// Every volume genuinely converged on this pass: nothing is
 						// deferred, so there is nothing left for this goroutine to
 						// retry. Exiting here (rather than idling forever) is the
@@ -733,10 +837,10 @@ func (d *Driver) startStartupAttachmentReconcile() {
 						// controller.
 						return
 					}
-					// (C11 fix) At least one volume was QUARANTINED rather than
-					// genuinely converged this pass (quarantineStaleStartupFencingVolume
-					// incremented startupReconcileQuarantineCount instead of joining
-					// this pass's errors). Readiness still latches true — that is the
+					// (C11 fix) At least one volume is QUARANTINED rather than
+					// genuinely converged (quarantineStaleStartupFencingVolume
+					// recorded it in startupQuarantined instead of joining a
+					// pass's errors). Readiness still latches true — that is the
 					// whole point of the carve-out, and must be preserved — but this
 					// goroutine must NOT exit: it is the only thing that will ever
 					// write the quarantined volume's own publication record and
@@ -782,7 +886,16 @@ func (d *Driver) startupAttachmentReconcileSignal() <-chan struct{} {
 	return d.startupReconcileSignal
 }
 
-func (d *Driver) requestStartupAttachmentReconcile() {
+// requestStartupAttachmentReconcile asks the startup reconcile loop to re-run
+// the volume whose dataset is datasetName, and only that volume. The request
+// is dropped harmlessly if the loop has already exited.
+func (d *Driver) requestStartupAttachmentReconcile(datasetName string) {
+	d.startupReconcileTargetsMu.Lock()
+	if d.startupReconcilePending == nil {
+		d.startupReconcilePending = make(map[string]struct{})
+	}
+	d.startupReconcilePending[datasetName] = struct{}{}
+	d.startupReconcileTargetsMu.Unlock()
 	d.startupAttachmentReconcileSignal()
 	select {
 	case d.startupReconcileSignal <- struct{}{}:

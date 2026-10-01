@@ -428,7 +428,8 @@ func (d *Driver) revokeStalePublicationRecord(
 	// startupAttachmentReconcileSignal, not polling. Signal it unconditionally:
 	// the write is dropped harmlessly if that goroutine already exited (fully
 	// converged, nothing quarantined) and merely schedules one extra, cheap pass
-	// if this particular revoke did not concern a quarantined volume.
-	d.requestStartupAttachmentReconcile()
+	// if this particular revoke did not concern a quarantined volume. The
+	// signal names this volume, and only this volume is re-run.
+	d.requestStartupAttachmentReconcile(datasetName)
 	return true, nil
 }

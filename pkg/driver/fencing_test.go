@@ -3300,7 +3300,7 @@ func TestBackgroundStartupAdditiveWaitsForDeferredTrigger(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, records, "new attachments are reconciled only after a real deferral signals work")
 
-	d.recordFencingDeferred(NodeIdentity{Name: "worker-later"}, ShareTypeNFS, "missing_identity", "test trigger")
+	d.recordFencingDeferred(dataset.Name, NodeIdentity{Name: "worker-later"}, ShareTypeNFS, "missing_identity", "test trigger")
 
 	require.Eventually(t, func() bool {
 		fresh, getErr := client.DatasetGet(ctx, dataset.Name)

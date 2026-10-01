@@ -402,9 +402,11 @@ func validateIdentityForProtocol(identity NodeIdentity, shareType ShareType) err
 	return nil
 }
 
-func (d *Driver) recordFencingDeferred(identity NodeIdentity, shareType ShareType, reason, detail string) {
+// recordFencingDeferred counts a deferral and asks the startup reconcile loop
+// to re-run datasetName, the volume whose fence was deferred, once more.
+func (d *Driver) recordFencingDeferred(datasetName string, identity NodeIdentity, shareType ShareType, reason, detail string) {
 	RecordFencingDeferred(reason, string(shareType))
-	d.requestStartupAttachmentReconcile()
+	d.requestStartupAttachmentReconcile(datasetName)
 	key := reason + "\x00" + string(shareType) + "\x00" + identity.Name
 	if _, loaded := d.fencingDeferredLogs.LoadOrStore(key, struct{}{}); loaded {
 		return
@@ -433,7 +435,7 @@ func rejectReservedSentinelIdentity(identity NodeIdentity, shareType ShareType) 
 // static allowlist. The publish still writes a durable ownership record so a
 // second legacy node cannot bypass SINGLE_NODE semantics, but skips only that
 // node's backend grant. Strict mode preserves the fail-closed contract.
-func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType ShareType) (bool, error) {
+func (d *Driver) validateOrDeferFencingIdentity(datasetName string, identity NodeIdentity, shareType ShareType) (bool, error) {
 	if err := rejectReservedSentinelIdentity(identity, shareType); err != nil {
 		// F2: a node that physically reported the reserved deny-all sentinel as its
 		// own initiator IQN is NOT a temporarily-missing-IQN rolling-upgrade node.
@@ -449,7 +451,7 @@ func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType
 	}
 	if err := validateIdentityForProtocol(identity, shareType); err != nil {
 		if d.config.Fencing.Mode == FencingModeAdditive {
-			d.recordFencingDeferred(identity, shareType, "missing_identity", err.Error())
+			d.recordFencingDeferred(datasetName, identity, shareType, "missing_identity", err.Error())
 			return true, nil
 		}
 		return false, err
@@ -469,7 +471,7 @@ func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType
 	err := status.Errorf(codes.FailedPrecondition,
 		"node %s has no IP inside nfs.shareAllowedNetworks", identity.Name)
 	if d.config.Fencing.Mode == FencingModeAdditive {
-		d.recordFencingDeferred(identity, shareType, "outside_allowed_network", err.Error())
+		d.recordFencingDeferred(datasetName, identity, shareType, "outside_allowed_network", err.Error())
 		return true, nil
 	}
 	return false, err
@@ -1053,7 +1055,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	deferred := false
 	if backendEnforcement {
 		var err error
-		deferred, err = d.validateOrDeferFencingIdentity(identity, shareType)
+		deferred, err = d.validateOrDeferFencingIdentity(datasetName, identity, shareType)
 		if err != nil {
 			return err
 		}
@@ -1228,7 +1230,7 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 	protectedNVMeNQNs := make([]string, 0)
 	hasDeferredActiveISCSI := false
 	for _, identity := range active {
-		deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
+		deferred, err := d.validateOrDeferFencingIdentity(datasetName, identity, shareType)
 		if err != nil {
 			return fmt.Errorf("publication record for node %s is not enforceable yet: %w", identity.Name, err)
 		}
@@ -1339,7 +1341,7 @@ func (d *Driver) applyNFSFence(
 		}
 		if !accepted {
 			if d.config.Fencing.Mode == FencingModeAdditive {
-				d.recordFencingDeferred(identity, ShareTypeNFS, "outside_allowed_network",
+				d.recordFencingDeferred(datasetName, identity, ShareTypeNFS, "outside_allowed_network",
 					"no node IP is inside nfs.shareAllowedNetworks")
 				return fmt.Errorf("%w: node %s has no IP inside nfs.shareAllowedNetworks", errFenceDeferred, identity.Name)
 			}

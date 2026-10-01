@@ -6,12 +6,16 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
@@ -203,5 +207,129 @@ func TestStartupQuarantineIsConfirmedAgainstAFullListing(t *testing.T) {
 	err = d.reconcilePublishedAttachments(ctx)
 	require.Error(t, err, "a conflict with a live attachment is not a stale record")
 	assert.Contains(t, err.Error(), "has not converged")
-	assert.Zero(t, d.startupReconcileQuarantineCount.Load())
+	assert.Zero(t, d.startupQuarantineCount())
+}
+
+// vaGetsByName counts VolumeAttachment GETs per name: the per-volume refresh
+// is the only caller, so it tells which volumes a pass re-ran.
+type vaGetsByName struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func countVAGets(kube *kubernetesfake.Clientset) *vaGetsByName {
+	gets := &vaGetsByName{counts: map[string]int{}}
+	kube.PrependReactor("get", "volumeattachments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		gets.mu.Lock()
+		gets.counts[action.(clienttesting.GetAction).GetName()]++
+		gets.mu.Unlock()
+		return false, nil, nil
+	})
+	return gets
+}
+
+func (g *vaGetsByName) get(name string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.counts[name]
+}
+
+// A revoke that unblocks one quarantined volume re-runs that volume only: the
+// others, converged or still quarantined, are not reconciled again, and a
+// volume still quarantined keeps its quarantine and keeps the loop alive.
+func TestStartupRevokeSignalReRunsOnlyItsVolume(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := truenas.NewMockClient()
+	var objects []runtime.Object
+	for _, volumeID := range []string{"q1", "q2", "settled"} {
+		objects, _ = staleRecordVolume(t, objects, volumeID)
+	}
+	kube := kubernetesfake.NewSimpleClientset(objects...)
+	gets := countVAGets(kube)
+	d := newStaleRecordDriver(client, kube, record.NewFakeRecorder(64))
+	d.eventRecorder.dynamicClient = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			volumeSnapshotContentGVR: "VolumeSnapshotContentList",
+			volumeSnapshotGVR:        "VolumeSnapshotList",
+		})
+	staleRecordNFSVolume(t, client, "q1", "worker-gone-1")
+	staleRecordNFSVolume(t, client, "q2", "worker-gone-2")
+	startupNFSVolumeShare(t, client, "settled")
+
+	d.ready.Store(false)
+	d.startStartupAttachmentReconcile()
+	t.Cleanup(d.stopStartupAttachmentReconcile)
+	require.Eventually(t, d.ready.Load, 3*time.Second, 10*time.Millisecond)
+	require.Equal(t, 2, d.startupQuarantineCount())
+	require.Equal(t, 1, gets.get("va-settled"))
+
+	revoke := func(volumeID, staleNode string) {
+		dataset, err := client.DatasetGet(ctx, "pool/parent/"+volumeID)
+		require.NoError(t, err)
+		key := publicationPropertyKey(staleNode)
+		revoked, err := d.revokeStalePublicationRecord(ctx, dataset.Name, volumeID, key, mustStoredRecords(t, d, dataset)[key], 1)
+		require.NoError(t, err)
+		require.True(t, revoked)
+	}
+	converged := func(volumeID string) bool {
+		dataset, err := client.DatasetGet(ctx, "pool/parent/"+volumeID)
+		if err != nil {
+			return false
+		}
+		records, err := storedPublicationRecords(d, dataset)
+		_, ok := records[publicationPropertyKey("worker-"+volumeID)]
+		return err == nil && ok
+	}
+
+	revoke("q1", "worker-gone-1")
+	require.Eventually(t, func() bool { return converged("q1") }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return d.startupQuarantineCount() == 1 }, 3*time.Second, 10*time.Millisecond)
+	assert.Equal(t, 1, gets.get("va-settled"), "a converged volume is not re-run by another volume's signal")
+	assert.Equal(t, 1, gets.get("va-q2"), "a quarantined volume is not re-run by another volume's signal")
+	assert.Equal(t, float64(1), testutil.ToFloat64(startupFencingUnconvergedVolumes.WithLabelValues("q2")),
+		"q2 is still quarantined")
+	assert.False(t, converged("q2"))
+
+	revoke("q2", "worker-gone-2")
+	require.Eventually(t, func() bool { return converged("q2") }, 3*time.Second, 10*time.Millisecond,
+		"the loop stayed alive for the volume still quarantined")
+	require.Eventually(t, func() bool { return d.startupQuarantineCount() == 0 }, 3*time.Second, 10*time.Millisecond)
+	assert.Equal(t, float64(0), testutil.ToFloat64(startupFencingUnconvergedVolumes.WithLabelValues("q2")))
+	assert.Equal(t, 1, gets.get("va-settled"))
+	assert.Equal(t, 2, gets.get("va-q1"))
+}
+
+// startupNFSVolumeShare provisions an NFS-shared dataset with no records.
+func startupNFSVolumeShare(t *testing.T, client *truenas.MockClient, volumeID string) {
+	t.Helper()
+	dataset, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: "pool/parent/" + volumeID, Type: "FILESYSTEM",
+	})
+	require.NoError(t, err)
+	share, err := client.NFSShareCreate(context.Background(), &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(context.Background(), dataset.Name, PropNFSShareID, fmt.Sprint(share.ID)))
+}
+
+// In additive mode a publish whose fence is deferred re-runs that volume in
+// the background, not the whole cluster.
+func TestStartupDeferralSignalReRunsOnlyItsVolume(t *testing.T) {
+	client := truenas.NewMockClient()
+	kube := kubernetesfake.NewSimpleClientset(startupNFSVolumes(t, client, 2)...)
+	gets := countVAGets(kube)
+	d := newStaleRecordDriver(client, kube, record.NewFakeRecorder(64))
+	d.config.Fencing.Mode = FencingModeAdditive
+	d.startStartupAttachmentReconcile()
+	t.Cleanup(d.stopStartupAttachmentReconcile)
+	require.Eventually(t, func() bool { return gets.get("va-restart-0") == 1 && gets.get("va-restart-1") == 1 },
+		3*time.Second, 10*time.Millisecond, "the first full pass")
+
+	d.recordFencingDeferred("pool/parent/restart-1", NodeIdentity{Name: "worker-restart-1"}, ShareTypeNFS, "missing_identity", "test trigger")
+	require.Eventually(t, func() bool { return gets.get("va-restart-1") == 2 }, 3*time.Second, 10*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	assert.Equal(t, 1, gets.get("va-restart-0"), "the other volume is not re-run")
+	assert.Equal(t, 2, gets.get("va-restart-1"))
 }
