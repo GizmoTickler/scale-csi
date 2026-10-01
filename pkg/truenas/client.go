@@ -788,6 +788,14 @@ type Client struct {
 	serviceReloadResolved  atomic.Bool
 	serviceReloadUseLegacy atomic.Bool
 
+	// nvmet.host_subsys.query and nvmet.port_subsys.query are asked to filter
+	// by subsys.id server-side. If a backend ever rejects that filter while
+	// the unfiltered query works, remember it so later calls go straight to
+	// the whole-table read instead of paying a rejected call first. Results
+	// are always re-filtered client-side either way.
+	hostSubsysServerFilterRejected atomic.Bool
+	portSubsysServerFilterRejected atomic.Bool
+
 	dispatcher *jobDispatcher
 
 	// A successful subscription closes the current pulse and installs a new

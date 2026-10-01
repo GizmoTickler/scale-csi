@@ -2,10 +2,12 @@ package truenas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"k8s.io/klog/v2"
 )
@@ -223,11 +225,47 @@ func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
 	return hs, nil
 }
 
+// subsysIDFilter is the server-side filter both association listings send.
+// NVMeoFHostSubsysFind already sends the same nested "subsys.id" filter.
+func subsysIDFilter(subsysID int) [][]interface{} {
+	return [][]interface{}{{"subsys.id", "=", subsysID}}
+}
+
+// queryBySubsystem runs an nvmet association query filtered to one subsystem
+// on the server, so the reply no longer grows with every volume on the NAS.
+// The filter is an optimisation only: callers still re-filter the rows
+// client-side, so a backend that ignores it returns the right answer. A
+// backend that REJECTS it (an API error, not a transport failure) is retried
+// once unfiltered, and if that works the rejection is remembered so later
+// calls skip the filtered attempt.
+func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejected *atomic.Bool) (interface{}, error) {
+	if !rejected.Load() {
+		result, err := c.Call(ctx, method, subsysIDFilter(subsysID), map[string]interface{}{})
+		if err == nil {
+			return result, nil
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			return nil, err
+		}
+		result, unfilteredErr := c.Call(ctx, method, []interface{}{}, map[string]interface{}{})
+		if unfilteredErr != nil {
+			return nil, unfilteredErr
+		}
+		if !rejected.Swap(true) {
+			klog.Warningf("%s rejected a subsys.id filter (%v); listing the whole table and filtering client-side from now on", method, err)
+		}
+		return result, nil
+	}
+	return c.Call(ctx, method, []interface{}{}, map[string]interface{}{})
+}
+
 // NVMeoFHostSubsysListBySubsystem lists the exact allowed-host associations
-// for one subsystem. TrueNAS does not consistently support nested-field
-// filtering across releases, so filtering is performed client-side.
+// for one subsystem. The query is filtered by subsys.id on the server; TrueNAS
+// has not consistently honored nested-field filters across releases, so the
+// rows are also filtered client-side and that check is authoritative.
 func (c *Client) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error) {
-	result, err := c.Call(ctx, "nvmet.host_subsys.query", []interface{}{}, map[string]interface{}{})
+	result, err := c.queryBySubsystem(ctx, "nvmet.host_subsys.query", subsysID, &c.hostSubsysServerFilterRejected)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list host_subsys associations: %w", err)
 	}
@@ -829,8 +867,6 @@ func parseNVMeoFPortSubsys(data interface{}) (*NVMeoFPortSubsys, error) {
 }
 
 // NVMeoFPortSubsysFindBySubsystem checks if a subsystem is already associated with any port.
-// Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
-// so we fetch all associations and filter client-side.
 func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
 	assocs, err := c.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
 	if err != nil {
@@ -847,27 +883,30 @@ type NVMeoFPortSubsys struct {
 }
 
 // NVMeoFPortSubsysListBySubsystem returns all port-subsystem associations for a given subsystem.
-// Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
-// so we fetch all associations and filter client-side.
+// The query is filtered by subsys.id on the server (see queryBySubsystem); the
+// rows are re-filtered client-side, which stays authoritative because older
+// releases did not honor nested-field filters.
 func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
-	assocs, err := c.NVMeoFPortSubsysList(ctx)
+	result, err := c.queryBySubsystem(ctx, "nvmet.port_subsys.query", subsysID, &c.portSubsysServerFilterRejected)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query port-subsystem associations: %w", err)
 	}
-	return NVMeoFPortSubsysFilterBySubsystem(assocs, subsysID), nil
+	return NVMeoFPortSubsysFilterBySubsystem(parseNVMeoFPortSubsysList(result), subsysID), nil
 }
 
 // NVMeoFPortSubsysList returns all port-subsystem associations.
 func (c *Client) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys, error) {
-	// Fetch all port-subsystem associations (no filter - API doesn't support nested field filtering)
 	result, err := c.Call(ctx, "nvmet.port_subsys.query", []interface{}{}, map[string]interface{}{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query port-subsystem associations: %w", err)
 	}
+	return parseNVMeoFPortSubsysList(result), nil
+}
 
+func parseNVMeoFPortSubsysList(result interface{}) []*NVMeoFPortSubsys {
 	items, ok := result.([]interface{})
 	if !ok {
-		return nil, nil
+		return nil
 	}
 
 	assocs := make([]*NVMeoFPortSubsys, 0, len(items))
@@ -879,7 +918,7 @@ func (c *Client) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys,
 		assocs = append(assocs, assoc)
 	}
 
-	return assocs, nil
+	return assocs
 }
 
 // NVMeoFPortSubsysFilterBySubsystem filters a pre-fetched association table.
