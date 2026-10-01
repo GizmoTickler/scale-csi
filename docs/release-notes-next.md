@@ -1,4 +1,35 @@
-# Release notes — v1.14.0 (next)
+# Release notes — v1.15.0 (next)
+
+## v1.15.0 — the Rust node agent, opt-in
+
+The image now carries a second node plugin, `scale-csi-node`, written in Rust.
+It serves NVMe-oF, both the kernel initiator and the userspace data path
+(nvmeublkd), and nothing else yet. The Go node plugin stays the default, and the
+controller is unchanged.
+
+- **Turning it on.** `node.implementation: rust` runs it on every node. To try
+  it on a few nodes first, `node.rustNodes: [node-a]` runs it in a second
+  DaemonSet, `<fullname>-node-rust`, on just those nodes, and the Go DaemonSet
+  avoids them. nvmeublkd keeps running on every node either way.
+- **What it does not serve yet.** The chart refuses either setting while NFS or
+  iSCSI is enabled, or NVMe-oF is not. The agent itself refuses to start with a
+  configuration that enables a protocol it does not serve.
+- **Interchangeable with the Go plugin on a live node.** It computes the same
+  node ID, reads and writes the same session registry, ublk markers and staging
+  layout, and takes the same flags and configuration. A volume staged by one is
+  published, expanded, unstaged or collected by the other, and switching back is
+  a DaemonSet change with no volume work.
+- **Behaviour.** Volume RPCs run to completion even when the caller's deadline
+  passes, so kubelet's retry finds the work done. Session GC keeps the Go
+  plugin's grace period and veto rules. NVMe controller tunables
+  (`fast_io_fail_tmo`) converge as in the Go plugin. A raw-block publish replay
+  after a restart is matched by device number.
+
+### Upgrade and rollback
+
+Nothing changes unless you set `node.implementation` or `node.rustNodes`. To go
+back from the Rust agent, remove the setting: the Go DaemonSet takes those nodes
+over and adopts what the agent staged.
 
 ## v1.14.0 — fewer TrueNAS writes, faster deletes, attaches first under load
 
