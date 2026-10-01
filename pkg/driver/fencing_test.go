@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1636,7 +1637,17 @@ func TestStartupReconcileBackfillsAttachedNFSNodeAndEnforcesFence(t *testing.T) 
 	assert.True(t, share.Enabled)
 }
 
+// The initial snapshot only schedules work: the per-volume pass re-reads each
+// VolumeAttachment by name under the lock, and one that is gone or being
+// deleted by then is never granted.
 func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing.T) {
+	for _, change := range []string{"deleted", "being deleted", "no longer attached"} {
+		t.Run(change, func(t *testing.T) { testStartupReconcileIgnoresAttachmentChangedAfterSnapshot(t, change) })
+	}
+}
+
+func testStartupReconcileIgnoresAttachmentChangedAfterSnapshot(t *testing.T, change string) {
+	t.Helper()
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/stale-startup", Type: "FILESYSTEM"})
@@ -1665,12 +1676,18 @@ func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing
 		Drivers: []storagev1.CSINodeDriver{{Name: "csi.scale.io", NodeID: nodeID}},
 	}}
 	kube := kubernetesfake.NewSimpleClientset(pv, attachment, csiNode)
-	var attachmentLists atomic.Int32
-	kube.PrependReactor("list", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
-		if attachmentLists.Add(1) == 1 {
-			return false, nil, nil
+	kube.PrependReactor("get", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
+		changed := attachment.DeepCopy()
+		switch change {
+		case "deleted":
+			return true, nil, apierrors.NewNotFound(storagev1.Resource("volumeattachments"), attachment.Name)
+		case "being deleted":
+			now := metav1.Now()
+			changed.DeletionTimestamp = &now
+		case "no longer attached":
+			changed.Status.Attached = false
 		}
-		return true, &storagev1.VolumeAttachmentList{}, nil
+		return true, changed, nil
 	})
 	d := &Driver{
 		name: "csi.scale.io",

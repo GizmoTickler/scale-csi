@@ -12,6 +12,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
@@ -42,6 +43,21 @@ type startupFencingVolume struct {
 	// pv carries one PersistentVolume referencing this volume so per-volume
 	// operator-attention conditions can be surfaced as Events, not just klog.
 	pv *corev1.PersistentVolume
+	// attachments is every VolumeAttachment of this volume in the pass's
+	// snapshot, Attached or not, with the publication it would converge. The
+	// per-volume refresh re-reads exactly these by name under the lock.
+	attachments []startupAttachment
+}
+
+// startupAttachment is one VolumeAttachment from the snapshot. VolumeAttachment
+// names are derived from (attacher, PV, node) and their spec is immutable, so
+// a GET by name under the volume lock answers "is this attachment still there,
+// still Attached, not being deleted" without listing the cluster.
+type startupAttachment struct {
+	name        string
+	nodeName    string
+	pvName      string
+	publication startupPublication
 }
 
 // reconcilePublishedAttachments is the rolling-upgrade bridge from static
@@ -118,6 +134,12 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 
 		identity := startupNodeIdentity(d.name, attachment.Spec.NodeName, csiNodes[attachment.Spec.NodeName], nodes[attachment.Spec.NodeName])
 		mode, readonly := accessModeForPersistentVolume(pv)
+		publication := startupPublication{
+			identity: identity,
+			nodeID:   csiNodeID(d.name, csiNodes[attachment.Spec.NodeName]),
+			mode:     mode,
+			readonly: readonly,
+		}
 		volumeID := pv.Spec.CSI.VolumeHandle
 		volume := volumes[volumeID]
 		if volume == nil {
@@ -132,16 +154,14 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 			volume.claimedNodes = make(map[string]struct{})
 		}
 		volume.claimedNodes[attachment.Spec.NodeName] = struct{}{}
+		volume.attachments = append(volume.attachments, startupAttachment{
+			name: attachment.Name, nodeName: attachment.Spec.NodeName, pvName: pvName, publication: publication,
+		})
 		if !attachedNow {
 			// A live claim, but nothing to converge a fence for on this pass.
 			continue
 		}
-		volume.publications = append(volume.publications, startupPublication{
-			identity: identity,
-			nodeID:   csiNodeID(d.name, csiNodes[attachment.Spec.NodeName]),
-			mode:     mode,
-			readonly: readonly,
-		})
+		volume.publications = append(volume.publications, publication)
 		attachmentCount++
 	}
 
@@ -286,8 +306,11 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	// The initial list only schedules work. Rebuild the current attachment set
 	// after taking the same per-volume lock as ControllerPublish/Unpublish. A VA
 	// with a deletion timestamp is already in the unpublish path and must never be
-	// re-granted from the stale startup snapshot.
-	currentVolume, err := d.currentStartupFencingVolume(ctx, volume.volumeID)
+	// re-granted from the stale startup snapshot. The snapshot's own attachments
+	// are re-read by name (one GET each) instead of listing every PV, VA,
+	// CSINode and Node in the cluster per volume; a VA created after the
+	// snapshot is published by its own ControllerPublishVolume.
+	currentVolume, err := d.refreshStartupFencingVolume(ctx, volume)
 	if err != nil {
 		return fmt.Errorf("refresh attached volume %s: %w", volume.volumeID, err)
 	}
@@ -338,6 +361,9 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	// backend share objects once and reuse them across this startup pass (see
 	// fenceResolution). The per-volume lock is held for the whole pass.
 	res := &fenceResolution{}
+	// stored is each key's record as it was read, before this pass touched it,
+	// so an unchanged record is recognized and not rewritten.
+	stored := make(map[string]publicationRecord, len(volume.publications))
 	for _, publication := range volume.publications {
 		isDeferred, identityErr := d.validateOrDeferFencingIdentity(publication.identity, shareType)
 		if identityErr != nil {
@@ -361,7 +387,9 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 			// periodic reconcileStalePublicationRecords sweep is what actually
 			// revokes the stale record; this only stops it from also blocking
 			// every OTHER volume in the meantime.
-			if staleNode, found := stalePublishedRecordNode(compatibilityRecords, liveNodes); found {
+			if staleNode, found, staleErr := d.confirmedStaleStartupRecord(ctx, volume.volumeID, compatibilityRecords, liveNodes); staleErr != nil {
+				return staleErr
+			} else if found {
 				return d.quarantineStaleStartupFencingVolume(volume, staleNode, compatibilityErr)
 			}
 			// Transient dual-VA states are normal during migration. Both modes retry
@@ -372,13 +400,20 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 			ctx, dataset, datasetName, shareType, publication.identity, compatibilityRecords, publication.mode, res,
 		); compatibilityErr != nil {
 			// (C11) Same carve-out for the backend-allowlist half of the check.
-			if staleNode, found := stalePublishedRecordNode(compatibilityRecords, liveNodes); found {
+			if staleNode, found, staleErr := d.confirmedStaleStartupRecord(ctx, volume.volumeID, compatibilityRecords, liveNodes); staleErr != nil {
+				return staleErr
+			} else if found {
 				return d.quarantineStaleStartupFencingVolume(volume, staleNode, compatibilityErr)
 			}
 			return fmt.Errorf("startup fencing for volume %s has not converged: %w", volume.volumeID, compatibilityErr)
 		}
 		key := publicationPropertyKey(publication.identity.Name)
 		previous, hasPrevious := records[key]
+		if hasPrevious {
+			if _, seen := stored[key]; !seen {
+				stored[key] = previous
+			}
+		}
 		if ownershipErr := d.populateAdditiveGrantOwnership(
 			ctx, dataset, datasetName, shareType, publication.identity,
 			previous, hasPrevious, isDeferred, &record, res,
@@ -400,10 +435,18 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	}
 	for key := range desired {
 		record := desired[key]
-		if err := d.publications().store(ctx, datasetName, dataset, key, record); err != nil {
+		observationKey := stalePublicationObservationKey(datasetName, key)
+		_, staleObserved := d.stalePublicationRecordsSeen.Load(observationKey)
+		if previous, hasPrevious := stored[key]; hasPrevious && !staleObserved && samePublicationRecordExceptTime(previous, record) {
+			// The same rule as a repeated ControllerPublishVolume: the stored
+			// record already says exactly this, so a restart rewrites nothing.
+			// A record the stale-record sweep is watching is rewritten, so a
+			// revoke that detected it sees a new generation and backs off.
+			records[key] = previous
+		} else if err := d.publications().store(ctx, datasetName, dataset, key, record); err != nil {
 			return fmt.Errorf("persist startup attachment for volume %s: %w", volume.volumeID, err)
 		}
-		d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, key))
+		d.stalePublicationRecordsSeen.Delete(observationKey)
 	}
 	if len(desired) > 0 {
 		if err := d.ensureShareExists(ctx, dataset, datasetName, volume.volumeID, shareType, res); err != nil {
@@ -435,6 +478,73 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	return nil
 }
 
+// refreshStartupFencingVolume re-reads, under the volume lock, each
+// VolumeAttachment the snapshot saw for this volume: one GET by name each. A
+// VA that is gone, or replaced by an object for another PV or node, no longer
+// claims anything; one being deleted or no longer Attached still claims its
+// node but is never (re)granted. Node identities come from the snapshot.
+func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *startupFencingVolume) (*startupFencingVolume, error) {
+	result := &startupFencingVolume{
+		volumeID:         snapshot.volumeID,
+		volumeAttributes: snapshot.volumeAttributes,
+		pv:               snapshot.pv,
+		attachments:      snapshot.attachments,
+	}
+	attachments := d.eventRecorder.clientset.StorageV1().VolumeAttachments()
+	for i := range snapshot.attachments {
+		attachment := &snapshot.attachments[i]
+		current, err := attachments.Get(ctx, attachment.name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get VolumeAttachment %s: %w", attachment.name, err)
+		}
+		if current.Spec.Attacher != d.name || current.Spec.NodeName != attachment.nodeName ||
+			current.Spec.Source.PersistentVolumeName == nil || *current.Spec.Source.PersistentVolumeName != attachment.pvName {
+			continue
+		}
+		if result.claimedNodes == nil {
+			result.claimedNodes = make(map[string]struct{})
+		}
+		result.claimedNodes[attachment.nodeName] = struct{}{}
+		if !current.Status.Attached || !current.DeletionTimestamp.IsZero() {
+			continue
+		}
+		result.publications = append(result.publications, attachment.publication)
+	}
+	return result, nil
+}
+
+// confirmedStaleStartupRecord is stalePublishedRecordNode over a liveNodes set
+// re-read from a full VolumeAttachment listing. The per-volume refresh only
+// re-reads the snapshot's own attachments, so it cannot see a VA created
+// since; quarantining on that narrower view could defer a volume whose
+// conflicting record belongs to a node that is in fact attached, which the
+// stale-record sweep would then never revoke. Quarantine is rare, so it pays
+// for the listing the common path no longer does.
+func (d *Driver) confirmedStaleStartupRecord(ctx context.Context, volumeID string, records map[string]publicationRecord, liveNodes map[string]struct{}) (staleNode string, found bool, err error) {
+	if _, found = stalePublishedRecordNode(records, liveNodes); !found {
+		return "", false, nil
+	}
+	current, err := d.currentStartupFencingVolume(ctx, volumeID)
+	if err != nil {
+		return "", false, fmt.Errorf("confirm stale publication record for volume %s: %w", volumeID, err)
+	}
+	confirmed := make(map[string]struct{}, len(liveNodes)+len(current.claimedNodes))
+	for node := range liveNodes {
+		confirmed[node] = struct{}{}
+	}
+	for node := range current.claimedNodes {
+		confirmed[node] = struct{}{}
+	}
+	staleNode, found = stalePublishedRecordNode(records, confirmed)
+	return staleNode, found, nil
+}
+
+// currentStartupFencingVolume rebuilds a volume's attachment set from full
+// listings. The per-volume pass uses refreshStartupFencingVolume; this one
+// backs the rare quarantine decision (confirmedStaleStartupRecord).
 func (d *Driver) currentStartupFencingVolume(ctx context.Context, volumeID string) (*startupFencingVolume, error) {
 	result := &startupFencingVolume{volumeID: volumeID}
 	clientset := d.eventRecorder.clientset
