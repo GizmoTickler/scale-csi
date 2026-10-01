@@ -171,12 +171,7 @@ async fn serves_identity_and_node_info() {
 
 #[tokio::test]
 async fn refuses_protocols_it_does_not_serve() {
-    for config in [
-        "nfs: {}\nnvmeof: {}\n",
-        "iscsi:\n  targetPortal: 192.0.2.1:3260\n",
-        // The kernel initiator is the NVMe-oF default data path.
-        "nvmeof:\n  ublk:\n    enabled: true\n",
-    ] {
+    for config in ["nfs: {}\nnvmeof: {}\n", "iscsi:\n  targetPortal: 192.0.2.1:3260\n"] {
         let mut agent = start(config, 0);
         let status = agent.child.wait().unwrap();
         assert!(!status.success(), "{config:?} was accepted");

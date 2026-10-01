@@ -5,8 +5,8 @@
 {{- if or (.Values.nfs | default dict).enabled (.Values.iscsi | default dict).enabled }}
 {{- fail "node.implementation=rust serves NVMe-oF only so far: set nfs.enabled=false and iscsi.enabled=false, or use node.implementation=go" }}
 {{- end }}
-{{- if not (and $nvmeof.enabled (eq ($nvmeof.dataPath | default "kernel") "ublk")) }}
-{{- fail "node.implementation=rust serves the userspace NVMe-oF data path only so far: it needs nvmeof.enabled=true and nvmeof.dataPath=ublk" }}
+{{- if not $nvmeof.enabled }}
+{{- fail "node.implementation=rust serves NVMe-oF only so far: it needs nvmeof.enabled=true" }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1

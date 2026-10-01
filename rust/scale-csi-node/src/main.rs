@@ -41,11 +41,6 @@ async fn run() -> Result<()> {
             "this install enables NFS or iSCSI, which the Rust node agent does not serve yet; run the Go node plugin"
         );
     }
-    if config.nvmeof.enabled && config.nvmeof.default_data_path() == config::DataPath::Kernel {
-        bail!(
-            "this install stages NVMe-oF volumes through the kernel initiator by default (nvmeof.dataPath), which the Rust node agent does not serve yet; run the Go node plugin"
-        );
-    }
     // The flag wins only when it is not the default; an empty config value takes it.
     let driver_name = if args.driver_name != config::DEFAULT_DRIVER_NAME || config.driver.is_empty() {
         args.driver_name.clone()
@@ -92,7 +87,12 @@ async fn run() -> Result<()> {
             None
         }
     };
+    if let Some(kubelet) = scale_csi_node::session_gc::kubelet_dir_of(&socket) {
+        state.host.kubelet_dir = kubelet;
+    }
     let state = Arc::new(state);
+    let (stop_gc, gc_stop) = tokio::sync::watch::channel(false);
+    let gc = tokio::spawn(scale_csi_node::session_gc::run(state.clone(), gc_stop));
     if args.health_port > 0 {
         let health = health::bind(args.health_port)
             .await
@@ -121,6 +121,9 @@ async fn run() -> Result<()> {
         .context("serve CSI")?;
     // Operations whose RPC the caller already gave up on are still running.
     state.wait_for_operations().await;
+    // Session GC finishes the session it is on, then stops.
+    let _ = stop_gc.send(true);
+    let _ = gc.await;
     Ok(())
 }
 

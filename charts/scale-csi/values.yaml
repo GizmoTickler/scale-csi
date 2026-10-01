@@ -213,9 +213,8 @@ node:
 
   # Which node plugin the DaemonSet runs, from the same image: go (scale-csi)
   # or rust (scale-csi-node, the Rust node agent). The Rust agent serves
-  # NVMe-oF through the userspace data path (nvmeof.dataPath=ublk) only so far:
-  # the chart refuses rust together with NFS, iSCSI or the kernel data path as
-  # the default.
+  # NVMe-oF (kernel initiator and nvmeublkd) only so far: the chart refuses
+  # rust together with NFS or iSCSI.
   implementation: go
 
   # Priority class for node pods

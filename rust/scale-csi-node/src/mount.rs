@@ -10,6 +10,7 @@
 //!   lazy unmount: a device-backed or unclassifiable mount surfaces its error so
 //!   the transport is not disconnected under a live mount.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -195,6 +196,51 @@ impl Mounter {
         }
         let text = String::from_utf8_lossy(&out.stdout);
         Ok(text.trim().lines().next().unwrap_or_default().trim().to_string())
+    }
+
+    /// Every mount point of every mounted block-device filesystem (Go
+    /// GetBlockDeviceMounts). `findmnt` exit 1 is "nothing mounted" only when
+    /// it printed nothing at all: an unreadable mount table must fail, or GC
+    /// would read it as "nothing in use".
+    pub async fn block_device_mounts(
+        &self,
+        dev_dir: &std::path::Path,
+        deadline: Option<Instant>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let out = self
+            .runner
+            .run(
+                "findmnt",
+                &["-n", "-r", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs"],
+                self.limits(self.timeouts.mount, deadline),
+            )
+            .await?;
+        let mut devices: HashMap<String, Vec<String>> = HashMap::new();
+        if !out.success() {
+            let quiet =
+                out.stdout.iter().all(u8::is_ascii_whitespace) && out.stderr.iter().all(u8::is_ascii_whitespace);
+            if out.code == Some(1) && !out.wedged && quiet {
+                return Ok(devices);
+            }
+            return Err(failure("findmnt failed", &out));
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            let mut device = decode_findmnt_raw(fields[0]);
+            if let Some(i) = device.find('[')
+                && i > 0
+                && device.ends_with(']')
+            {
+                device.truncate(i);
+            }
+            if std::path::Path::new(&device).starts_with(dev_dir) {
+                devices.entry(device).or_default().push(decode_findmnt_raw(fields[1]));
+            }
+        }
+        Ok(devices)
     }
 
     pub async fn mount(
@@ -436,6 +482,27 @@ impl Mounter {
         }
         self.mount(device, target, fs_type, options, deadline).await
     }
+}
+
+/// Undoes `findmnt -r`'s `\xNN` escaping.
+pub fn decode_findmnt_raw(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if i + 3 < b.len()
+            && b[i] == b'\\'
+            && b[i + 1] == b'x'
+            && let Ok(v) = u8::from_str_radix(&field[i + 2..i + 4], 16)
+        {
+            out.push(v);
+            i += 4;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `TYPE` and `PTTYPE` from `blkid -o export`.
@@ -775,5 +842,55 @@ mod tests {
         assert_eq!(mounts[0].options, ["rw", "noatime", "rw", "errors=continue"]);
         assert!(!mounts[0].read_only);
         assert!(mounts[1].read_only, "a read-only mount option counts");
+    }
+
+    #[test]
+    fn findmnt_raw_escapes() {
+        assert_eq!(decode_findmnt_raw("/var/lib/a\\x20b"), "/var/lib/a b");
+        assert_eq!(decode_findmnt_raw("/plain"), "/plain");
+        assert_eq!(decode_findmnt_raw("/bad\\xZZ"), "/bad\\xZZ");
+    }
+
+    #[tokio::test]
+    async fn block_device_mounts_and_the_empty_rule() {
+        let (m, _f) = mounter(
+            &Script::new(vec![(
+                Some(0),
+                "/dev/nvme0n1 /var/lib/kubelet/a\\x20b\n/dev/nvme0n1[/sub] /var/lib/kubelet/pods/p\ntmpfs /run\n",
+                "",
+                false,
+            )]),
+            "",
+        );
+        let got = m.block_device_mounts(std::path::Path::new("/dev"), None).await.unwrap();
+        assert_eq!(
+            got.get("/dev/nvme0n1").unwrap(),
+            &vec![
+                "/var/lib/kubelet/a b".to_string(),
+                "/var/lib/kubelet/pods/p".to_string()
+            ]
+        );
+        assert_eq!(got.len(), 1);
+        let (m, _f) = mounter(&Script::new(vec![(Some(1), "", "", false)]), "");
+        assert!(
+            m.block_device_mounts(std::path::Path::new("/dev"), None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing mounted"
+        );
+        let (m, _f) = mounter(
+            &Script::new(vec![(Some(1), "", "findmnt: cannot read /proc/self/mountinfo", false)]),
+            "",
+        );
+        assert!(
+            m.block_device_mounts(std::path::Path::new("/dev"), None).await.is_err(),
+            "an unreadable table is not empty"
+        );
+        let (m, _f) = mounter(&Script::new(vec![(None, "", "", true)]), "");
+        assert!(
+            m.block_device_mounts(std::path::Path::new("/dev"), None).await.is_err(),
+            "a wedged findmnt is not empty"
+        );
     }
 }

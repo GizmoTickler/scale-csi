@@ -21,6 +21,7 @@ pub mod nvme_kernel;
 pub mod publish;
 pub mod records;
 pub mod service;
+pub mod session_gc;
 pub mod session_registry;
 pub mod stage;
 pub mod ublk_client;
@@ -33,6 +34,8 @@ mod capacity_tests;
 mod nvme_kernel_tests;
 #[cfg(test)]
 mod publish_tests;
+#[cfg(test)]
+mod session_gc_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]

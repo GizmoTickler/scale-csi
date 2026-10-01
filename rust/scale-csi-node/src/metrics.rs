@@ -16,6 +16,9 @@ pub struct Metrics {
     operations_duration: HistogramVec,
     node_connect_total: IntCounterVec,
     nvme_path_connect_total: IntCounterVec,
+    nvme_sessions_total: IntGauge,
+    gc_sessions_disconnected_total: IntCounterVec,
+    nvme_controller_tunable_corrections_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -64,8 +67,37 @@ impl Metrics {
             &["address", "result"],
         )
         .expect("valid metric");
+        let nvme_sessions_total = IntGauge::with_opts(
+            Opts::new(
+                "nvme_sessions_total",
+                "Total number of active NVMe-oF sessions on this node",
+            )
+            .namespace(NAMESPACE),
+        )
+        .expect("valid metric");
+        let gc_sessions_disconnected_total = IntCounterVec::new(
+            Opts::new(
+                "gc_sessions_disconnected_total",
+                "Total number of orphaned sessions disconnected by session garbage collection",
+            )
+            .namespace(NAMESPACE),
+            &["transport"],
+        )
+        .expect("valid metric");
+        let nvme_controller_tunable_corrections_total = IntCounterVec::new(
+            Opts::new(
+                "nvme_controller_tunable_corrections_total",
+                "Live NVMe-oF controllers whose tunables the node plugin converged to configuration, by tunable and result",
+            )
+            .namespace(NAMESPACE),
+            &["tunable", "result"],
+        )
+        .expect("valid metric");
         for collector in [
             Box::new(operations_total.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(nvme_sessions_total.clone()),
+            Box::new(gc_sessions_disconnected_total.clone()),
+            Box::new(nvme_controller_tunable_corrections_total.clone()),
             Box::new(operations_duration.clone()),
             Box::new(node_connect_total.clone()),
             Box::new(nvme_path_connect_total.clone()),
@@ -80,7 +112,42 @@ impl Metrics {
             operations_duration,
             node_connect_total,
             nvme_path_connect_total,
+            nvme_sessions_total,
+            gc_sessions_disconnected_total,
+            nvme_controller_tunable_corrections_total,
         }
+    }
+
+    pub fn set_nvme_sessions(&self, count: usize) {
+        self.nvme_sessions_total.set(count as i64);
+    }
+
+    pub fn nvme_sessions(&self) -> i64 {
+        self.nvme_sessions_total.get()
+    }
+
+    pub fn record_gc_disconnect(&self, transport: &str) {
+        self.gc_sessions_disconnected_total
+            .with_label_values(&[transport])
+            .inc();
+    }
+
+    pub fn gc_disconnects(&self, transport: &str) -> u64 {
+        self.gc_sessions_disconnected_total
+            .with_label_values(&[transport])
+            .get()
+    }
+
+    pub fn record_tunable_correction(&self, tunable: &str, result: &str) {
+        self.nvme_controller_tunable_corrections_total
+            .with_label_values(&[tunable, result])
+            .inc();
+    }
+
+    pub fn tunable_corrections(&self, tunable: &str, result: &str) -> u64 {
+        self.nvme_controller_tunable_corrections_total
+            .with_label_values(&[tunable, result])
+            .get()
     }
 
     /// One transport attach: `transport` is "nvmeof" for the kernel initiator,

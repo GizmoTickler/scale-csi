@@ -129,6 +129,19 @@ impl Runner for FakeHost {
                 Some((_, fs, _)) => output(0, &format!("{fs}\n")),
                 None => output(1, ""),
             },
+            ("findmnt", ["-n", "-r", "-o", "SOURCE,TARGET", "-t", _]) => {
+                let rows: String = host
+                    .mounts
+                    .iter()
+                    .filter(|(_, (_, fs, _))| ["ext4", "ext3", "xfs", "btrfs"].contains(&fs.as_str()))
+                    .map(|(target, (source, _, _))| format!("{source} {}\n", target.replace(' ', "\\x20")))
+                    .collect();
+                if rows.is_empty() {
+                    output(1, "")
+                } else {
+                    output(0, &rows)
+                }
+            }
             ("blkid", _) => match host.filesystems.get(last) {
                 Some(fs) => output(0, &format!("TYPE={fs}\n")),
                 None => output(2, ""),
@@ -379,6 +392,7 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
     state.events = events.clone();
     state.host = Host {
         dev_dir: daemon.dev_dir.path().to_path_buf(),
+        kubelet_dir: dir.path().join("kubelet"),
         sysfs: dir.path().join("sys"),
         host_id_files: vec![dir.path().join("no-hostid")],
     };
@@ -511,14 +525,19 @@ impl FakeKernel {
     }
 
     fn add_path(&mut self, nqn: &str, address: &str, state: &str) {
+        self.add_controller(nqn, address, state, "off");
+    }
+
+    /// A controller with its sysfs attributes; returns its name.
+    pub fn add_controller(&mut self, nqn: &str, address: &str, state: &str, fast_io_fail_tmo: &str) -> String {
         let controller = format!("nvme{}", self.next_controller);
         self.next_controller += 1;
-        std::fs::create_dir_all(self.sys.join("class/nvme").join(&controller)).unwrap();
-        std::fs::write(
-            self.sys.join("class/nvme").join(&controller).join("subsysnqn"),
-            format!("{nqn}\n"),
-        )
-        .unwrap();
+        let dir = self.sys.join("class/nvme").join(&controller);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("subsysnqn"), format!("{nqn}\n")).unwrap();
+        std::fs::write(dir.join("transport"), "tcp\n").unwrap();
+        std::fs::write(dir.join("address"), format!("traddr={address},trsvcid=4420\n")).unwrap();
+        std::fs::write(dir.join("fast_io_fail_tmo"), format!("{fast_io_fail_tmo}\n")).unwrap();
         if !self.subsystems.contains_key(nqn) {
             let index = self.next_subsystem;
             self.next_subsystem += 1;
@@ -530,7 +549,10 @@ impl FakeKernel {
             self.subsystems.insert(nqn.to_string(), (index, Vec::new()));
         }
         let entry = self.subsystems.get_mut(nqn).unwrap();
-        entry.1.push((controller, address.to_string(), state.to_string()));
+        entry
+            .1
+            .push((controller.clone(), address.to_string(), state.to_string()));
+        controller
     }
 
     fn remove(&mut self, nqn: &str) -> bool {

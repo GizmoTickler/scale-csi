@@ -30,6 +30,47 @@ pub struct Config {
     pub nvmeof: NvmeofConfig,
     pub node: NodeConfig,
     pub command_timeouts: CommandTimeouts,
+    pub session_gc: SessionGcConfig,
+}
+
+/// `sessionGC`: orphaned-session cleanup on the node (Go defaults).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionGcConfig {
+    pub enabled: bool,
+    /// Seconds; 0 or less takes 300.
+    pub interval: i64,
+    /// Seconds an orphan must stay orphaned; 0 takes 60.
+    pub grace_period: i64,
+    pub dry_run: bool,
+    /// Absent: true.
+    pub run_on_startup: Option<bool>,
+    /// Seconds; 0 takes 5.
+    pub startup_delay: i64,
+    #[serde(rename = "nvmeofEnabled")]
+    pub nvmeof_enabled: Option<bool>,
+}
+
+impl SessionGcConfig {
+    fn seconds(value: i64, default: u64) -> Duration {
+        Duration::from_secs(u64::try_from(value).ok().filter(|v| *v > 0).unwrap_or(default))
+    }
+
+    pub fn interval(&self) -> Duration {
+        Self::seconds(self.interval, 300)
+    }
+
+    pub fn grace_period(&self) -> Duration {
+        Self::seconds(self.grace_period, 60)
+    }
+
+    pub fn startup_delay(&self) -> Duration {
+        Self::seconds(self.startup_delay, 5)
+    }
+
+    pub fn run_on_startup(&self) -> bool {
+        self.run_on_startup.unwrap_or(true)
+    }
 }
 
 /// `commandTimeouts`, in seconds; 0 takes the default.
@@ -232,6 +273,7 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
     let node: NodeConfig = serde_json::from_value(section("node")).context("config node")?;
     let command_timeouts: CommandTimeouts =
         serde_json::from_value(section("commandTimeouts")).context("config commandTimeouts")?;
+    let session_gc: SessionGcConfig = serde_json::from_value(section("sessionGC")).context("config sessionGC")?;
     let driver = root
         .get("driver")
         .and_then(Value::as_str)
@@ -244,6 +286,7 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
         nvmeof,
         node,
         command_timeouts,
+        session_gc,
     };
     validate(&config)?;
     Ok(config)
@@ -283,6 +326,14 @@ fn validate(config: &Config) -> Result<()> {
     }
     if n.device_wait_timeout < 0 {
         bail!("nvmeof.deviceWaitTimeout must not be negative");
+    }
+    for (name, value) in [
+        ("sessionGC.interval", config.session_gc.interval),
+        ("sessionGC.gracePeriod", config.session_gc.grace_period),
+    ] {
+        if value < 0 {
+            bail!("{name} must not be negative");
+        }
     }
     if config.node.session_cleanup_delay < 0 {
         bail!("node.sessionCleanupDelay must not be negative");

@@ -55,6 +55,11 @@ func TestChartNodeImplementationRustRunsTheAgent(t *testing.T) {
 	}
 }
 
+// The kernel initiator as the default data path is served.
+func TestChartNodeImplementationRustServesTheKernelPath(t *testing.T) {
+	helmTemplate(t, withArgs(rustNodeArgs, "--set", "nvmeof.dataPath=kernel", "--set", "node.implementation=rust")...)
+}
+
 func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -63,7 +68,6 @@ func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 	}{
 		{"NFS on", withArgs(rustNodeArgs, "--set", "nfs.enabled=true"), "serves NVMe-oF only"},
 		{"iSCSI on", withArgs(rustNodeArgs, "--set", "iscsi.enabled=true"), "serves NVMe-oF only"},
-		{"kernel default data path", withArgs(rustNodeArgs, "--set", "nvmeof.dataPath=kernel"), "nvmeof.dataPath=ublk"},
 		{"NVMe-oF off", withArgs(rustNodeArgs, "--set", "nvmeof.enabled=false"), "nvmeof.enabled=true"},
 	}
 	for _, tc := range cases {

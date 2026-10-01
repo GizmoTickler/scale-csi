@@ -26,8 +26,10 @@ use crate::ublk_client::{self, Daemon};
 
 /// Where the node looks at the host; the tests point it elsewhere.
 pub struct Host {
-    /// Where ublk block devices appear.
+    /// Where block devices appear.
     pub dev_dir: PathBuf,
+    /// Kubelet's root directory (its CSI staging directory is under it).
+    pub kubelet_dir: PathBuf,
     pub sysfs: PathBuf,
     pub host_id_files: Vec<PathBuf>,
 }
@@ -36,6 +38,7 @@ impl Default for Host {
     fn default() -> Self {
         Host {
             dev_dir: PathBuf::from("/dev"),
+            kubelet_dir: PathBuf::from("/var/lib/kubelet"),
             sysfs: PathBuf::from("/sys"),
             host_id_files: crate::ublk_state::default_host_id_files(),
         }
@@ -64,6 +67,8 @@ pub struct State {
     pub nvme_sessions: Option<SessionRegistry>,
     /// Shared by each running volume operation; see run_to_completion.
     pub operations: Arc<RwLock<()>>,
+    /// Session GC's orphaned sessions and when it first saw them.
+    pub orphans: crate::session_gc::Orphans,
 }
 
 impl State {
@@ -98,6 +103,7 @@ impl State {
             nvme_sessions: None,
             host: Host::default(),
             operations: Arc::default(),
+            orphans: Default::default(),
         }
     }
 }
