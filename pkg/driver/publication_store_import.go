@@ -92,7 +92,7 @@ func resolvePublicationRecords(legacy, current map[string]publicationRecord) map
 		}
 		return out
 	}
-	out := make(map[string]publicationRecord, len(legacy)+len(current))
+	out := make(map[string]publicationRecord, len(legacy))
 	for key := range legacy {
 		out[key] = legacy[key]
 	}

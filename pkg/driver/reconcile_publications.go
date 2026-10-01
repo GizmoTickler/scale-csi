@@ -122,7 +122,7 @@ func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.D
 func mergeStaleSweeps(legacy, current staleSweep) staleSweep {
 	legacyBy := make(map[string]map[string]publicationRecord, len(legacy.candidates))
 	currentBy := make(map[string]map[string]publicationRecord, len(current.candidates))
-	order := make([]string, 0, len(legacy.candidates)+len(current.candidates))
+	order := make([]string, 0, len(legacy.candidates))
 	for _, sweep := range []struct {
 		candidates []staleSweepCandidate
 		into       map[string]map[string]publicationRecord
