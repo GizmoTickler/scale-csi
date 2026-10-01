@@ -773,3 +773,55 @@ func TestISCSIExtentDelete_NotFound(t *testing.T) {
 	// Should succeed (idempotent)
 	assert.NoError(t, err)
 }
+
+// TestNVMeoFSubsystemDeleteCascade_SendsForce: the cascade is the forced
+// delete; without {"force": true} TrueNAS refuses a subsystem that still has a
+// namespace or a port association.
+func TestNVMeoFSubsystemDeleteCascade_SendsForce(t *testing.T) {
+	mock := newMockWSServer()
+	params := make(chan []interface{}, 1)
+
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "system.info":
+				resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-25.10.0", "hostname": "truenas-test"}
+			case "nvmet.subsys.delete":
+				params <- req.Params
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+
+	wsURL := strings.Replace(server.URL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host: parts[0], Port: port, Protocol: "http", APIKey: "test-api-key",
+		Timeout: 5 * time.Second, ConnectTimeout: 5 * time.Second, MaxConnections: 1,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	require.NoError(t, client.NVMeoFSubsystemDeleteCascade(context.Background(), 31))
+	got := <-params
+	require.Len(t, got, 2)
+	assert.Equal(t, float64(31), got[0])
+	assert.Equal(t, map[string]interface{}{"force": true}, got[1])
+}

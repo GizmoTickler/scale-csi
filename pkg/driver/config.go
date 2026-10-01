@@ -1026,6 +1026,12 @@ func (c NVMeoFConfig) ublkAvailable() bool {
 	return c.Ublk.Enabled || c.defaultDataPath() == NVMeoFDataPathUblk
 }
 
+// observeBusyBeforeDelete reports whether dataset deletes first run the busy
+// observation scans (zfs.observeBusyBeforeDelete, default true).
+func (c *Config) observeBusyBeforeDelete() bool {
+	return c == nil || c.ZFS.ObserveBusyBeforeDelete == nil || *c.ZFS.ObserveBusyBeforeDelete
+}
+
 // nodeVolumeLimit is the volume count NodeGetInfo advertises (0: none).
 // node.maxVolumesPerNode wins when set. Otherwise an install whose NVMe-oF
 // volumes use the ublk data path by default advertises the number of volumes
@@ -1035,12 +1041,6 @@ func (c NVMeoFConfig) ublkAvailable() bool {
 // node, whatever its protocol or data path, so it errs towards fewer volumes.
 // An install that only lets classes opt in advertises nothing: most of its
 // volumes do not count against the daemon.
-// observeBusyBeforeDelete reports whether dataset deletes first run the busy
-// observation scans (zfs.observeBusyBeforeDelete, default true).
-func (c *Config) observeBusyBeforeDelete() bool {
-	return c == nil || c.ZFS.ObserveBusyBeforeDelete == nil || *c.ZFS.ObserveBusyBeforeDelete
-}
-
 func (c *Config) nodeVolumeLimit() int64 {
 	if c.Node.MaxVolumesPerNode > 0 {
 		return c.Node.MaxVolumesPerNode

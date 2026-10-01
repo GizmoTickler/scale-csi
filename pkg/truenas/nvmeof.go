@@ -554,11 +554,13 @@ func (c *Client) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID in
 		return nil, fmt.Errorf("unexpected NVMe-oF namespace response type")
 	}
 
+	// A row that cannot be parsed fails the listing: callers decide from it
+	// whether a subsystem serves anything else, and a dropped row would say no.
 	namespaces := make([]*NVMeoFNamespace, 0, len(items))
 	for _, item := range items {
 		namespace, parseErr := parseNVMeoFNamespace(item)
 		if parseErr != nil {
-			continue
+			return nil, fmt.Errorf("unparseable NVMe-oF namespace in subsystem %d: %w", subsysID, parseErr)
 		}
 		namespaces = append(namespaces, namespace)
 	}

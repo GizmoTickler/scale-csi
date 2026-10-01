@@ -329,12 +329,45 @@ func TestNVMeoFShareDeleteIsOneForcedSubsystemDeleteWhenTheSubsystemIsTheVolumes
 		require.Len(t, subsystems, 1)
 		other, err := client.NVMeoFNamespaceCreate(ctx, subsystems[0].ID, "zvol/pool/parent/another", "ZVOL")
 		require.NoError(t, err)
-		_ = d.deleteNVMeoFShareForDataset(ctx, nil, datasetName)
-		assert.Zero(t, client.calls["subsys.delete(force)"], "never forced")
-		assert.Equal(t, 1, client.calls["namespace.delete"], "only this volume's namespace")
+		require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
+		assert.Equal(t, map[string]int{"namespace.delete": 1}, client.calls, "only this volume's namespace; never forced, no port association touched")
 		_, err = client.NVMeoFNamespaceGet(ctx, other.ID)
 		assert.NoError(t, err, "the other namespace survives")
+		_, err = client.NVMeoFSubsystemGet(ctx, subsystems[0].ID)
+		assert.NoError(t, err, "and so does the subsystem")
 	})
+
+	t.Run("the listing fails", func(t *testing.T) {
+		d, client, datasetName := setup(t)
+		failing := &namespaceListFailingClient{deleteCountingClient: client}
+		d.truenasClient = failing
+		require.Error(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName), "no listing, no forced delete")
+		assert.Empty(t, client.calls, "nothing is deleted")
+	})
+
+	t.Run("this volume's namespace is not among the subsystem's", func(t *testing.T) {
+		d, client, datasetName := setup(t)
+		// A namespace whose subsystem the backend did not report: the volume's
+		// subsystem is resolved from the stored ID and does not list it, so the
+		// cascade cannot reach it.
+		namespaces, err := client.NVMeoFNamespaceList(ctx)
+		require.NoError(t, err)
+		require.Len(t, namespaces, 1)
+		namespaces[0].SubsystemID = 0
+		require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
+		assert.Equal(t, 1, client.calls["subsys.delete(force)"])
+		assert.Equal(t, 1, client.calls["namespace.delete"], "the namespace the cascade did not cover is deleted on its own")
+		_, err = client.NVMeoFNamespaceGet(ctx, namespaces[0].ID)
+		assert.Error(t, err)
+	})
+}
+
+type namespaceListFailingClient struct {
+	*deleteCountingClient
+}
+
+func (c *namespaceListFailingClient) NVMeoFNamespaceListBySubsystem(context.Context, int) ([]*truenas.NVMeoFNamespace, error) {
+	return nil, errors.New("simulated listing failure")
 }
 
 // zfs.observeBusyBeforeDelete=false skips the two observation-only scans that

@@ -548,7 +548,11 @@ func TestDeleteNVMeoFShare_PropagatesCleanupErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "NVMe-oF cleanup errors")
 }
 
-func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
+// TestDeleteNVMeoFShare_LeavesASharedSubsystemAlone: a subsystem that also
+// serves another volume's namespace keeps its port associations and is not
+// deleted (deleting the associations took the other volume offline, and the
+// subsystem delete was refused anyway, so the delete failed for good).
+func TestDeleteNVMeoFShare_LeavesASharedSubsystemAlone(t *testing.T) {
 	mockClient := &nvmeDeleteAssociationCountingMock{MockClient: truenas.NewMockClient()}
 	d := &Driver{
 		config: &Config{
@@ -565,14 +569,13 @@ func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mockClient.DatasetSetUserProperty(context.Background(), datasetName, PropNVMeoFSubsystemID, "1"))
 	mockClient.NVMeSubsystems[1] = &truenas.NVMeoFSubsystem{ID: 1, Name: "test-nvme-assoc-cache"}
-	// The subsystem also serves another namespace, so the delete takes the
-	// per-object path this test measures instead of the forced cascade.
 	mockClient.NVMeNamespaces[99] = &truenas.NVMeoFNamespace{ID: 99, SubsystemID: 1, DevicePath: "zvol/tank/k8s/volumes/another"}
 
-	err = d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName)
-	require.Error(t, err)
-	assert.Equal(t, 1, mockClient.portSubsysDeleteCalls)
-	assert.Equal(t, 1, mockClient.portSubsysListCalls)
+	require.NoError(t, d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName))
+	assert.Zero(t, mockClient.portSubsysDeleteCalls, "no port association of the shared subsystem is deleted")
+	assert.Zero(t, mockClient.portSubsysListCalls)
+	assert.Contains(t, mockClient.NVMeSubsystems, 1, "the subsystem stays")
+	assert.Contains(t, mockClient.NVMeNamespaces, 99, "and so does the other volume's namespace")
 }
 
 // =============================================================================
