@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // ServiceReloadDebouncer coalesces multiple service reload requests into a single
@@ -37,6 +39,12 @@ type serviceReloadState struct {
 	pending  []chan error // channels waiting for reload result
 	lastCall time.Time
 	count    int // number of coalesced requests
+	// The most urgent class and the oldest operation among the batch's
+	// callers: the reload is admitted to TrueNAS as theirs, so it is not
+	// queued behind their own later calls (or, for a publish waiting on it,
+	// behind provisioning).
+	priority truenas.Priority
+	start    time.Time
 }
 
 // NewServiceReloadDebouncer creates a new debouncer with the given delay.
@@ -69,9 +77,25 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 		d.services[service] = state
 	}
 
+	now := time.Now()
+	priority := truenas.PriorityOf(ctx)
+	start, stamped := truenas.OperationStartOf(ctx)
+	if !stamped {
+		start = now
+	}
+	if state.timer == nil {
+		state.priority, state.start = priority, start
+	} else {
+		if priority < state.priority {
+			state.priority = priority
+		}
+		if start.Before(state.start) {
+			state.start = start
+		}
+	}
 	state.pending = append(state.pending, resultCh)
 	state.count++
-	state.lastCall = time.Now()
+	state.lastCall = now
 
 	// Leading-window batching: arm the timer only for the FIRST request of a
 	// batch. Requests that arrive while the timer is already running coalesce
@@ -131,6 +155,7 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 	// Capture pending channels and reset state
 	pendingChannels := state.pending
 	coalescedCount := state.count
+	priority, start := state.priority, state.start
 	state.pending = make([]chan error, 0)
 	state.count = 0
 	state.timer = nil
@@ -142,10 +167,14 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 		klog.Infof("Service reload debouncer: coalesced %d reload requests for %s into single reload", coalescedCount, service)
 	}
 
-	// Perform the actual reload with a background context
-	// (the original contexts may have timed out, but we still want to reload)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// The reload runs detached from its callers' contexts (some may have
+	// timed out; the reload is still wanted), but is admitted to TrueNAS with
+	// their class and oldest operation start. It carries no deadline of its
+	// own: the client bounds the call itself, after a request slot is granted,
+	// by its request timeout. A deadline here would also have counted the wait
+	// for a slot, which under a burst of the callers' own operations can
+	// exceed any fixed budget.
+	ctx := truenas.WithOperationStart(truenas.WithPriority(context.Background(), priority), start)
 
 	err := d.reloadFunc(ctx, service)
 	if err != nil {

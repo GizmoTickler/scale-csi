@@ -7,6 +7,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 func TestServiceReloadDebouncer_SingleRequest(t *testing.T) {
@@ -252,4 +256,48 @@ func TestServiceReloadDebouncer_FullyCancelledBatchDoesNotStarveNextBatch(t *tes
 	if got := reloadCount.Load(); got != 1 {
 		t.Fatalf("expected exactly 1 reload for batch 2, got %d", got)
 	}
+}
+
+// A debounced reload is admitted to TrueNAS as the work of the callers waiting
+// on it: their most urgent class and their oldest operation start, with no
+// deadline of its own that would count the wait for a request slot. Admitted
+// as background work it queued behind every earlier operation's later calls,
+// and under a burst its 30 s budget ran out before it got a slot (iSCSI
+// multipath creates and fenced publishes wait on it).
+func TestServiceReloadIsAdmittedAsItsCallers(t *testing.T) {
+	type seen struct {
+		priority    truenas.Priority
+		start       time.Time
+		stamped     bool
+		hasDeadline bool
+	}
+	got := make(chan seen, 1)
+	d := NewServiceReloadDebouncer(50*time.Millisecond, func(ctx context.Context, _ string) error {
+		start, stamped := truenas.OperationStartOf(ctx)
+		_, hasDeadline := ctx.Deadline()
+		got <- seen{truenas.PriorityOf(ctx), start, stamped, hasDeadline}
+		return nil
+	})
+	defer d.Stop()
+
+	base := time.Now().Add(-time.Minute)
+	callers := []context.Context{
+		truenas.WithOperationStart(context.Background(), base.Add(2*time.Second)),
+		truenas.WithOperationStart(truenas.WithPriority(context.Background(), truenas.PriorityAttach), base.Add(5*time.Second)),
+		truenas.WithOperationStart(truenas.WithPriority(context.Background(), truenas.PriorityDelete), base),
+	}
+	var wg sync.WaitGroup
+	for _, ctx := range callers {
+		wg.Add(1)
+		go func(ctx context.Context) {
+			defer wg.Done()
+			assert.NoError(t, d.RequestReload(ctx, "iscsitarget"))
+		}(ctx)
+	}
+	wg.Wait()
+	s := <-got
+	assert.Equal(t, truenas.PriorityAttach, s.priority, "the most urgent caller's class")
+	assert.True(t, s.stamped)
+	assert.True(t, s.start.Equal(base), "the oldest caller's operation start")
+	assert.False(t, s.hasDeadline, "no budget that counts the wait for a slot")
 }
