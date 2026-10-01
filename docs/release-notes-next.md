@@ -58,13 +58,30 @@ moves into the attach class. New series, on the dashboard's backpressure
 panel: `scale_csi_truenas_request_admission_wait_seconds{class}` and
 `scale_csi_truenas_requests_waiting{class}`.
 
-### Node fix
+The iSCSI target reload that creates and fenced publishes wait for is
+admitted as theirs (their most urgent class and oldest operation), so it is
+not queued behind their own later calls; its time limit now applies to the
+call itself once it has a slot, not to the wait for one.
 
-Repeating NodePublishVolume for a raw-block volume that is already published
-returned Internal ("unsupported type Drw-rw----"): the node accepted only
-kubelet's placeholder file at the target, but a published target is the
-device node bound over it. It is now accepted. Filesystem volumes were not
-affected.
+### Other fixes
+
+- Repeating NodePublishVolume for a raw-block volume that is already
+  published returned Internal ("unsupported type Drw-rw----"), and after a
+  node-plugin restart (an upgrade is one) AlreadyExists ("backed by udev"):
+  the node accepted only kubelet's placeholder file at the target and
+  compared mount sources, but a published target is the device node bound
+  over it, and the mount table shows its source as devtmpfs. The target is now
+  identified by its device number. Filesystem volumes were not affected.
+- A new multipath NVMe-oF share whose port associations partly failed is
+  rolled back with a forced subsystem delete. The plain delete was refused by
+  TrueNAS while the subsystem was still on a port, and the subsystem leaked.
+
+### Rolling back to v1.13.1
+
+Nothing to undo on TrueNAS. One chart value is new: if you set
+`zfs.observeBusyBeforeDelete: false`, remove it before rolling back. The
+v1.13.1 chart's schema rejects the key, and a v1.13.1 controller reading a
+config that contains it refuses to start.
 
 
 ## v1.13.1 — stop republishing every attached volume every minute
