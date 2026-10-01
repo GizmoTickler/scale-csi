@@ -713,7 +713,7 @@ func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) 
 		},
 	}
 
-	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	raw, err := c.callRaw(ctx, "pool.dataset.query", filters, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
@@ -723,15 +723,17 @@ func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) 
 	// error: IsNotFoundError matches the plain "dataset not found" text, so
 	// DatasetExists reported a false absence and DatasetDelete returned nil —
 	// the PV is released while the dataset and its data live on.
-	datasets, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected pool.dataset.query response for %s: got %T, want a list", name, result)
+	datasets, err := decodePoolDatasetRows(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected pool.dataset.query response for %s: %w", name, err)
 	}
 	if len(datasets) == 0 {
 		return nil, fmt.Errorf("dataset not found: %s", name)
 	}
-
-	return parseDataset(datasets[0])
+	if datasets[0] == nil {
+		return nil, fmt.Errorf("unexpected dataset format")
+	}
+	return datasets[0], nil
 }
 
 // DatasetGetByNames retrieves multiple datasets by name in a single
@@ -753,18 +755,16 @@ func (c *Client) DatasetGetByNames(ctx context.Context, names []string) (map[str
 		},
 	}
 
-	response, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	raw, err := c.callRaw(ctx, "pool.dataset.query", filters, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get datasets: %w", err)
 	}
-
-	items, ok := response.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
+	datasets, err := decodePoolDatasetRows(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected response type: %w", err)
 	}
-	for _, item := range items {
-		dataset, parseErr := parseDataset(item)
-		if parseErr != nil || dataset == nil {
+	for _, dataset := range datasets {
+		if dataset == nil {
 			continue
 		}
 		result[dataset.Name] = dataset
@@ -774,12 +774,12 @@ func (c *Client) DatasetGetByNames(ctx context.Context, names []string) (map[str
 
 // DatasetUpdate updates a dataset's properties.
 func (c *Client) DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error) {
-	result, err := c.Call(ctx, "pool.dataset.update", name, params)
+	raw, err := c.callRaw(ctx, "pool.dataset.update", name, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update dataset: %w", err)
 	}
 
-	return parseDataset(result)
+	return decodePoolDatasetRow(raw)
 }
 
 // DatasetList lists CSI-managed datasets below the given parent.

@@ -3,6 +3,8 @@ package truenas
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -266,6 +268,82 @@ func (dataset *rawDataset) toDataset(resourceQuery bool) *Dataset {
 	}
 	result.LegacyCSIProperties = normalizeCSIUserProperties(result.UserProperties)
 	return result
+}
+
+// notADatasetListError reports a pool.dataset.query result that is not a JSON
+// array. It is a malformed reply, never evidence that a dataset is absent.
+type notADatasetListError struct{ kind string }
+
+func (e notADatasetListError) Error() string {
+	return fmt.Sprintf("got %s, want a list", e.kind)
+}
+
+func jsonKind(trimmed []byte) string {
+	if len(trimmed) == 0 {
+		return "an empty result"
+	}
+	switch trimmed[0] {
+	case '{':
+		return "an object"
+	case '"':
+		return "a string"
+	case 'n':
+		return "null"
+	case 't', 'f':
+		return "a boolean"
+	default:
+		return "a number"
+	}
+}
+
+// decodePoolDatasetRows decodes a pool.dataset.query result with the typed
+// decoder (no interface{} tree). Any shape the typed decoder rejects, or a
+// null row, sends the whole result through the interface decoder row by row
+// exactly as before, so the fast path can never turn a malformed reply into a
+// different answer; a row parseDataset rejects is returned as nil. A result
+// that is not a JSON array is notADatasetListError.
+func decodePoolDatasetRows(raw json.RawMessage) ([]*Dataset, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, notADatasetListError{kind: jsonKind(trimmed)}
+	}
+	var typed []*rawDataset
+	if err := json.Unmarshal(trimmed, &typed); err == nil && !slices.Contains(typed, nil) {
+		return rawDatasetsToDatasets(typed, false), nil
+	}
+	generic, err := rawResultToInterface(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := generic.([]interface{})
+	if !ok {
+		return nil, notADatasetListError{kind: jsonKind(trimmed)}
+	}
+	datasets := make([]*Dataset, len(items))
+	for i, item := range items {
+		if dataset, parseErr := parseDataset(item); parseErr == nil {
+			datasets[i] = dataset
+		}
+	}
+	return datasets, nil
+}
+
+// decodePoolDatasetRow decodes one pool.dataset.* dataset object (the
+// pool.dataset.update reply) the same way: typed when it is a well-formed
+// object, otherwise exactly as parseDataset always did.
+func decodePoolDatasetRow(raw json.RawMessage) (*Dataset, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var typed rawDataset
+		if err := json.Unmarshal(trimmed, &typed); err == nil {
+			return typed.toDataset(false), nil
+		}
+	}
+	generic, err := rawResultToInterface(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	return parseDataset(generic)
 }
 
 func rawSnapshotsToSnapshots(raw []*rawSnapshot, resourceQuery bool) []*Snapshot {
