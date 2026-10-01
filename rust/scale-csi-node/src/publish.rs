@@ -279,11 +279,14 @@ async fn validate_raw_block_ownership(
             ublk_stage::validate_raw_block_ownership(state, volume_id, device, deadline).await
         }
         ShareType::Nvmeof => crate::nvme_kernel::validate_raw_block_ownership(state, volume_id, device),
+        ShareType::Iscsi if state.config.iscsi_enabled => {
+            crate::iscsi_stage::validate_raw_block_ownership(state, volume_id, device).await
+        }
+        ShareType::Iscsi => Err(Status::failed_precondition(format!(
+            "raw block device {device} is an iSCSI device on an install without iSCSI, which the Rust node agent does not serve"
+        ))),
         // NFS never publishes a raw block volume.
         ShareType::Nfs => Ok(()),
-        _ => Err(Status::failed_precondition(format!(
-            "raw block device {device} is a kernel device, which the Rust node agent does not serve yet"
-        ))),
     }
 }
 

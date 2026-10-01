@@ -27,10 +27,12 @@ pub struct Config {
     pub driver: String,
     pub nfs_enabled: bool,
     pub iscsi_enabled: bool,
+    pub iscsi: IscsiConfig,
     pub nvmeof: NvmeofConfig,
     pub node: NodeConfig,
     pub command_timeouts: CommandTimeouts,
     pub session_gc: SessionGcConfig,
+    pub rate_limiting: RateLimitConfig,
 }
 
 /// `sessionGC`: orphaned-session cleanup on the node (Go defaults).
@@ -49,6 +51,8 @@ pub struct SessionGcConfig {
     pub startup_delay: i64,
     #[serde(rename = "nvmeofEnabled")]
     pub nvmeof_enabled: Option<bool>,
+    #[serde(rename = "iscsiEnabled")]
+    pub iscsi_enabled: Option<bool>,
 }
 
 impl SessionGcConfig {
@@ -98,6 +102,52 @@ impl CommandTimeouts {
 
     pub fn nvme(&self) -> Duration {
         seconds_or(self.nvme, 30)
+    }
+
+    pub fn iscsi(&self) -> Duration {
+        seconds_or(self.iscsi, 10)
+    }
+}
+
+/// `iscsi`: the keys the node reads (Go ISCSIConfig).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IscsiConfig {
+    /// `host:port`, normalized at load as Go normalizeISCSITargetPortal does;
+    /// session GC only considers sessions to it.
+    pub target_portal: String,
+    /// Appended to the volume ID before the target name is derived.
+    pub name_suffix: String,
+    /// Seconds a stage waits for the LUN's device; 0 takes 60.
+    pub device_wait_timeout: i64,
+}
+
+impl IscsiConfig {
+    pub fn device_wait_timeout(&self) -> Duration {
+        seconds_or(self.device_wait_timeout, 60)
+    }
+}
+
+/// `resilience.rateLimiting`: iSCSI login concurrency and discovery caching.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RateLimitConfig {
+    /// Logins in flight per portal; 0 takes 2.
+    pub max_concurrent_logins: i64,
+    /// Seconds a SendTargets discovery of a portal is reused; 0 takes 30.
+    pub discovery_cache_duration: i64,
+}
+
+impl RateLimitConfig {
+    pub fn max_concurrent_logins(&self) -> usize {
+        usize::try_from(self.max_concurrent_logins)
+            .ok()
+            .filter(|v| *v > 0)
+            .unwrap_or(2)
+    }
+
+    pub fn discovery_cache_duration(&self) -> Duration {
+        seconds_or(self.discovery_cache_duration, 30)
     }
 }
 
@@ -274,6 +324,24 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
     let command_timeouts: CommandTimeouts =
         serde_json::from_value(section("commandTimeouts")).context("config commandTimeouts")?;
     let session_gc: SessionGcConfig = serde_json::from_value(section("sessionGC")).context("config sessionGC")?;
+    let mut iscsi: IscsiConfig = serde_json::from_value(section("iscsi")).context("config iscsi")?;
+    let iscsi_enabled = enabled("iscsi")?;
+    if iscsi_enabled {
+        if iscsi.target_portal.is_empty() {
+            bail!("iscsi.targetPortal is required when iSCSI is enabled");
+        }
+        iscsi.target_portal = crate::iscsi_stage::normalize_target_portal(&iscsi.target_portal)
+            .map_err(|e| anyhow::anyhow!("iscsi.targetPortal is invalid: {e}"))?;
+    }
+    let resilience = section("resilience");
+    let rate_limiting: RateLimitConfig = serde_json::from_value(
+        resilience
+            .get("rateLimiting")
+            .cloned()
+            .filter(|v| !v.is_null())
+            .unwrap_or(Value::Object(Default::default())),
+    )
+    .context("config resilience.rateLimiting")?;
     let driver = root
         .get("driver")
         .and_then(Value::as_str)
@@ -282,11 +350,13 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
     let config = Config {
         driver,
         nfs_enabled: enabled("nfs")?,
-        iscsi_enabled: enabled("iscsi")?,
+        iscsi_enabled,
+        iscsi,
         nvmeof,
         node,
         command_timeouts,
         session_gc,
+        rate_limiting,
     };
     validate(&config)?;
     Ok(config)
@@ -330,6 +400,23 @@ fn validate(config: &Config) -> Result<()> {
     for (name, value) in [
         ("sessionGC.interval", config.session_gc.interval),
         ("sessionGC.gracePeriod", config.session_gc.grace_period),
+    ] {
+        if value < 0 {
+            bail!("{name} must not be negative");
+        }
+    }
+    if config.iscsi.device_wait_timeout < 0 {
+        bail!("iscsi.deviceWaitTimeout must not be negative");
+    }
+    for (name, value) in [
+        (
+            "resilience.rateLimiting.maxConcurrentLogins",
+            config.rate_limiting.max_concurrent_logins,
+        ),
+        (
+            "resilience.rateLimiting.discoveryCacheDuration",
+            config.rate_limiting.discovery_cache_duration,
+        ),
     ] {
         if value < 0 {
             bail!("{name} must not be negative");
@@ -514,6 +601,49 @@ mod tests {
         ] {
             assert!(parse(bad, env).is_err(), "{bad:?} was accepted");
         }
+    }
+
+    #[test]
+    fn the_iscsi_keys_the_node_reads() {
+        let c = parse("iscsi:\n  targetPortal: Host.Example.\n", env).unwrap();
+        assert!(c.iscsi_enabled);
+        assert_eq!(
+            c.iscsi.target_portal, "host.example:3260",
+            "normalized as the Go loader does"
+        );
+        assert_eq!(c.iscsi.device_wait_timeout(), Duration::from_secs(60));
+        assert_eq!(c.command_timeouts.iscsi(), Duration::from_secs(10));
+        assert_eq!(c.rate_limiting.max_concurrent_logins(), 2);
+        assert_eq!(c.rate_limiting.discovery_cache_duration(), Duration::from_secs(30));
+        assert_eq!(c.session_gc.iscsi_enabled, None);
+        let c = parse(
+            "iscsi:\n  targetPortal: 192.0.2.1:3261\n  nameSuffix: -x\n  deviceWaitTimeout: 5\nresilience:\n  rateLimiting: {maxConcurrentLogins: 4, discoveryCacheDuration: 9}\ncommandTimeouts: {iscsi: 20}\nsessionGC: {iscsiEnabled: false}\n",
+            env,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.iscsi.target_portal.as_str(), c.iscsi.name_suffix.as_str()),
+            ("192.0.2.1:3261", "-x")
+        );
+        assert_eq!(c.iscsi.device_wait_timeout(), Duration::from_secs(5));
+        assert_eq!(c.rate_limiting.max_concurrent_logins(), 4);
+        assert_eq!(c.rate_limiting.discovery_cache_duration(), Duration::from_secs(9));
+        assert_eq!(c.command_timeouts.iscsi(), Duration::from_secs(20));
+        assert_eq!(c.session_gc.iscsi_enabled, Some(false));
+        let err = parse("iscsi:\n  enabled: true\n", env).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("iscsi.targetPortal is required when iSCSI is enabled"),
+            "{err:#}"
+        );
+        for bad in [
+            "iscsi:\n  targetPortal: 192.0.2.1:0\n",
+            "iscsi:\n  targetPortal: 192.0.2.1\n  deviceWaitTimeout: -1\n",
+            "resilience:\n  rateLimiting: {maxConcurrentLogins: -1}\n",
+        ] {
+            assert!(parse(bad, env).is_err(), "{bad:?} was accepted");
+        }
+        let off = parse("iscsi:\n  enabled: false\n", env).unwrap();
+        assert!(!off.iscsi_enabled, "a disabled block needs no portal");
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub struct Metrics {
     nvme_sessions_total: IntGauge,
     gc_sessions_disconnected_total: IntCounterVec,
     nvme_controller_tunable_corrections_total: IntCounterVec,
+    iscsi_sessions_total: IntGauge,
+    iscsi_path_connect_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -93,6 +95,24 @@ impl Metrics {
             &["tunable", "result"],
         )
         .expect("valid metric");
+        // iSCSI.
+        let iscsi_sessions_total = IntGauge::with_opts(
+            Opts::new(
+                "iscsi_sessions_total",
+                "Total number of active iSCSI sessions on this node",
+            )
+            .namespace(NAMESPACE),
+        )
+        .expect("valid metric");
+        let iscsi_path_connect_total = IntCounterVec::new(
+            Opts::new(
+                "iscsi_path_connect_total",
+                "Total number of iSCSI path convergence results by target portal",
+            )
+            .namespace(NAMESPACE),
+            &["portal", "result"],
+        )
+        .expect("valid metric");
         for collector in [
             Box::new(operations_total.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(nvme_sessions_total.clone()),
@@ -103,6 +123,8 @@ impl Metrics {
             Box::new(nvme_path_connect_total.clone()),
             Box::new(connection_status),
             Box::new(connections_active),
+            Box::new(iscsi_sessions_total.clone()),
+            Box::new(iscsi_path_connect_total.clone()),
         ] {
             registry.register(collector).expect("unique metric");
         }
@@ -115,7 +137,25 @@ impl Metrics {
             nvme_sessions_total,
             gc_sessions_disconnected_total,
             nvme_controller_tunable_corrections_total,
+            iscsi_sessions_total,
+            iscsi_path_connect_total,
         }
+    }
+
+    pub fn set_iscsi_sessions(&self, count: usize) {
+        self.iscsi_sessions_total.set(count as i64);
+    }
+
+    pub fn iscsi_sessions(&self) -> i64 {
+        self.iscsi_sessions_total.get()
+    }
+
+    pub fn record_iscsi_path_connect(&self, portal: &str, result: &str) {
+        self.iscsi_path_connect_total.with_label_values(&[portal, result]).inc();
+    }
+
+    pub fn iscsi_path_connects(&self, portal: &str, result: &str) -> u64 {
+        self.iscsi_path_connect_total.with_label_values(&[portal, result]).get()
     }
 
     pub fn set_nvme_sessions(&self, count: usize) {

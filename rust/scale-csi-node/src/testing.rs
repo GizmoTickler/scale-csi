@@ -28,6 +28,8 @@ pub struct HostState {
     pub failing: Vec<String>,
     /// A fake kernel NVMe initiator, when set.
     pub kernel: Option<FakeKernel>,
+    /// A fake iSCSI initiator, when set.
+    pub iscsi: Option<crate::iscsi_testing::FakeIscsi>,
     /// device -> filesystem
     pub filesystems: HashMap<String, String>,
     pub calls: Vec<String>,
@@ -81,7 +83,8 @@ impl FakeHost {
             _ => path.to_string(),
         };
         let name = std::path::Path::new(&device).file_name()?.to_str()?;
-        let is_device = name.starts_with("ublkb") || name.starts_with("nvme") || name.starts_with("sd");
+        let is_device =
+            name.starts_with("ublkb") || name.starts_with("nvme") || name.starts_with("sd") || name.starts_with("dm-");
         is_device.then(|| {
             name.bytes()
                 .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
@@ -210,6 +213,7 @@ impl Runner for FakeHost {
             }
             ("resize2fs" | "xfs_growfs" | "btrfs", _) => output(0, ""),
             ("nvme", _) if host.kernel.is_some() => host.kernel.as_mut().unwrap().run(args),
+            ("iscsiadm", _) if host.iscsi.is_some() => host.iscsi.as_mut().unwrap().run(args),
             _ => output(127, ""),
         })
     }

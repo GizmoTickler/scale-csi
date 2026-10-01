@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status};
 use crate::config::Config;
 use crate::csi::{self, identity_server::Identity, node_server::Node};
 use crate::events::{Events, LogEvents};
+use crate::iscsi::Iscsi;
 use crate::locks::OperationLocks;
 use crate::metrics::Metrics;
 use crate::mount::{CLocaleRunner, Mounter, Timeouts};
@@ -81,6 +82,10 @@ pub struct State {
     pub operations: Arc<RwLock<()>>,
     /// Session GC's orphaned sessions and when it first saw them.
     pub orphans: crate::session_gc::Orphans,
+    /// The kernel iSCSI initiator (iscsiadm and sysfs).
+    pub iscsi: Iscsi,
+    /// Session GC's orphaned iSCSI sessions, kept apart from NVMe-oF's.
+    pub iscsi_orphans: crate::session_gc::Orphans,
 }
 
 impl State {
@@ -93,6 +98,9 @@ impl State {
             format: config.command_timeouts.format(),
         };
         let nvme_timeout = config.command_timeouts.nvme();
+        let mut iscsi = Iscsi::new(Arc::new(CLocaleRunner), config.command_timeouts.iscsi());
+        iscsi.max_concurrent_logins = config.rate_limiting.max_concurrent_logins();
+        iscsi.discovery_cache = config.rate_limiting.discovery_cache_duration();
         State {
             metrics,
             driver_name,
@@ -116,6 +124,8 @@ impl State {
             host: Host::default(),
             operations: Arc::default(),
             orphans: Default::default(),
+            iscsi,
+            iscsi_orphans: Default::default(),
         }
     }
 }

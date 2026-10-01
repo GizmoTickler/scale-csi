@@ -101,7 +101,7 @@ async fn list(state: &State, deadline: Option<Instant>, why: &str) -> Vec<Subsys
 }
 
 /// The staged device, if it is still live: a block link, or a mounted device.
-async fn staged_device(state: &State, staging: &str, deadline: Option<Instant>) -> Option<String> {
+pub(crate) async fn staged_device(state: &State, staging: &str, deadline: Option<Instant>) -> Option<String> {
     if let Some(device) = staged_block_device_path(staging, &state.host.dev_dir) {
         return Some(device);
     }

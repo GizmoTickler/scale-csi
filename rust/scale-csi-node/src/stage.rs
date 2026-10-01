@@ -8,8 +8,8 @@
 //! a raw-block volume gets a symlink to its device at the staging path, a
 //! filesystem volume is formatted if blank and mounted there.
 //!
-//! This agent serves NVMe-oF through nvmeublkd only, so far. A volume on any
-//! other path is refused with FailedPrecondition before anything is changed.
+//! This agent serves NVMe-oF and iSCSI so far. An NFS volume is refused with
+//! FailedPrecondition before anything is changed.
 
 use std::collections::HashMap;
 use std::os::unix::fs::DirBuilderExt;
@@ -100,10 +100,7 @@ async fn verify_stage_device_source(
             ublk_stage::verify_stage_source(state, volume_id, device, context, deadline).await
         }
         ShareType::Nvmeof => nvme_kernel::verify_stage_source(state, device, context),
-        _ => Err(not_served(format!(
-            "staging target is backed by {device}, a kernel {} device",
-            share_name(share)
-        ))),
+        ShareType::Iscsi => crate::iscsi_stage::verify_stage_source(state, device, context).await,
     }
 }
 
@@ -295,13 +292,21 @@ pub async fn node_stage(
         .ok_or_else(|| Status::aborted("operation already in progress"))?;
 
     let share = capability::attach_driver(&req.volume_context, &state.driver_name);
-    if share != ShareType::Nvmeof {
+    // iSCSI is served where the install enables it (the Go node would try
+    // anyway; an install without it has no iSCSI settings to stage with).
+    if share == ShareType::Nfs || (share == ShareType::Iscsi && !state.config.iscsi_enabled) {
         return Err(not_served(format!(
             "volume {volume_id} is a {} volume",
             share_name(share)
         )));
     }
-    let stage_context = with_publish_hint(&req.volume_context, &req.publish_context, "addresses");
+    // The attach-scoped path hint: iSCSI portals, NVMe-oF addresses.
+    let hint = if share == ShareType::Iscsi {
+        "portals"
+    } else {
+        "addresses"
+    };
+    let stage_context = with_publish_hint(&req.volume_context, &req.publish_context, hint);
     let signature = capability::signature(Some(capability))?;
     let expected = capability::stage_source_identity(share, &req.volume_context)?;
     let want = Wanted {
@@ -314,6 +319,20 @@ pub async fn node_stage(
         deadline,
     };
     if handle_existing_stage(state, &want).await? {
+        if share == ShareType::Iscsi {
+            let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+            crate::iscsi_stage::converge_existing(
+                state,
+                &stage_context,
+                &req.secrets,
+                staging,
+                event.as_ref(),
+                deadline,
+            )
+            .await;
+            info!("Volume {volume_id} is already staged compatibly at {staging}");
+            return Ok(());
+        }
         // Kernel path convergence is for kernel controllers only: a ublk
         // device has none, and the daemon runs its own multipath.
         let ublk = state
@@ -341,6 +360,26 @@ pub async fn node_stage(
         .create(directory)
         .map_err(|e| Status::internal(format!("failed to create staging directory: {e}")))?;
     let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+
+    if share == ShareType::Iscsi {
+        crate::iscsi_stage::stage(
+            state,
+            crate::iscsi_stage::StageRequest {
+                context: &stage_context,
+                secrets: &req.secrets,
+                staging,
+                capability,
+                event: event.as_ref(),
+                deadline,
+            },
+        )
+        .await?;
+        if !handle_existing_stage(state, &want).await? {
+            remember_stage(state, &want).await;
+        }
+        info!("Volume {volume_id} staged successfully at {staging}");
+        return Ok(());
+    }
 
     match ublk_stage::data_path_for_volume(state, &stage_context)? {
         DataPath::Ublk => {
@@ -423,9 +462,10 @@ pub async fn node_unstage(
             }
         },
     };
-    // Only NVMe-oF is served: an iSCSI (or other) device is refused before
-    // anything changes rather than half unstaged.
-    if !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") {
+    // Without iSCSI only NVMe-oF is served: another device is refused before
+    // anything changes rather than half unstaged. With it, a device that is
+    // not NVMe-oF is cleaned up as iSCSI, as in the Go node.
+    if !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") && !state.config.iscsi_enabled {
         return Err(not_served(format!(
             "volume {volume_id} is staged on {device}, which is not an NVMe-oF device"
         )));
@@ -467,12 +507,14 @@ pub async fn node_unstage(
         // A block link's literal /dev name can be stale after a reboot: the
         // session is found by the volume's subsystem name instead. A device
         // read from the live mount before the unmount is safe to use.
-        let cleanup =
-            if !symlink && !device.is_empty() && nvme_kernel::disconnect_device(state, &device, deadline).await {
-                Ok(())
-            } else {
-                nvme_kernel::cleanup_by_volume(state, volume_id, deadline).await
-            };
+        let iscsi = !device.contains("nvme") && (!device.is_empty() || state.config.iscsi_enabled);
+        let cleanup = if iscsi {
+            crate::iscsi_stage::unstage_cleanup(state, volume_id, &device, symlink, deadline).await
+        } else if !symlink && !device.is_empty() && nvme_kernel::disconnect_device(state, &device, deadline).await {
+            Ok(())
+        } else {
+            nvme_kernel::cleanup_by_volume(state, volume_id, deadline).await
+        };
         // Fail closed: a session that was found but would not disconnect is
         // not unstaged, so kubelet retries rather than leaking it.
         cleanup.map_err(|e| {

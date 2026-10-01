@@ -32,7 +32,11 @@ fn start(config: &str, health_port: u16) -> Agent {
 }
 
 fn start_with(config: &str, health_port: u16, verbosity: u8) -> Agent {
-    let dir = tempfile::tempdir().unwrap();
+    start_in(tempfile::tempdir().unwrap(), config, health_port, verbosity, None)
+}
+
+/// `path_first`: a directory put in front of PATH (fake host commands).
+fn start_in(dir: tempfile::TempDir, config: &str, health_port: u16, verbosity: u8, path_first: Option<&Path>) -> Agent {
     let config_path = dir.path().join("config.yaml");
     std::fs::write(&config_path, config).unwrap();
     let socket = dir.path().join("csi.sock");
@@ -47,6 +51,13 @@ fn start_with(config: &str, health_port: u16, verbosity: u8) -> Agent {
             format!("-v={verbosity}"),
         ])
         .env("NODE_IP", "192.0.2.10")
+        .env(
+            "PATH",
+            match path_first {
+                Some(first) => format!("{}:{}", first.display(), std::env::var("PATH").unwrap_or_default()),
+                None => std::env::var("PATH").unwrap_or_default(),
+            },
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -171,7 +182,10 @@ async fn serves_identity_and_node_info() {
 
 #[tokio::test]
 async fn refuses_protocols_it_does_not_serve() {
-    for config in ["nfs: {}\nnvmeof: {}\n", "iscsi:\n  targetPortal: 192.0.2.1:3260\n"] {
+    for config in [
+        "nfs: {}\nnvmeof: {}\n",
+        "nfs: {}\niscsi:\n  targetPortal: 192.0.2.1:3260\n",
+    ] {
         let mut agent = start(config, 0);
         let status = agent.child.wait().unwrap();
         assert!(!status.success(), "{config:?} was accepted");
@@ -260,4 +274,93 @@ async fn request_secrets_never_reach_the_log() {
     );
     assert!(log.contains("failed after"), "{log}");
     assert!(!log.contains("hunter2"), "a secret reached the log: {log}");
+}
+
+/// An iSCSI install is served.
+#[tokio::test]
+async fn serves_an_iscsi_install() {
+    let agent = start("iscsi:\n  targetPortal: 192.0.2.1\n", 0);
+    let mut node = NodeClient::new(channel(&agent.socket).await);
+    let info = node
+        .node_get_info(csi::NodeGetInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(node_id::parse(&info.node_id).unwrap().name, "test-node");
+}
+
+/// A CHAP stage end to end, against a fake iscsiadm on PATH that records its
+/// argv: at trace verbosity neither the log nor any argv carries a password.
+#[tokio::test]
+async fn chap_passwords_reach_neither_the_log_nor_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let argv_log = dir.path().join("iscsiadm.argv");
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> {}\ncase \"$*\" in\n  \"-m session\") echo 'iscsiadm: No active sessions.'; exit 21;;\n  *--login*) echo 'iscsiadm: initiator reported error (24 - iSCSI login failed due to authorization failure)'; exit 24;;\nesac\nexit 0\n",
+        argv_log.display()
+    );
+    std::fs::write(bin.join("iscsiadm"), script).unwrap();
+    std::fs::set_permissions(
+        bin.join("iscsiadm"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let staging = dir.path().join("staging/globalmount").to_string_lossy().into_owned();
+    let mut agent = start_in(dir, "iscsi:\n  targetPortal: 192.0.2.1:3260\n", 0, 5, Some(&bin));
+    let mut node = NodeClient::new(channel(&agent.socket).await);
+    let secret = "hunter2-Pass12";
+    let request = csi::NodeStageVolumeRequest {
+        volume_id: "pvc-chap".into(),
+        staging_target_path: staging,
+        volume_capability: Some(csi::VolumeCapability {
+            access_type: Some(csi::volume_capability::AccessType::Mount(Default::default())),
+            access_mode: Some(csi::volume_capability::AccessMode { mode: 1 }),
+        }),
+        volume_context: [
+            ("node_attach_driver", "iscsi"),
+            ("portal", "192.0.2.1:3260"),
+            ("iqn", "iqn.2005-10.org.freenas.ctl:pvc-chap"),
+            ("lun", "0"),
+            ("chap", "CHAP"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+        secrets: [("username", "chap-user"), ("password", secret)]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let err = node.node_stage_volume(request).await.unwrap_err();
+    assert!(!err.message().contains("hunter2"), "{err:?}");
+    drop(node);
+    let mut stderr = agent.child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut log = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut log);
+        log
+    });
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(agent.child.id() as i32, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while agent.child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = agent.child.kill();
+            let _ = agent.child.wait();
+            panic!("no exit after SIGTERM: {}", reader.join().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let log = reader.join().unwrap();
+    assert!(
+        log.contains("request: NodeStageVolumeRequest"),
+        "the body is logged at trace: {log}"
+    );
+    assert!(!log.contains("hunter2"), "a password reached the log: {log}");
+    let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+    assert!(argv.contains("-n node.session.auth.username -v chap-user"), "{argv}");
+    assert!(!argv.contains("hunter2"), "a password reached argv: {argv}");
 }
