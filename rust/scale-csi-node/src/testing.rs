@@ -66,6 +66,26 @@ impl HostState {
 }
 
 impl FakeHost {
+    /// A fake device number: a bind target reports its device's; a device
+    /// path reports one derived from its name.
+    pub fn device_number(&self, path: &str) -> Option<u64> {
+        let host = self.0.lock().unwrap();
+        let device = match host.mounts.get(path) {
+            Some((source, fs, _)) if fs == "devtmpfs" => source
+                .strip_prefix("udev[")
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(source)
+                .to_string(),
+            _ => path.to_string(),
+        };
+        let name = std::path::Path::new(&device).file_name()?.to_str()?;
+        let is_device = name.starts_with("ublkb") || name.starts_with("nvme") || name.starts_with("sd");
+        is_device.then(|| {
+            name.bytes()
+                .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
+        })
+    }
+
     pub fn mount(&self, target: &str, source: &str, fs: &str) {
         self.mount_with(target, source, fs, "rw");
     }
@@ -173,7 +193,8 @@ impl Runner for FakeHost {
                     .is_some_and(|i| args[i + 1].split(',').any(|o| o == "bind"));
                 let entry = match host.mounts.get(source) {
                     Some((src, fs, _)) if bound => (src.clone(), fs.clone(), "rw".to_string()),
-                    _ if bound => (source.to_string(), "devtmpfs".to_string(), "rw".to_string()),
+                    // As findmnt shows it: devtmpfs with the node's path as root.
+                    _ if bound => (format!("udev[{source}]"), "devtmpfs".to_string(), "rw".to_string()),
                     _ => (source.to_string(), fs, "rw".to_string()),
                 };
                 host.mounts.insert(target.into(), entry);
@@ -395,6 +416,11 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
         kubelet_dir: dir.path().join("kubelet"),
         sysfs: dir.path().join("sys"),
         host_id_files: vec![dir.path().join("no-hostid")],
+        // A bind target reports its device's number (see FakeHost::device_number).
+        device_number: {
+            let numbers = host.clone();
+            Arc::new(move |path: &str| Ok(numbers.device_number(path)))
+        },
     };
     let nvme_runner: Arc<dyn Runner> = host.clone();
     state.nvme = crate::nvme::Nvme {

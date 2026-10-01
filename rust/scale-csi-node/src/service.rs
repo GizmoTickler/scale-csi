@@ -24,6 +24,15 @@ use crate::records::Records;
 use crate::session_registry::SessionRegistry;
 use crate::ublk_client::{self, Daemon};
 
+/// A path's device number, when it is a block device.
+pub type BlockDeviceNumber = Arc<dyn Fn(&str) -> std::io::Result<Option<u64>> + Send + Sync>;
+
+fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path)?;
+    Ok(meta.file_type().is_block_device().then(|| meta.rdev()))
+}
+
 /// Where the node looks at the host; the tests point it elsewhere.
 pub struct Host {
     /// Where block devices appear.
@@ -32,6 +41,8 @@ pub struct Host {
     pub kubelet_dir: PathBuf,
     pub sysfs: PathBuf,
     pub host_id_files: Vec<PathBuf>,
+    /// stat(2) of a block device's number (the tests supply their own).
+    pub device_number: BlockDeviceNumber,
 }
 
 impl Default for Host {
@@ -41,6 +52,7 @@ impl Default for Host {
             kubelet_dir: PathBuf::from("/var/lib/kubelet"),
             sysfs: PathBuf::from("/sys"),
             host_id_files: crate::ublk_state::default_host_id_files(),
+            device_number: Arc::new(block_device_number),
         }
     }
 }

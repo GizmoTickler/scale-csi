@@ -123,7 +123,22 @@ async fn validate_existing(
         .mount_info(target, deadline)
         .await
         .map_err(|e| Status::internal(format!("failed to inspect existing publication mount: {e:#}")))?;
-    let live = normalize_mount_source(&info.source);
+    let mut live = normalize_mount_source(&info.source);
+    if capability.access_type == AccessType::Block {
+        // The mount table shows a bound device node's source as devtmpfs
+        // ("udev[/nvme0n1]"), not the device: compare device numbers.
+        let number = |path: &str| {
+            (state.host.device_number)(path)
+                .map_err(|e| Status::internal(format!("failed to inspect existing raw block publication: {e}")))
+        };
+        let (bound, staged) = (number(target)?, number(expected)?);
+        if bound.is_none() || bound != staged {
+            return Err(Status::already_exists(format!(
+                "target path {target} is not bound to the staged device {expected}"
+            )));
+        }
+        live = expected.to_string();
+    }
     if info.read_only != req.readonly {
         return Err(Status::already_exists(format!(
             "target path {target} readonly state is {}, requested {}",
@@ -261,9 +276,11 @@ async fn remember(
     expected: &str,
     deadline: Option<Instant>,
 ) {
+    // A raw-block publication is the staged device itself (its mount source is
+    // devtmpfs); validate_existing compares it the same way.
     let live = match state.mounter.mount_info(&req.target_path, deadline).await {
-        Ok(info) => normalize_mount_source(&info.source),
-        Err(_) => expected.to_string(),
+        Ok(info) if capability.access_type != AccessType::Block => normalize_mount_source(&info.source),
+        _ => expected.to_string(),
     };
     state.records.store_publication(MountRecord {
         volume_id: req.volume_id.clone(),

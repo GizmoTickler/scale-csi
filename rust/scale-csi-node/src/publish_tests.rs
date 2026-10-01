@@ -391,3 +391,25 @@ async fn a_recorded_publication_blocks_a_second_target() {
     let err = node_publish(&n.state, &second, None).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
+
+/// After a restart there is no record, and the mount table shows the bound
+/// device node's source as devtmpfs (`udev[/dev/...]`): the replay matches the
+/// target to the staged device by device number.
+#[tokio::test]
+async fn a_raw_block_replay_after_a_restart_matches_by_device_number() {
+    let (n, staging) = staged(block()).await;
+    let req = publish_request(&n, &staging, "p1", block());
+    node_publish(&n.state, &req, None).await.unwrap();
+    n.state.records.delete_publication(&req.target_path);
+    node_publish(&n.state, &req, None)
+        .await
+        .expect("the bound device is the staged one");
+    assert_eq!(mounts_of(&n, &req.target_path), 1);
+
+    // Bound to another device: refused.
+    n.state.records.delete_publication(&req.target_path);
+    n.host
+        .mount_with(&req.target_path, "udev[/dev/ublkb9]", "devtmpfs", "rw");
+    let err = node_publish(&n.state, &req, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists, "{err:?}");
+}
