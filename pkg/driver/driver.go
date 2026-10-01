@@ -311,7 +311,10 @@ type Driver struct {
 	// revoking an old record immediately after a fresh VA disappearance.
 	stalePublicationRecordsSeen sync.Map
 	// publicationStore holds publication records; nil means the ZFS store.
-	publicationStore    publicationStore
+	publicationStore publicationStore
+	// publicationCacheRef is the store's watch, for Stop() to end; it races
+	// Run()'s startup, hence atomic.
+	publicationCacheRef atomic.Pointer[publicationCache]
 	fencingDeferredLogs sync.Map
 
 	// Track when orphaned sessions were first seen (for grace period). The
@@ -710,6 +713,9 @@ func (d *Driver) Stop() {
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
 	d.stopTombstoneReapRecordPoll()
+	if publicationCache := d.publicationCacheRef.Load(); publicationCache != nil {
+		publicationCache.close()
+	}
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

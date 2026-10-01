@@ -123,9 +123,18 @@ func (s kubernetesPublicationStore) records(ctx context.Context, datasetName str
 	if err != nil {
 		return nil, fmt.Errorf("list publication records for %s: %w", datasetName, err)
 	}
-	records := make(map[string]publicationRecord, len(list.Items))
+	objects := make([]*unstructured.Unstructured, len(list.Items))
 	for i := range list.Items {
-		object := &list.Items[i]
+		objects[i] = &list.Items[i]
+	}
+	return s.recordsOf(datasetName, objects)
+}
+
+// recordsOf validates the dataset's objects, from the API or the cache, as
+// records keyed by node.
+func (s kubernetesPublicationStore) recordsOf(datasetName string, objects []*unstructured.Unstructured) (map[string]publicationRecord, error) {
+	records := make(map[string]publicationRecord, len(objects))
+	for _, object := range objects {
 		spec, err := decodeVolumePublicationSpec(object)
 		if err != nil {
 			return nil, err

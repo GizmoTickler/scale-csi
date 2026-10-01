@@ -28,19 +28,28 @@ func selectingDriver(t *testing.T, setting string, listErr ...error) (*Driver, *
 
 	fake := newFakeVolumePublicationClient()
 	lists := 0
-	fake.PrependReactor("list", "volumepublications", func(clienttesting.Action) (bool, runtime.Object, error) {
+	fake.PrependReactor("list", "volumepublications", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if list, ok := action.(clienttesting.ListAction); ok && !list.GetListRestrictions().Labels.Empty() {
+			return false, nil, nil // the cache's watch, not the probe
+		}
 		lists++
 		if lists <= len(listErr) && listErr[lists-1] != nil {
 			return true, nil, listErr[lists-1]
 		}
 		return false, nil, nil
 	})
-	return &Driver{
+	d := &Driver{
 		runController: true,
 		config:        &Config{DriverInstanceID: "one"},
 		truenasClient: truenas.NewMockClient(),
 		eventRecorder: &EventRecorder{dynamicClient: fake},
-	}, &lists
+	}
+	t.Cleanup(func() {
+		if publicationCache := d.publicationCacheRef.Load(); publicationCache != nil {
+			publicationCache.close()
+		}
+	})
+	return d, &lists
 }
 
 func TestPublicationStoreSelection(t *testing.T) {
@@ -60,6 +69,9 @@ func TestPublicationStoreSelection(t *testing.T) {
 	require.True(t, ok, "%T", d.publications())
 	assert.Equal(t, "scale-csi", store.kube.namespace)
 	assert.Equal(t, "one", store.kube.instance)
+	require.NotNil(t, store.cache)
+	assert.True(t, store.cache.informer.HasSynced(), "the cache synced before serving")
+	assert.Same(t, store.cache, d.publicationCacheRef.Load(), "Stop() can end the watch")
 
 	d, _ = selectingDriver(t, "kubernetes", apierrors.NewNotFound(resource, ""))
 	err := d.selectPublicationStore(ctx)

@@ -74,7 +74,22 @@ func (d *Driver) selectPublicationStore(ctx context.Context) error {
 		_, err = store.resource().List(ctx, metav1.ListOptions{Limit: 1})
 		switch {
 		case err == nil:
-			d.publicationStore = importingPublicationStore{kube: store, legacy: zfsPublicationStore{client: d.truenasClient}}
+			publicationCache, cacheErr := newPublicationCache(store)
+			if cacheErr != nil {
+				return fmt.Errorf("publication records: %w", cacheErr)
+			}
+			// Stop() sets serverStopped before it loads the reference: one of
+			// the two sees the other and the watch is ended.
+			d.publicationCacheRef.Store(publicationCache)
+			d.serverStateMu.Lock()
+			stopped := d.serverStopped
+			d.serverStateMu.Unlock()
+			if stopped {
+				publicationCache.close()
+			} else {
+				publicationCache.start(ctx)
+			}
+			d.publicationStore = importingPublicationStore{kube: store, legacy: zfsPublicationStore{client: d.truenasClient}, cache: publicationCache}
 			klog.Infof("Publication records are kept as VolumePublications in namespace %s", namespace)
 			return nil
 		case apierrors.IsNotFound(err):

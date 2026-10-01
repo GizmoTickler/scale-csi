@@ -19,6 +19,31 @@ import (
 type importingPublicationStore struct {
 	kube   kubernetesPublicationStore
 	legacy zfsPublicationStore
+	// cache answers the reads that only report records; nil reads the API.
+	cache *publicationCache
+}
+
+// cachedRecords is records with the Kubernetes side read from the cache,
+// once it has synced.
+func (s importingPublicationStore) cachedRecords(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error) {
+	if s.cache == nil {
+		return s.records(ctx, datasetName, ds)
+	}
+	current, synced, err := s.cache.records(datasetName)
+	if err != nil {
+		return nil, err
+	}
+	if !synced {
+		return s.records(ctx, datasetName, ds)
+	}
+	out, err := s.legacy.records(ctx, datasetName, ds)
+	if err != nil {
+		return nil, err
+	}
+	for key := range current {
+		out[key] = current[key]
+	}
+	return out, nil
 }
 
 func (s importingPublicationStore) records(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error) {

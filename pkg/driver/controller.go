@@ -2487,7 +2487,7 @@ func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page [
 // not go dark over one corrupt property — the entry is returned without
 // published-node data instead.
 func (d *Driver) publishedNodeIDs(ctx context.Context, ds *truenas.Dataset) []string {
-	records, err := d.publications().records(ctx, ds.Name, ds)
+	records, err := readPublicationRecordsCached(ctx, d.publications(), ds.Name, ds)
 	if err != nil {
 		klog.Warningf("ListVolumes: skipping published-node ids for %s: %v", ds.Name, err)
 		return nil

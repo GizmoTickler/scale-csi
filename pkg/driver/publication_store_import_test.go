@@ -15,6 +15,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
@@ -227,4 +228,35 @@ func TestStaleSweepRevokesRecordsInEitherStoreDuringImport(t *testing.T) {
 	share, err = client.NFSShareGet(ctx, share.ID)
 	require.NoError(t, err)
 	assert.Empty(t, share.Hosts, "both CSI-added grants removed")
+}
+
+// ListVolumes reads published node ids from the watch-fed cache: once it has
+// synced, a resync of every volume costs no API call, and the cache follows
+// writes.
+func TestPublishedNodeIDsComeFromTheCacheWithoutAnAPICall(t *testing.T) {
+	ctx := context.Background()
+	store, client, ds := newImportingStore(t, testRecord("node-1", publicationStatePublished))
+	fake := store.kube.client.(*dynamicfake.FakeDynamicClient)
+	publicationCache, err := newPublicationCache(store.kube)
+	require.NoError(t, err)
+	t.Cleanup(publicationCache.close)
+	publicationCache.start(ctx)
+	store.cache = publicationCache
+	d := &Driver{publicationStore: store, truenasClient: client}
+
+	require.NoError(t, store.kube.store(ctx, ds.Name, ds, publicationPropertyKey("node-2"), testRecord("node-2", publicationStatePublished)))
+	want := []string{testRecord("node-1", "").EncodedID, testRecord("node-2", "").EncodedID}
+	require.Eventually(t, func() bool { return assert.ObjectsAreEqual(want, d.publishedNodeIDs(ctx, ds)) },
+		5*time.Second, 10*time.Millisecond, "a record on ZFS and one in Kubernetes")
+
+	fake.ClearActions()
+	for range 50 {
+		assert.Equal(t, want, d.publishedNodeIDs(ctx, ds))
+	}
+	assert.Empty(t, fake.Actions(), "no API call per read")
+
+	require.NoError(t, store.kube.remove(ctx, ds.Name, ds, []string{publicationPropertyKey("node-2")}))
+	require.Eventually(t, func() bool {
+		return assert.ObjectsAreEqual([]string{testRecord("node-1", "").EncodedID}, d.publishedNodeIDs(ctx, ds))
+	}, 5*time.Second, 10*time.Millisecond, "the cache follows a removal")
 }
