@@ -825,3 +825,52 @@ func TestNVMeoFSubsystemDeleteCascade_SendsForce(t *testing.T) {
 	assert.Equal(t, float64(31), got[0])
 	assert.Equal(t, map[string]interface{}{"force": true}, got[1])
 }
+
+// TestNVMeoFNamespaceListBySubsystem_UnparseableRowFails: callers decide from
+// this listing whether a subsystem serves anything else, so a row that cannot
+// be parsed fails the listing instead of being dropped.
+func TestNVMeoFNamespaceListBySubsystem_UnparseableRowFails(t *testing.T) {
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "system.info":
+				resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-25.10.0", "hostname": "truenas-test"}
+			case "nvmet.namespace.query":
+				resp.Result = []interface{}{
+					map[string]interface{}{"id": float64(7), "device_path": "zvol/pool/a", "subsys": map[string]interface{}{"id": float64(31)}},
+					"not a namespace",
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+
+	wsURL := strings.Replace(server.URL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host: parts[0], Port: port, Protocol: "http", APIKey: "test-api-key",
+		Timeout: 5 * time.Second, ConnectTimeout: 5 * time.Second, MaxConnections: 1,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.NVMeoFNamespaceListBySubsystem(context.Background(), 31)
+	require.Error(t, err)
+}

@@ -488,6 +488,13 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 					return fmt.Errorf("NVMe-oF cleanup errors for %s: namespace %d: %w", datasetName, n.ID, deleteErr)
 				}
 			}
+			// Success here lets the dataset delete run, so make sure nothing still
+			// exports this zvol.
+			if remaining, findErr := d.truenasClient.NVMeoFNamespaceFindByDevicePath(ctx, ownDevice); findErr != nil {
+				return fmt.Errorf("NVMe-oF cleanup errors for %s: verify the zvol is no longer exported: %w", datasetName, findErr)
+			} else if remaining != nil {
+				return fmt.Errorf("NVMe-oF cleanup errors for %s: namespace %d still exports the zvol", datasetName, remaining.ID)
+			}
 			klog.Warningf("NVMe-oF subsystem %d (%s) also serves %d namespace(s) of another volume; deleted only %s's namespace and left the subsystem and its port associations in place",
 				subsystem.ID, subsystem.Name, len(others), datasetName)
 			return nil

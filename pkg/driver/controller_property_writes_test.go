@@ -362,6 +362,103 @@ func TestNVMeoFShareDeleteIsOneForcedSubsystemDeleteWhenTheSubsystemIsTheVolumes
 	})
 }
 
+// namespaceDeleteFailingClient fails namespace deletes.
+type namespaceDeleteFailingClient struct {
+	*deleteCountingClient
+}
+
+func (c *namespaceDeleteFailingClient) NVMeoFNamespaceDelete(context.Context, int) error {
+	c.calls["namespace.delete"]++
+	return errors.New("simulated namespace delete failure")
+}
+
+// The shared-subsystem path reports success only once this volume's zvol is
+// no longer exported: its own namespaces are found by ID or by device path,
+// one the listing did not return is deleted too, and a failed delete is an
+// error.
+func TestNVMeoFShareDeleteOnASharedSubsystemUnexportsTheZvol(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Driver, *deleteCountingClient, string, int) {
+		t.Helper()
+		client := &deleteCountingClient{MockClient: truenas.NewMockClient(), calls: map[string]int{}}
+		d := newMultipathAPICallCountDriver(t, newAPICallCountingClient(), nil)
+		d.truenasClient = client
+		mustCreateParentDataset(t, client.MockClient)
+		resp, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("shared", "nvmeof"))
+		require.NoError(t, err)
+		subsystems, err := client.NVMeoFSubsystemList(ctx)
+		require.NoError(t, err)
+		require.Len(t, subsystems, 1)
+		_, err = client.NVMeoFNamespaceCreate(ctx, subsystems[0].ID, "zvol/pool/parent/another", "ZVOL")
+		require.NoError(t, err)
+		return d, client, "pool/parent/" + resp.GetVolume().GetVolumeId(), subsystems[0].ID
+	}
+	exported := func(t *testing.T, client *deleteCountingClient, datasetName string) bool {
+		t.Helper()
+		n, err := client.NVMeoFNamespaceFindByDevicePath(ctx, "zvol/"+datasetName)
+		require.NoError(t, err)
+		return n != nil
+	}
+
+	t.Run("a second namespace of this zvol is found by device path", func(t *testing.T) {
+		d, client, datasetName, subsystemID := setup(t)
+		_, err := client.NVMeoFNamespaceCreate(ctx, subsystemID, "zvol/"+datasetName, "ZVOL")
+		require.NoError(t, err)
+		require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
+		assert.Equal(t, 2, client.calls["namespace.delete"])
+		assert.False(t, exported(t, client, datasetName))
+	})
+
+	t.Run("this zvol's namespace the listing did not return", func(t *testing.T) {
+		d, client, datasetName, _ := setup(t)
+		namespace, err := client.NVMeoFNamespaceFindByDevicePath(ctx, "zvol/"+datasetName)
+		require.NoError(t, err)
+		// Resolved by device path, absent from the subsystem's listing.
+		namespace.SubsystemID = 0
+		stored, err := client.DatasetGet(ctx, datasetName)
+		require.NoError(t, err)
+		require.NotEmpty(t, datasetUserProperty(stored, PropNVMeoFSubsystemID))
+		require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
+		assert.False(t, exported(t, client, datasetName))
+	})
+
+	t.Run("another subsystem still exports this zvol", func(t *testing.T) {
+		d, client, datasetName, _ := setup(t)
+		elsewhere, err := client.NVMeoFSubsystemCreate(ctx, "elsewhere", true, nil)
+		require.NoError(t, err)
+		_, err = client.NVMeoFNamespaceCreate(ctx, elsewhere.ID, "zvol/"+datasetName, "ZVOL")
+		require.NoError(t, err)
+		require.Error(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName), "success would let the dataset delete run under a live export")
+	})
+
+	t.Run("the namespace delete fails", func(t *testing.T) {
+		d, client, datasetName, _ := setup(t)
+		d.truenasClient = &namespaceDeleteFailingClient{deleteCountingClient: client}
+		require.Error(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName), "a zvol still exported is not a deleted share")
+		assert.True(t, exported(t, client, datasetName))
+	})
+}
+
+// A namespace of this volume whose subsystem cannot be found (gone, never
+// recorded, renamed) is still deleted.
+func TestNVMeoFShareDeleteWithoutASubsystemDeletesTheNamespace(t *testing.T) {
+	ctx := context.Background()
+	client := &deleteCountingClient{MockClient: truenas.NewMockClient(), calls: map[string]int{}}
+	d := newMultipathAPICallCountDriver(t, newAPICallCountingClient(), nil)
+	d.truenasClient = client
+	mustCreateParentDataset(t, client.MockClient)
+	datasetName := "pool/parent/orphaned"
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	namespace, err := client.NVMeoFNamespaceCreate(ctx, 4242, "zvol/"+datasetName, "ZVOL")
+	require.NoError(t, err)
+
+	require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
+	assert.Equal(t, map[string]int{"namespace.delete": 1}, client.calls)
+	_, err = client.NVMeoFNamespaceGet(ctx, namespace.ID)
+	assert.Error(t, err)
+}
+
 type namespaceListFailingClient struct {
 	*deleteCountingClient
 }
