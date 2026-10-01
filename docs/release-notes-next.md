@@ -5,8 +5,9 @@
 The TrueNAS middleware serves the control plane largely one write at a time,
 and a property write costs 0.2-0.4 s of it, so this release makes the
 controller ask for less and in a better order. Nothing to configure for an
-upgrade from v1.13.1, and a rollback to v1.13.1 needs nothing either: the
-records on TrueNAS keep their format.
+upgrade from v1.13.1. The records on TrueNAS keep their format, so a rollback
+needs nothing on TrueNAS; see "Rolling back to v1.13.1" for the one chart
+value to check.
 
 ### Fewer property writes
 
@@ -78,10 +79,16 @@ call itself once it has a slot, not to the wait for one.
 
 ### Rolling back to v1.13.1
 
-Nothing to undo on TrueNAS. One chart value is new: if you set
-`zfs.observeBusyBeforeDelete: false`, remove it before rolling back. The
-v1.13.1 chart's schema rejects the key, and a v1.13.1 controller reading a
-config that contains it refuses to start.
+Nothing to undo on TrueNAS. One chart value is new: if your values set
+`zfs.observeBusyBeforeDelete` at all (`true` included), remove it before
+rolling back. The v1.13.1 chart's schema rejects the key, and a v1.13.1
+controller reading a config that contains it refuses to start. The default
+render does not contain it.
+
+### Image
+
+The image is now published for linux/amd64 only. No supported install ran
+arm64, and the arm64 build cost an emulated Go build per release.
 
 
 ## v1.13.1 — stop republishing every attached volume every minute
