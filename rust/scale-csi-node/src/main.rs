@@ -12,7 +12,7 @@ use scale_csi_node::metrics::{Metrics, OperationsLayer};
 use scale_csi_node::node_id::{self, Protocols};
 use scale_csi_node::service::{IdentityService, NodeService, State};
 use scale_csi_node::session_registry::SessionRegistry;
-use scale_csi_node::{args, config, discovery, health};
+use scale_csi_node::{args, config, discovery, health, kube_api, kube_events};
 
 #[tokio::main]
 async fn main() {
@@ -79,7 +79,21 @@ async fn run() -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
 
     let metrics = Arc::new(Metrics::new());
+    // Events as the Go node records them: from the driver, on this host.
+    let source = kube_events::Source {
+        component: driver_name.clone(),
+        host: hostname().unwrap_or_else(|_| "unknown".into()),
+    };
+    let (events, sink) = kube_events::sink(
+        std::path::Path::new(kube_api::SERVICE_ACCOUNT_DIR),
+        std::env::var("KUBERNETES_SERVICE_HOST").ok(),
+        std::env::var("KUBERNETES_SERVICE_PORT").ok(),
+        source,
+        metrics.clone(),
+    );
+    info!("events: {sink:?}");
     let mut state = State::new(config, driver_name, node_name, node_id, metrics.clone());
+    state.events = events;
     state.nvme_sessions = match SessionRegistry::beside(&socket) {
         Ok(registry) => Some(registry),
         Err(e) => {
