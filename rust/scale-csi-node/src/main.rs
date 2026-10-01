@@ -36,10 +36,8 @@ async fn run() -> Result<()> {
         bail!("-config is required");
     }
     let config = config::load(&args.config)?;
-    if config.nfs_enabled || config.iscsi_enabled {
-        bail!(
-            "this install enables NFS or iSCSI, which the Rust node agent does not serve yet; run the Go node plugin"
-        );
+    if config.iscsi_enabled {
+        bail!("this install enables iSCSI, which the Rust node agent does not serve yet; run the Go node plugin");
     }
     // The flag wins only when it is not the default; an empty config value takes it.
     let driver_name = if args.driver_name != config::DEFAULT_DRIVER_NAME || config.driver.is_empty() {

@@ -61,7 +61,7 @@ fn likely_csi_publication_target(target: &str) -> bool {
 
 /// The source a publication must show: the staged device (raw block), the
 /// staging mount's source (filesystem). Without a staging path only a legacy
-/// NFS direct mount publishes, which this agent does not serve.
+/// NFS direct mount publishes: its `server:share`.
 async fn expected_source(
     state: &State,
     req: &csi::NodePublishVolumeRequest,
@@ -93,9 +93,7 @@ async fn expected_source(
         return Ok(normalize_mount_source(&info.source));
     }
     match capability::attach_driver(&req.volume_context, &state.driver_name) {
-        ShareType::Nfs => Err(Status::failed_precondition(
-            "an NFS volume published without a staging path, which the Rust node agent does not serve yet",
-        )),
+        ShareType::Nfs => capability::stage_source_identity(ShareType::Nfs, &req.volume_context),
         _ => Err(Status::failed_precondition("staging path required for block volumes")),
     }
 }
@@ -385,6 +383,18 @@ pub async fn node_publish(
             .bind_mount(&device, target, &options, deadline)
             .await
             .map_err(|e| mount_failed(Status::internal(format!("failed to bind mount block device: {e:#}"))))?;
+    } else if staging.is_empty() {
+        // A legacy direct mount (no staging): only NFS gets here, mounted
+        // straight at the target with "ro" and the request's flags as its
+        // mount options (Go NodePublishVolume's direct branch).
+        let mut options: Vec<String> = if req.readonly { vec!["ro".into()] } else { Vec::new() };
+        let mut direct = volume_capability.clone();
+        if let Some(csi::volume_capability::AccessType::Mount(m)) = &mut direct.access_type {
+            options.extend(m.mount_flags.iter().cloned());
+            m.mount_flags = options;
+        }
+        let context = crate::stage::with_publish_hint(&req.volume_context, &req.publish_context, "addresses");
+        crate::nfs::stage(state, &context, target, Some(&direct), event.as_ref(), deadline).await?;
     } else {
         // The request's flags as given (not de-duplicated), after "ro".
         let mut options: Vec<String> = if req.readonly { vec!["ro".into()] } else { Vec::new() };

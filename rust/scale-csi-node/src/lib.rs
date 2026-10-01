@@ -14,6 +14,7 @@ pub mod health;
 pub mod locks;
 pub mod metrics;
 pub mod mount;
+pub mod nfs;
 pub mod node_id;
 pub mod nvme;
 pub mod nvme_addresses;
@@ -30,6 +31,8 @@ pub mod ublk_state;
 
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod nfs_tests;
 #[cfg(test)]
 mod nvme_kernel_tests;
 #[cfg(test)]

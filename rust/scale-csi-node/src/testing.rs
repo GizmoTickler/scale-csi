@@ -30,6 +30,9 @@ pub struct HostState {
     pub kernel: Option<FakeKernel>,
     /// device -> filesystem
     pub filesystems: HashMap<String, String>,
+    /// The NFS version an NFS mount negotiates (shown as `vers=`); 4.2 when
+    /// unset. A version 3 mount shows as `nfs`, any other as `nfs4`.
+    pub nfs_version: Option<String>,
     pub calls: Vec<String>,
 }
 
@@ -197,6 +200,17 @@ impl Runner for FakeHost {
                     Some((src, fs, _)) if bound => (src.clone(), fs.clone(), "rw".to_string()),
                     // As findmnt shows it: devtmpfs with the node's path as root.
                     _ if bound => (format!("udev[{source}]"), "devtmpfs".to_string(), "rw".to_string()),
+                    // As the kernel shows an NFS mount: its negotiated version.
+                    _ if fs == "nfs" => {
+                        let version = host.nfs_version.clone().unwrap_or_else(|| "4.2".into());
+                        let fs = if version.starts_with('3') { "nfs" } else { "nfs4" };
+                        let ro = args
+                            .iter()
+                            .position(|a| *a == "-o")
+                            .is_some_and(|i| args[i + 1].split(',').any(|o| o == "ro"));
+                        let mode = if ro { "ro" } else { "rw" };
+                        (source.to_string(), fs.to_string(), format!("{mode},vers={version}"))
+                    }
                     _ => (source.to_string(), fs, "rw".to_string()),
                 };
                 host.mounts.insert(target.into(), entry);
