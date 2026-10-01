@@ -21,7 +21,7 @@ func newJobWaitTestClient(t *testing.T) *Client {
 		config:                 &ClientConfig{},
 		dispatcher:             newJobDispatcher(),
 		jobSubscriptionChanged: make(chan struct{}),
-		semaphore:              make(chan struct{}, 1),
+		semaphore:              newAdmissionGate(1),
 		jobWaitPollInterval:    5 * time.Millisecond,
 		jobWaitSafetyInterval:  30 * time.Millisecond,
 	}
@@ -257,24 +257,22 @@ func TestJobWaitT10SemaphoreAccounting(t *testing.T) {
 	pollHoldingSlot := make(chan struct{}, 1)
 	releasePoll := make(chan struct{})
 	client.jobPollOnceOverride = func(ctx context.Context, _ int64) (bool, error) {
-		select {
-		case client.semaphore <- struct{}{}:
-		case <-ctx.Done():
-			return false, ctx.Err()
+		if err := client.semaphore.acquire(ctx); err != nil {
+			return false, err
 		}
 		pollHoldingSlot <- struct{}{}
 		<-releasePoll
-		<-client.semaphore
+		client.semaphore.release()
 		return false, nil
 	}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- client.waitForJob(context.Background(), 110) }()
 	<-pollHoldingSlot
-	assert.Len(t, client.semaphore, 1, "pollJobOnce must take exactly one slot")
+	assert.Equal(t, 1, client.semaphore.inFlight(), "pollJobOnce must take exactly one slot")
 	close(releasePoll)
-	require.Eventually(t, func() bool { return len(client.semaphore) == 0 }, time.Second, time.Millisecond)
-	assert.Empty(t, client.semaphore, "a blocked subscribed waiter must hold zero slots")
+	require.Eventually(t, func() bool { return client.semaphore.inFlight() == 0 }, time.Second, time.Millisecond)
+	assert.Zero(t, client.semaphore.inFlight(), "a blocked subscribed waiter must hold zero slots")
 
 	offerJobTestEvent(t, client.dispatcher, 110, "FAILED")
 	err := <-errCh

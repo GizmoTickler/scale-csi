@@ -3,6 +3,9 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -54,7 +57,7 @@ func newMultipathAPICallCountDriver(t *testing.T, client *apiCallCountingClient,
 // distinct storage addresses. Nothing else changes.
 func TestNVMeoFMultipathAPICallGolden(t *testing.T) {
 	const (
-		singlePathCalls = 12
+		singlePathCalls = 11
 		addressCount    = 4
 	)
 	// 4 addresses => 3 extra ports beyond the single-path baseline, each costing
@@ -295,4 +298,132 @@ func TestNVMeoFPortPerfDriftIsReported(t *testing.T) {
 
 	// A nil port is not a drift report.
 	assert.Empty(t, truenas.NVMeoFPortCreateOptions{PiEnable: boolPtr(true)}.Drift(nil))
+}
+
+// portRefusingMock fails the second port association, and refuses a plain
+// subsystem delete while the subsystem is still visible on a port, as TrueNAS
+// does ("subsystem is visible on N port(s)"); only a forced delete removes it.
+type portRefusingMock struct {
+	*apiCallCountingClient
+	mu      sync.Mutex
+	creates int
+	failAt  int         // the create that fails (1-based); 0 never
+	assocs  map[int]int // subsystem -> associations
+}
+
+func (m *portRefusingMock) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*truenas.NVMeoFPortSubsys, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.creates++
+	if m.creates == m.failAt {
+		return nil, errors.New("injected port association failure")
+	}
+	m.assocs[subsysID]++
+	return &truenas.NVMeoFPortSubsys{ID: m.creates, PortID: portID, SubsysID: subsysID}, nil
+}
+
+func (m *portRefusingMock) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	visible := m.assocs[id]
+	m.mu.Unlock()
+	if visible > 0 {
+		return fmt.Errorf("subsystem is visible on %d port(s)", visible)
+	}
+	return m.apiCallCountingClient.NVMeoFSubsystemDelete(ctx, id)
+}
+
+func (m *portRefusingMock) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	m.mu.Lock()
+	delete(m.assocs, id)
+	m.mu.Unlock()
+	return m.apiCallCountingClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
+// A share (re)created at publish whose multipath port associations partly
+// failed rolls back the subsystem it created. With a plain delete TrueNAS
+// refused (the subsystem was still on the port already associated) and the
+// subsystem leaked; nothing above the share create cleans up on this path.
+func TestPartialPortAssociationRollsBackTheSubsystem(t *testing.T) {
+	ctx := context.Background()
+	base := newAPICallCountingClient()
+	mock := &portRefusingMock{apiCallCountingClient: base, assocs: map[int]int{}}
+	d := newMultipathAPICallCountDriver(t, base, nil)
+	d.truenasClient = mock
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("mp-rollback", "nvmeof"))
+	require.NoError(t, err)
+
+	// The share is gone (deleted out of band); the next publish recreates it
+	// with multipath, and the second association fails.
+	subsystems, err := base.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	require.Len(t, subsystems, 1)
+	require.NoError(t, mock.NVMeoFSubsystemDeleteCascade(ctx, subsystems[0].ID))
+	d.config.NVMeoF.Multipath = true
+	d.config.NVMeoF.Addresses = []string{"192.0.2.21", "192.0.2.22"}
+	mock.mu.Lock()
+	mock.failAt = mock.creates + 2
+	mock.mu.Unlock()
+
+	err = nvmeoFShareBackend{d}.EnsureShare(ctx, nil, "pool/parent/mp-rollback", "mp-rollback", &fenceResolution{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "injected port association failure")
+	subsystems, err = base.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, subsystems, "the subsystem the publish made is gone, associations and all")
+}
+
+// adoptingMock models TrueNAS's nvmet.subsys.create on a name that exists:
+// the client returns the existing subsystem rather than failing.
+type adoptingMock struct {
+	*portRefusingMock
+}
+
+func (m *adoptingMock) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...truenas.NVMeoFSubsystemCreateOptions) (*truenas.NVMeoFSubsystem, error) {
+	subsystems, err := m.NVMeoFSubsystemList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, existing := range subsystems {
+		if existing.Name == name {
+			return existing, nil
+		}
+	}
+	return m.portRefusingMock.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs, opts...)
+}
+
+// A create adopts an existing subsystem of the same name (another install on
+// the NAS whose volume name collides), so its rollback after a partial port
+// association must never force-delete a subsystem that serves a namespace:
+// that would take the other install's volume and paths with it.
+func TestPartialPortAssociationNeverForcesAnAdoptedSubsystemsNamespaceAway(t *testing.T) {
+	ctx := context.Background()
+	base := newAPICallCountingClient()
+	refusing := &portRefusingMock{apiCallCountingClient: base, assocs: map[int]int{}}
+	d := newMultipathAPICallCountDriver(t, base, []string{"192.0.2.21", "192.0.2.22"})
+	d.truenasClient = &adoptingMock{refusing}
+
+	// The name this create will use, taken from a probe volume's subsystem.
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("mp-probe", "nvmeof"))
+	require.NoError(t, err)
+	probe, err := base.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	require.Len(t, probe, 1)
+	name := strings.Replace(probe[0].Name, "mp-probe", "mp-collide", 1)
+
+	// The other install's subsystem of that name, serving its volume.
+	other, err := base.NVMeoFSubsystemCreate(ctx, name, true, nil)
+	require.NoError(t, err)
+	_, err = base.NVMeoFNamespaceCreate(ctx, other.ID, "zvol/otherpool/mp-collide", "ZVOL")
+	require.NoError(t, err)
+
+	refusing.mu.Lock()
+	refusing.failAt = refusing.creates + 2
+	refusing.mu.Unlock()
+	_, err = d.CreateVolume(ctx, apiCallCountVolumeRequest("mp-collide", "nvmeof"))
+	require.Error(t, err)
+
+	namespaces, err := base.NVMeoFNamespaceListBySubsystem(ctx, other.ID)
+	require.NoError(t, err)
+	assert.Len(t, namespaces, 1, "the other install's namespace survives")
+	assert.Contains(t, base.NVMeSubsystems, other.ID, "and so does its subsystem")
 }

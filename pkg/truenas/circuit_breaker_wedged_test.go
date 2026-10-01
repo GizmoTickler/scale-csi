@@ -139,14 +139,13 @@ func TestClient_CanceledHalfOpenProbeRecordsNoOutcome(t *testing.T) {
 		return time.Since(client.circuitBreaker.Stats().LastFailure) >= time.Millisecond
 	}, time.Second, time.Millisecond)
 
-	// Fill the semaphore so the canceled call parks on the acquire, the earliest
-	// client-side-cancellation exit below the admission.
-	client.semaphore <- struct{}{}
+	// An already-canceled call is refused at the request-slot acquire, the
+	// earliest client-side-cancellation exit below the admission.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := client.Call(ctx, "pool.dataset.query")
-	<-client.semaphore
 	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, client.semaphore.inFlight())
 
 	stats := client.circuitBreaker.Stats()
 	assert.Equal(t, CircuitHalfOpen, stats.State,

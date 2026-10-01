@@ -316,6 +316,26 @@ func (c *Client) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 	return nil
 }
 
+// NVMeoFSubsystemDeleteCascade deletes an NVMe-oF subsystem together with its
+// namespaces, port associations and host associations, in one call
+// (nvmet.subsys.delete with force). Verified on TrueNAS 26.0: the namespace,
+// all port and host associations go with it; host entries themselves stay.
+// Only for a subsystem known to hold nothing but what the caller means to
+// delete.
+func (c *Client) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	_, err := c.Call(ctx, "nvmet.subsys.delete", id, map[string]bool{"force": true})
+	if err != nil {
+		if IsNotFoundError(err) {
+			return nil
+		}
+		if c.deleteVanishedTolerant(ctx, "nvmet.subsys.query", id) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete NVMe-oF subsystem: %w", err)
+	}
+	return nil
+}
+
 // NVMeoFSubsystemUpdateAllowAnyHost changes the subsystem from the legacy
 // allow-any state to an explicit host association allowlist (or vice versa).
 func (c *Client) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error) {
@@ -534,11 +554,13 @@ func (c *Client) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID in
 		return nil, fmt.Errorf("unexpected NVMe-oF namespace response type")
 	}
 
+	// A row that cannot be parsed fails the listing: callers decide from it
+	// whether a subsystem serves anything else, and a dropped row would say no.
 	namespaces := make([]*NVMeoFNamespace, 0, len(items))
 	for _, item := range items {
 		namespace, parseErr := parseNVMeoFNamespace(item)
 		if parseErr != nil {
-			continue
+			return nil, fmt.Errorf("unparseable NVMe-oF namespace in subsystem %d: %w", subsysID, parseErr)
 		}
 		namespaces = append(namespaces, namespace)
 	}

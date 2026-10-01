@@ -632,6 +632,7 @@ type ClientConfig struct {
 	HeartbeatInterval    time.Duration        // Interval for WebSocket heartbeat (default: 30s)
 	MaxConnections       int                  // Maximum number of concurrent connections (default: 5)
 	MaxConcurrentReqs    int                  // Maximum number of concurrent API requests (default: 10)
+	AdmissionMetrics     AdmissionMetrics     // Optional: queueing observations of the request slots
 	LazyConnect          bool                 // Skip eager connection; connect on first API use (node-only mode)
 	MetricsRecorder      MetricsRecorder      // Optional callback for recording request metrics
 	PendingDepthRecorder PendingDepthRecorder // Optional callback for in-flight request depth
@@ -731,7 +732,7 @@ type Client struct {
 	config                      *ClientConfig
 	pool                        []*Connection
 	next                        uint64                      // For round-robin selection
-	semaphore                   chan struct{}               // Limits concurrent requests to prevent TrueNAS overload
+	semaphore                   *admissionGate              // Limits concurrent requests to prevent TrueNAS overload; admits by priority and operation age
 	metricsRecorder             MetricsRecorder             // Optional callback for recording request metrics
 	pendingDepthRecorder        PendingDepthRecorder        // Optional callback for in-flight request depth
 	replicationJobAbortRecorder ReplicationJobAbortRecorder // Optional callback for successful job aborts
@@ -908,7 +909,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	client := &Client{
 		config:                      cfg,
 		pool:                        make([]*Connection, cfg.MaxConnections),
-		semaphore:                   make(chan struct{}, cfg.MaxConcurrentReqs),
+		semaphore:                   newAdmissionGateWithMetrics(cfg.MaxConcurrentReqs, cfg.AdmissionMetrics),
 		metricsRecorder:             cfg.MetricsRecorder,
 		pendingDepthRecorder:        cfg.PendingDepthRecorder,
 		replicationJobAbortRecorder: cfg.ReplicationJobAbortRecorder,
@@ -1733,15 +1734,14 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		}
 	}
 
-	// Acquire semaphore slot (limit concurrent requests)
-	select {
-	case c.semaphore <- struct{}{}:
-		// Got a slot, continue
-	case <-ctx.Done():
+	// Acquire a request slot (limit concurrent requests). Waiters are admitted
+	// by priority, then by the age of the operation they belong to; see
+	// WithPriority and WithOperationStart.
+	if err := c.semaphore.acquire(ctx); err != nil {
 		abandonProbe()
-		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", ctx.Err())
+		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", err)
 	}
-	defer func() { <-c.semaphore }() // Release slot when done
+	defer c.semaphore.release() // Release slot when done
 
 	maxRetries := c.config.APIRetryMaxAttempts
 	var lastErr error

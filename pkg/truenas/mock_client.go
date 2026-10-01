@@ -26,26 +26,29 @@ type MockClient struct {
 	setUserPropertiesCalls int
 
 	// Mock data
-	Datasets                   map[string]*Dataset
-	Snapshots                  map[string]*Snapshot
-	NFSShares                  map[int]*NFSShare
-	ISCSITargets               map[int]*ISCSITarget
-	ISCSIExtents               map[int]*ISCSIExtent
-	TargetExtents              map[int]*ISCSITargetExtent
-	NVMeHosts                  map[string]*NVMeoFHost
-	NVMeHostSubsystems         map[int]*NVMeoFHostSubsys
-	NVMeSubsystems             map[int]*NVMeoFSubsystem
-	NVMeNamespaces             map[int]*NVMeoFNamespace
-	ISCSIPortals               map[int]*ISCSIPortal
-	ISCSIInitiators            map[int]*ISCSIInitiator
-	ISCSIAuths                 map[int]*ISCSIAuth
-	PoolAvailable              int64
-	ReplicationJobs            map[int64]*ReplicationJob
-	SnapshotTasks              map[int]*SnapshotTask
-	SnapshotTaskDeleteCalls    []int
-	nextSnapshotTaskID         int
-	deferredSnapshots          map[string]struct{}
-	DatasetDeleteCalls         []DatasetDeleteCall
+	Datasets                map[string]*Dataset
+	Snapshots               map[string]*Snapshot
+	NFSShares               map[int]*NFSShare
+	ISCSITargets            map[int]*ISCSITarget
+	ISCSIExtents            map[int]*ISCSIExtent
+	TargetExtents           map[int]*ISCSITargetExtent
+	NVMeHosts               map[string]*NVMeoFHost
+	NVMeHostSubsystems      map[int]*NVMeoFHostSubsys
+	NVMeSubsystems          map[int]*NVMeoFSubsystem
+	NVMeNamespaces          map[int]*NVMeoFNamespace
+	ISCSIPortals            map[int]*ISCSIPortal
+	ISCSIInitiators         map[int]*ISCSIInitiator
+	ISCSIAuths              map[int]*ISCSIAuth
+	PoolAvailable           int64
+	ReplicationJobs         map[int64]*ReplicationJob
+	SnapshotTasks           map[int]*SnapshotTask
+	SnapshotTaskDeleteCalls []int
+	nextSnapshotTaskID      int
+	deferredSnapshots       map[string]struct{}
+	DatasetDeleteCalls      []DatasetDeleteCall
+	// SnapshotDeleteCalls records every SnapshotDelete with the admission
+	// priority its context carried.
+	SnapshotDeleteCalls        []SnapshotDeleteCall
 	DatasetAttachmentValues    map[string][]DatasetAttachment
 	DatasetProcessValues       map[string][]DatasetProcess
 	DatasetAttachmentCalls     []string
@@ -331,6 +334,14 @@ type DatasetDeleteCall struct {
 	Name      string
 	Recursive bool
 	Force     bool
+	// Priority is the admission priority the call's context carried.
+	Priority Priority
+}
+
+// SnapshotDeleteCall records one SnapshotDelete.
+type SnapshotDeleteCall struct {
+	ID       string
+	Priority Priority
 }
 
 // NewMockClient creates a new MockClient.
@@ -785,6 +796,7 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 		Name:      name,
 		Recursive: recursive,
 		Force:     force,
+		Priority:  priorityOf(ctx),
 	})
 
 	if m.InjectError != nil {
@@ -1680,6 +1692,7 @@ func (m *MockClient) SetSnapshotUsedBytes(snapshotID string, usedBytes int64) {
 func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.SnapshotDeleteCalls = append(m.SnapshotDeleteCalls, SnapshotDeleteCall{ID: snapshotID, Priority: priorityOf(ctx)})
 
 	if m.InjectError != nil {
 		return m.InjectError
@@ -2847,6 +2860,23 @@ func (m *MockClient) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 	defer m.mu.Unlock()
 
 	delete(m.NVMeSubsystems, id)
+	for associationID, association := range m.NVMeHostSubsystems {
+		if association.SubsysID == id {
+			delete(m.NVMeHostSubsystems, associationID)
+		}
+	}
+	return nil
+}
+func (m *MockClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.NVMeSubsystems, id)
+	for namespaceID, namespace := range m.NVMeNamespaces {
+		if namespace.SubsystemID == id {
+			delete(m.NVMeNamespaces, namespaceID)
+		}
+	}
 	for associationID, association := range m.NVMeHostSubsystems {
 		if association.SubsysID == id {
 			delete(m.NVMeHostSubsystems, associationID)

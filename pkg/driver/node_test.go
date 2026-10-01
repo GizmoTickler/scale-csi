@@ -867,6 +867,16 @@ func TestNodePublishUnpublishVolume_BlockRoundTrip(t *testing.T) {
 	stagingPath := filepath.Join(t.TempDir(), "staged-device")
 	require.NoError(t, os.Symlink("/dev/null", stagingPath))
 	targetPath := filepath.Join(t.TempDir(), "pod", "volume")
+	// The fake mount cannot bind a device: report the bound target as the
+	// staged device, as stat through a real bind mount does.
+	originalStat := nodeStatsStat
+	t.Cleanup(func() { nodeStatsStat = originalStat })
+	nodeStatsStat = func(path string) (uint32, uint64, error) {
+		if path == targetPath || path == "/dev/null" {
+			return unix.S_IFBLK | 0o660, 7, nil
+		}
+		return originalStat(path)
+	}
 	d := newTestNodeDriver(ShareTypeISCSI)
 	req := &csi.NodePublishVolumeRequest{
 		VolumeId:          "block-vol",

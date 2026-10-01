@@ -25,6 +25,7 @@ var (
 
 type startupPublication struct {
 	identity NodeIdentity
+	nodeID   string // the node's id as its CSINode advertises it; "" if it advertises none
 	mode     csi.VolumeCapability_AccessMode_Mode
 	readonly bool
 }
@@ -137,6 +138,7 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 		}
 		volume.publications = append(volume.publications, startupPublication{
 			identity: identity,
+			nodeID:   csiNodeID(d.name, csiNodes[attachment.Spec.NodeName]),
 			mode:     mode,
 			readonly: readonly,
 		})
@@ -192,6 +194,19 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 	klog.Infof("Startup fencing reconciliation converged: %d attached publication(s) across %d volume(s)",
 		attachmentCount, len(volumes))
 	return nil
+}
+
+// csiNodeID is the id the CSINode advertises for driverName, "" if none.
+func csiNodeID(driverName string, csiNode *storagev1.CSINode) string {
+	if csiNode == nil {
+		return ""
+	}
+	for _, driver := range csiNode.Spec.Drivers {
+		if driver.Name == driverName {
+			return driver.NodeID
+		}
+	}
+	return ""
 }
 
 func startupNodeIdentity(
@@ -333,6 +348,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		if recordErr != nil {
 			return fmt.Errorf("encode attached node %s identity: %w", publication.identity.Name, recordErr)
 		}
+		record.keepCONodeID(publication.nodeID)
 		if compatibilityErr := validatePublicationCompatibility(compatibilityRecords, record); compatibilityErr != nil {
 			// (C11) A conflict whose ONLY blocking record has no live
 			// VolumeAttachment at all is a stale record left by a force-removed
@@ -494,7 +510,9 @@ func (d *Driver) currentStartupFencingVolume(ctx context.Context, volumeID strin
 		mode, readonly := accessModeForPersistentVolume(attachment.pv)
 		result.volumeAttributes = attachment.pv.Spec.CSI.VolumeAttributes
 		result.pv = attachment.pv
-		result.publications = append(result.publications, startupPublication{identity: identity, mode: mode, readonly: readonly})
+		result.publications = append(result.publications, startupPublication{
+			identity: identity, nodeID: csiNodeID(d.name, csiNodes[attachment.nodeName]), mode: mode, readonly: readonly,
+		})
 	}
 	return result, nil
 }

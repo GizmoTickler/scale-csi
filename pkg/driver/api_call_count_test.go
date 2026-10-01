@@ -528,6 +528,11 @@ func (c *apiCallCountingClient) NVMeoFSubsystemDelete(ctx context.Context, id in
 	return c.MockClient.NVMeoFSubsystemDelete(ctx, id)
 }
 
+func (c *apiCallCountingClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	c.record("NVMeoFSubsystemDeleteCascade")
+	return c.MockClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
 func (c *apiCallCountingClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*truenas.NVMeoFSubsystem, error) {
 	c.record("NVMeoFSubsystemGet")
 	return c.MockClient.NVMeoFSubsystemGet(ctx, id)
@@ -922,7 +927,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the in-share
 		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
 		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
-		// managed/ownership/provision/name stamp (DatasetSetUserProperties).
+		// managed/ownership/provision/name stamp (DatasetSetUserProperties). The
+		// in-share stamp stays although the final one repeats it: it lands before
+		// the debounced reload, so a crash in that wait cannot lose the extent-ID
+		// witness and geometry (NVMe-oF folds its IDs instead; its repair is fatal).
 		{name: "CreateVolume fresh iSCSI", want: 14, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
@@ -1390,15 +1398,14 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-nfs-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Three calls:
+		// Two calls:
 		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
-		// 2. DatasetSetUserProperties        — flip the record to "unpublishing"
-		//                                      BEFORE access is removed (crash-safe
-		//                                      tombstone; a restart can never re-add).
-		// 3. DatasetRemoveUserProperties     — removePublicationRecords clears the
-		//                                      durable record (off mode never touches
-		//                                      a backend allowlist).
-		assertAPICallCount(t, "off NFS unpublish", client, 3)
+		// 2. DatasetRemoveUserProperties     — removePublicationRecords clears the
+		//                                      durable record. Off mode never touches
+		//                                      a backend allowlist, so there is no
+		//                                      access removal for an "unpublishing"
+		//                                      tombstone to guard and none is written.
+		assertAPICallCount(t, "off NFS unpublish", client, 2)
 	})
 
 	// (b) additive + NFS — backend enforcement on, static policy preserved. The
@@ -1473,7 +1480,8 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
 		require.NoError(t, err)
-		// Nine calls (steady-state republish; ~13 before P1):
+		// Eight calls (steady-state republish; ~13 before P1, 9 while an unchanged
+		// record was rewritten):
 		// 1. DatasetGet                      — ControllerPublishVolume volume read.
 		// 2. NVMeoFNamespaceGet              — ensureShare resolves the namespace
 		//                                      (memoized for the rest of the request).
@@ -1483,13 +1491,13 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		//                                      node NQN to a host ID.
 		// 5. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
 		//                                      for compatibility/classification.
-		// 6. DatasetSetUserProperties        — storePublicationRecord.
-		// 7. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
+		//    (record write SKIPPED: the stored record already says exactly this.)
+		// 6. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
 		//                                      compatibility state is not reused.
-		// 8. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
+		// 7. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
 		//                                      of the desired association.
-		// 9. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
-		assertAPICallCount(t, "strict NVMe-oF publish", client, 9)
+		// 8. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
+		assertAPICallCount(t, "strict NVMe-oF publish", client, 8)
 	})
 	t.Run("strict NVMe-oF unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -1601,16 +1609,13 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-iscsi-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Three calls (mirror of off NFS unpublish; off mode never touches a backend
-		// allowlist):
+		// Two calls (mirror of off NFS unpublish; off mode never touches a backend
+		// allowlist, so no "unpublishing" tombstone is written):
 		// 1. DatasetGet                  — ControllerUnpublishVolume volume read.
-		// 2. DatasetSetUserProperties    — flip the record to "unpublishing" BEFORE
-		//                                  access is removed (crash-safe tombstone).
-		// 3. DatasetRemoveUserProperties — removePublicationRecords clears the record.
-		assertAPICallCount(t, "off iSCSI unpublish", client, 3)
+		// 2. DatasetRemoveUserProperties — removePublicationRecords clears the record.
+		assertAPICallCount(t, "off iSCSI unpublish", client, 2)
 		assertAPICallMethodMap(t, "off iSCSI unpublish", client, map[string]int{
 			"DatasetGet":                  1,
-			"DatasetSetUserProperties":    1,
 			"DatasetRemoveUserProperties": 1,
 		})
 	})

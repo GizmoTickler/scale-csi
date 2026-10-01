@@ -1,4 +1,135 @@
-# Release notes — v1.13.0 (next)
+# Release notes — v1.14.0 (next)
+
+## v1.14.0 — fewer TrueNAS writes, faster deletes, attaches first under load
+
+The TrueNAS middleware serves the control plane largely one write at a time,
+and a property write costs 0.2-0.4 s of it, so this release makes the
+controller ask for less and in a better order. Nothing to configure for an
+upgrade from v1.13.1. The records on TrueNAS keep their format, so a rollback
+needs nothing on TrueNAS; see "Rolling back to v1.13.1" for the one chart
+value to check.
+
+### Fewer property writes
+
+- Creating an NVMe-oF volume writes the share's TrueNAS object ids together
+  with the volume's other properties, one dataset update instead of two
+  (11 TrueNAS calls instead of 12 for a single-path volume).
+- A publish that finds the volume's publication record already as it would
+  write it no longer rewrites it (a strict-fencing republish is 8 calls
+  instead of 9), unless the stale-record sweep is watching that record.
+- With fencing off (the chart default), an unpublish no longer writes the
+  "unpublishing" marker before removing the record: it has nothing to fence,
+  so it is 2 calls instead of 3. With fencing on, the marker is written as
+  before.
+- iSCSI keeps its write inside share creation: it is the evidence a crashed
+  create leaves for the retry.
+
+### Faster NVMe-oF deletes
+
+- When a volume's NVMe-oF subsystem is its own, the share is deleted with
+  one forced subsystem delete, which removes its namespace and host and port
+  associations with it, instead of one call per object.
+- A subsystem that also serves other namespaces is left alone: only this
+  volume's namespace is deleted, and the delete succeeds only once TrueNAS
+  shows the zvol exported nowhere. If the subsystem's namespaces cannot be
+  listed, the delete fails and is retried rather than guessing.
+- The two "is anything still using this dataset" scans before a dataset
+  delete (`pool.dataset.attachments`, `pool.dataset.processes`, about 0.7 s
+  of middleware time per delete) can be turned off with
+  `zfs.observeBusyBeforeDelete: false`. They never blocked a delete; they
+  only log and count (`scale_csi_dataset_busy_observations_total`). The
+  default keeps them.
+
+### Attaches first when TrueNAS is busy
+
+The controller's TrueNAS request slots used to admit waiting requests in
+arrival order, so a burst of operations shared the slots evenly and finished
+together at the end. Waiting requests are now admitted by class, then by the
+age of the CSI operation they belong to:
+
+1. attach: ControllerPublishVolume and ControllerUnpublishVolume (a pod is
+   waiting);
+2. default: provisioning, expansion, snapshots, background work;
+3. delete: DeleteVolume, DeleteSnapshot and the orphan reaper.
+
+So a node drain's re-attaches overtake provisioning and deletes, and a burst
+completes in the order it arrived. A delete that has waited 2 s moves up to
+the default class (it may hold a volume lock a publish needs); nothing
+moves into the attach class. New series, on the dashboard's backpressure
+panel: `scale_csi_truenas_request_admission_wait_seconds{class}` and
+`scale_csi_truenas_requests_waiting{class}`.
+
+The iSCSI target reload that creates and fenced publishes wait for is
+admitted as theirs (their most urgent class and oldest operation), so it is
+not queued behind their own later calls; its time limit now applies to the
+call itself once it has a slot, not to the wait for one.
+
+### Other fixes
+
+- Repeating NodePublishVolume for a raw-block volume that is already
+  published returned Internal ("unsupported type Drw-rw----"), and after a
+  node-plugin restart (an upgrade is one) AlreadyExists ("backed by udev"):
+  the node accepted only kubelet's placeholder file at the target and
+  compared mount sources, but a published target is the device node bound
+  over it, and the mount table shows its source as devtmpfs. The target is now
+  identified by its device number. Filesystem volumes were not affected.
+- A new multipath NVMe-oF share whose port associations partly failed is
+  rolled back with a forced subsystem delete. The plain delete was refused by
+  TrueNAS while the subsystem was still on a port, and the subsystem leaked.
+
+### Rolling back to v1.13.1
+
+Nothing to undo on TrueNAS. One chart value is new: if your values set
+`zfs.observeBusyBeforeDelete` at all (`true` included), remove it before
+rolling back. The v1.13.1 chart's schema rejects the key, and a v1.13.1
+controller reading a config that contains it refuses to start. The default
+render does not contain it.
+
+### Image
+
+The image is now published for linux/amd64 only. No supported install ran
+arm64, and the arm64 build cost an emulated Go build per release.
+
+
+## v1.13.1 — stop republishing every attached volume every minute
+
+A fix for the controller only; the node plugin, the chart's defaults and
+the data path are unchanged.
+
+Since v1.10.0 the controller reported each volume's publications to
+Kubernetes under a node id of its own making (the node's id plus the
+Node object's addresses), which never equals the id the node registered in
+its CSINode. The csi-attacher compares the two about once a minute for
+every VolumeAttachment, found every attached volume "not published", and
+forced a ControllerPublishVolume for each of them. Nothing broke, but each
+of those republishes cost about 15 TrueNAS API calls, one of them a ZFS
+property write of about a second, and held the volume's lock: on a cluster
+with 29 attachments that was about 440 API calls and 70 seconds of
+TrueNAS middleware time every minute at idle, and a snapshot that arrived
+during a republish was refused with "operation already in progress" and
+retried.
+
+The publication record now keeps the node id Kubernetes uses (the
+ControllerPublishVolume NodeId, or the CSINode's id when the controller
+rebuilds records at startup); fencing still uses the resolved identity
+with its addresses. Records written by earlier versions are rewritten the
+first time they are touched after the upgrade: with fencing enabled, by the
+controller's startup reconciliation, so the republishing stops when v1.13.1
+starts; with fencing off (the chart default), by one last forced republish
+per volume, so it stops within about a minute of the upgrade. To see it: the csi-attacher stops logging "VolumeAttachment
+attached status and actual state do not match", and
+`rate(scale_csi_truenas_requests_total[10m])` on the controller drops to
+near zero at idle.
+
+One behaviour goes away with the noise: the minute-by-minute republish also
+re-applied every volume's backend fence (the NVMe-oF host, iSCSI initiator
+or NFS host allowlist) from the node's current identity. A fence changed by
+hand on TrueNAS used to be reverted within a minute; it now stays as edited
+until the volume's next publish, or a controller restart when fencing is
+on. A node's new address reaches an NFS allowlist at those same points
+instead of within a minute. This is how every CSI driver behaves. A node
+that registers a new identity (a new NQN or IQN) still gets exactly one
+republish.
 
 ## v1.13.0 — optional userspace NVMe/TCP data path (ublk), session GC ownership
 

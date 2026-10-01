@@ -153,7 +153,7 @@ func TestClient_AuthLossRetriesAndRecordsBreakerFailure(t *testing.T) {
 	client := &Client{
 		config:         cfg,
 		pool:           []*Connection{conn},
-		semaphore:      make(chan struct{}, 1),
+		semaphore:      newAdmissionGate(1),
 		circuitBreaker: breaker,
 	}
 

@@ -177,6 +177,7 @@ new ownership boundary.
 | `zfs.zvolReadyTimeout` | Zvol readiness timeout in seconds | `60` |
 | `zfs.datasetProperties` | Additional ZFS dataset properties (e.g. `compression`, `dedup`) | `{}` |
 | `zfs.destroyForeignSnapshotsOnDelete` | Allow recursive volume deletion to destroy non-CSI snapshots | `false` |
+| `zfs.observeBusyBeforeDelete` | Before each delete, log and count whether TrueNAS still sees the dataset in use (two observation-only scans, about 0.7 s of middleware time; never blocks the delete) | `true` |
 
 Compression and deduplication are configured through `zfs.datasetProperties`
 (e.g. `{compression: "zstd", dedup: "off"}`). When the map is empty, no
