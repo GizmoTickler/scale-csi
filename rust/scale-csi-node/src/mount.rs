@@ -274,6 +274,21 @@ impl Mounter {
         Ok(())
     }
 
+    /// An NFS mount (Go MountNFS): `nfsvers=4` first, then the given options,
+    /// so a later `vers=`/`nfsvers=` in them wins.
+    pub async fn mount_nfs(
+        &self,
+        source: &str,
+        target: &str,
+        options: &[String],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let mut all = Vec::with_capacity(options.len() + 1);
+        all.push("nfsvers=4".to_string());
+        all.extend(options.iter().cloned());
+        self.mount(source, target, "nfs", &all, deadline).await
+    }
+
     /// A bind mount; `ro` needs its own remount (the flag is ignored on the
     /// first bind), and a failed remount takes the fresh bind down again.
     pub async fn bind_mount(

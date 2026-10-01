@@ -243,12 +243,11 @@ async fn a_raw_block_publish_needs_a_staged_device() {
         node_publish(&n.state, &req, None).await.unwrap_err().code(),
         Code::FailedPrecondition
     );
-    // Without a staging path only NFS publishes, which this agent does not serve.
-    let mut fs = publish_request(&n, "", "p1", filesystem());
-    fs.volume_context.insert("node_attach_driver".into(), "nfs".into());
+    // Without a staging path only NFS publishes (nfs_tests.rs).
+    let fs = publish_request(&n, "", "p1", filesystem());
     let err = node_publish(&n.state, &fs, None).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
-    assert!(err.message().contains("does not serve yet"));
+    assert_eq!(err.message(), "staging path required for block volumes");
 }
 
 #[tokio::test]

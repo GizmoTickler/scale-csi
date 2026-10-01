@@ -9,12 +9,8 @@
 {{- end }}
 {{- if or (eq $implementation "rust") $rustNodes }}
 {{- $nvmeof := .Values.nvmeof | default dict }}
-{{- $iscsi := .Values.iscsi | default dict }}
-{{- if (.Values.nfs | default dict).enabled }}
-{{- fail "the Rust node agent (node.implementation=rust or node.rustNodes) does not serve NFS yet: set nfs.enabled=false" }}
-{{- end }}
-{{- if not (or $nvmeof.enabled $iscsi.enabled) }}
-{{- fail "the Rust node agent (node.implementation=rust or node.rustNodes) serves NVMe-oF and iSCSI: it needs nvmeof.enabled=true or iscsi.enabled=true" }}
+{{- if not (or $nvmeof.enabled (.Values.iscsi | default dict).enabled (.Values.nfs | default dict).enabled) }}
+{{- fail "the Rust node agent (node.implementation=rust or node.rustNodes) needs a protocol: enable nvmeof, iscsi or nfs" }}
 {{- end }}
 {{- end }}
 {{- /* The DaemonSet of node.implementation, and with node.rustNodes a second

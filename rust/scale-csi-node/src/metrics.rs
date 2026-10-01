@@ -16,6 +16,7 @@ pub struct Metrics {
     operations_duration: HistogramVec,
     node_connect_total: IntCounterVec,
     nvme_path_connect_total: IntCounterVec,
+    nfs_trunk_connect_total: IntCounterVec,
     nvme_sessions_total: IntGauge,
     gc_sessions_disconnected_total: IntCounterVec,
     nvme_controller_tunable_corrections_total: IntCounterVec,
@@ -64,6 +65,15 @@ impl Metrics {
             Opts::new(
                 "nvme_path_connect_total",
                 "Total number of NVMe-oF path convergence results by transport address",
+            )
+            .namespace(NAMESPACE),
+            &["address", "result"],
+        )
+        .expect("valid metric");
+        let nfs_trunk_connect_total = IntCounterVec::new(
+            Opts::new(
+                "nfs_trunk_connect_total",
+                "Total number of NFS trunk transport probe results by server address",
             )
             .namespace(NAMESPACE),
             &["address", "result"],
@@ -121,6 +131,7 @@ impl Metrics {
             Box::new(operations_duration.clone()),
             Box::new(node_connect_total.clone()),
             Box::new(nvme_path_connect_total.clone()),
+            Box::new(nfs_trunk_connect_total.clone()),
             Box::new(connection_status),
             Box::new(connections_active),
             Box::new(iscsi_sessions_total.clone()),
@@ -134,6 +145,7 @@ impl Metrics {
             operations_duration,
             node_connect_total,
             nvme_path_connect_total,
+            nfs_trunk_connect_total,
             nvme_sessions_total,
             gc_sessions_disconnected_total,
             nvme_controller_tunable_corrections_total,
@@ -191,7 +203,8 @@ impl Metrics {
     }
 
     /// One transport attach: `transport` is "nvmeof" for the kernel initiator,
-    /// "nvmeof-ublk" for nvmeublkd; `result` is "success" or "error".
+    /// "nvmeof-ublk" for nvmeublkd, "nfs" for an NFS mount; `result` is
+    /// "success" or "error".
     pub fn record_node_connect(&self, transport: &str, result: &str) {
         self.node_connect_total.with_label_values(&[transport, result]).inc();
     }
@@ -206,6 +219,16 @@ impl Metrics {
 
     pub fn nvme_path_connects(&self, address: &str, result: &str) -> u64 {
         self.nvme_path_connect_total.with_label_values(&[address, result]).get()
+    }
+
+    /// One NFS trunk probe: `address` is the server address, or
+    /// "invalid-publish-context" when the address hint was discarded.
+    pub fn record_nfs_trunk_connect(&self, address: &str, result: &str) {
+        self.nfs_trunk_connect_total.with_label_values(&[address, result]).inc();
+    }
+
+    pub fn nfs_trunk_connects(&self, address: &str, result: &str) -> u64 {
+        self.nfs_trunk_connect_total.with_label_values(&[address, result]).get()
     }
 
     /// One finished RPC. `status` is "benign" for Aborted, NotFound and

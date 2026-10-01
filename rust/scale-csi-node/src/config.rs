@@ -26,6 +26,7 @@ pub enum DataPath {
 pub struct Config {
     pub driver: String,
     pub nfs_enabled: bool,
+    pub nfs: NfsConfig,
     pub iscsi_enabled: bool,
     pub iscsi: IscsiConfig,
     pub nvmeof: NvmeofConfig,
@@ -33,6 +34,16 @@ pub struct Config {
     pub command_timeouts: CommandTimeouts,
     pub session_gc: SessionGcConfig,
     pub rate_limiting: RateLimitConfig,
+}
+
+/// `nfs`: the keys an NFS mount on the node reads.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NfsConfig {
+    /// `nconnect=<n>` on every NFS mount, 1..16; absent: the option is omitted.
+    pub nconnect: Option<i64>,
+    /// Storage networks whose interface addresses join this node's identity IPs.
+    pub node_identity_networks: Vec<String>,
 }
 
 /// `sessionGC`: orphaned-session cleanup on the node (Go defaults).
@@ -320,6 +331,7 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
     };
     let mut nvmeof: NvmeofConfig = serde_json::from_value(section("nvmeof")).context("config nvmeof")?;
     nvmeof.enabled = enabled("nvmeof")?;
+    let nfs: NfsConfig = serde_json::from_value(section("nfs")).context("config nfs")?;
     let node: NodeConfig = serde_json::from_value(section("node")).context("config node")?;
     let command_timeouts: CommandTimeouts =
         serde_json::from_value(section("commandTimeouts")).context("config commandTimeouts")?;
@@ -352,6 +364,7 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
         nfs_enabled: enabled("nfs")?,
         iscsi_enabled,
         iscsi,
+        nfs,
         nvmeof,
         node,
         command_timeouts,
@@ -363,6 +376,12 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
 }
 
 fn validate(config: &Config) -> Result<()> {
+    if let Some(n) = config.nfs.nconnect
+        && !(1..=16).contains(&n)
+    {
+        bail!("nfs.nconnect must be between 1 and 16 (got {n})");
+    }
+    crate::discovery::parse_identity_networks(&config.nfs.node_identity_networks).map_err(anyhow::Error::msg)?;
     let n = &config.nvmeof;
     match n.data_path.trim().to_ascii_lowercase().as_str() {
         "" | "kernel" | "ublk" => {}
@@ -644,6 +663,28 @@ mod tests {
         }
         let off = parse("iscsi:\n  enabled: false\n", env).unwrap();
         assert!(!off.iscsi_enabled, "a disabled block needs no portal");
+    }
+
+    #[test]
+    fn the_nfs_keys() {
+        let c = parse("nfs: {shareHost: x}\n", env).unwrap();
+        assert_eq!(c.nfs.nconnect, None);
+        assert!(c.nfs.node_identity_networks.is_empty());
+        let c = parse(
+            "nfs:\n  shareHost: x\n  nconnect: 4\n  nodeIdentityNetworks: [192.168.201.0/24, \"fd00:201::/64\"]\n",
+            env,
+        )
+        .unwrap();
+        assert_eq!(c.nfs.nconnect, Some(4));
+        assert_eq!(c.nfs.node_identity_networks, ["192.168.201.0/24", "fd00:201::/64"]);
+        for bad in [
+            "nfs: {nconnect: 0}",
+            "nfs: {nconnect: 17}",
+            "nfs: {nodeIdentityNetworks: [192.168.201.0/33]}",
+            "nfs: {nodeIdentityNetworks: [nas01]}",
+        ] {
+            assert!(parse(bad, env).is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]

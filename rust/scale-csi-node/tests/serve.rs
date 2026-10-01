@@ -181,18 +181,49 @@ async fn serves_identity_and_node_info() {
 }
 
 #[tokio::test]
-async fn refuses_protocols_it_does_not_serve() {
+async fn refuses_a_protocol_it_cannot_serve_as_configured() {
     for config in [
-        "nfs: {}\nnvmeof: {}\n",
-        "nfs: {}\niscsi:\n  targetPortal: 192.0.2.1:3260\n",
+        "iscsi:\n  enabled: true\n",
     ] {
         let mut agent = start(config, 0);
         let status = agent.child.wait().unwrap();
         assert!(!status.success(), "{config:?} was accepted");
         let mut err = String::new();
         std::io::Read::read_to_string(agent.child.stderr.as_mut().unwrap(), &mut err).unwrap();
-        assert!(err.contains("does not serve yet"), "{err}");
+        assert!(err.contains("iscsi.targetPortal is required"), "{err}");
     }
+}
+
+/// An NFS install is served; its node id carries NODE_IP and, NVMe-oF being
+/// off, no NQN. A storage network matching no interface changes nothing.
+#[tokio::test]
+async fn serves_an_nfs_install() {
+    let want = node_id::encode(&node_id::NodeIdentity {
+        name: "test-node".into(),
+        ips: vec!["192.0.2.10".parse().unwrap()],
+        ..Default::default()
+    })
+    .unwrap();
+    for config in [
+        "nfs:\n  shareHost: 192.0.2.1\n",
+        "nfs:\n  shareHost: 192.0.2.1\n  nodeIdentityNetworks: [198.18.0.0/15]\n",
+    ] {
+        let agent = start(config, 0);
+        let got = NodeClient::new(channel(&agent.socket).await)
+            .node_get_info(csi::NodeGetInfoRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.node_id, want, "{config:?}");
+    }
+    let mut agent = start("nfs:\n  nodeIdentityNetworks: [192.0.2.0/33]\n", 0);
+    assert!(
+        !agent.child.wait().unwrap().success(),
+        "a bad storage network is refused"
+    );
+    let mut err = String::new();
+    std::io::Read::read_to_string(agent.child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert!(err.contains("nfs.nodeIdentityNetworks"), "{err}");
 }
 
 #[tokio::test]

@@ -5,10 +5,7 @@
 ### The Rust node agent serves iSCSI
 
 `scale-csi-node`, the opt-in Rust node plugin, now serves iSCSI volumes as well
-as NVMe-oF. Only NFS is still Go-only: the chart refuses `node.implementation:
-rust` and `node.rustNodes` while `nfs.enabled` is true, and the agent refuses to
-start with NFS in its configuration. An iSCSI-only install (NVMe-oF off) may now
-run the agent.
+as NVMe-oF. An iSCSI-only install (NVMe-oF off) may run the agent.
 
 - **Same commands, same host access.** The agent runs `iscsiadm` through the
   image's wrapper (nsenter into the host), as the Go plugin does, with the same
@@ -64,6 +61,69 @@ run the agent.
 Nothing changes unless `node.implementation` or `node.rustNodes` is set. To
 try the agent on an iSCSI install, canary it with `node.rustNodes` first;
 removing the setting hands the nodes back to the Go plugin with no volume work.
+
+### NFS over a storage network with fencing on
+
+With `fencing.mode` `strict` (or `additive` on an export that already lists
+hosts), the controller grants an NFS export to the publishing node's identity
+IPs. Those were the node's `status.hostIP`, its Kubernetes address. A node that
+reaches the NAS over a separate storage network (its own subnet and interface,
+for example a NAS at 192.168.201.10 reached from the node's 192.168.201.x
+interface) presents its address on that network instead, which was not in the
+export's hosts, and the NAS refused the mount (NFSv4.1/4.2 returned `ENOENT`).
+
+- **The fix.** `nfs.nodeIdentityNetworks` lists the storage networks, as CIDRs
+  or single IPs (at most 16). At startup each node plugin, Go and Rust, adds its
+  interface addresses inside those networks to the IPs of its node ID, beside
+  its `status.hostIP`. The controller then grants them like any identity IP.
+  Link-local addresses are never used; IPv4 and IPv6 networks are both
+  accepted; an IPv4-mapped IPv6 network is refused (write the IPv4 form).
+- **Enable it.** Set `nfs.nodeIdentityNetworks: [192.168.201.0/24]` (every
+  fabric subnet the nodes mount from, including each `nfs.addresses` subnet with
+  trunking). If `nfs.shareAllowedNetworks` is set, it must cover these networks
+  too, or the controller still leaves the addresses out (it logs a warning at
+  start). List only storage subnets: a pod or CNI range would make node IDs
+  change with CNI addresses. On an IPv6 fabric with SLAAC privacy addresses,
+  list the node's stable address rather than the /64.
+- **Upgrade effect.** Unset, the default, nothing changes: every node ID is
+  byte-identical to the previous release's and the interfaces are not read. Setting it changes
+  the node ID of every node with an address in a listed network. kubelet
+  re-registers the plugin with the new ID when the node plugin restarts (the
+  chart rolls the DaemonSet on a ConfigMap change); the Kubernetes Node does not
+  restart. An export picks up a node's new address on that volume's next
+  publish to the node, so a volume that must move its mounts to the fabric
+  needs its pods rescheduled. The `server` of existing volumes is fixed at
+  creation: pointing `nfs.server` at the fabric address affects new volumes.
+  Rolling back to a release without the key: remove it first (the ConfigMap is
+  strict-parsed), and the node IDs return to their old value.
+- **The 256-byte limit.** The node ID still packs IPs in canonical order and
+  drops what does not fit. A storage-network address that is dropped is named in
+  a warning at node start; a typical node (name, NQN, IQN, one Kubernetes and a
+  couple of fabric addresses) fits with room to spare.
+
+### The Rust node agent serves NFS
+
+`scale-csi-node` now serves NFS volumes, with the Go node plugin's behaviour:
+
+- the same mount, `mount -t nfs -o nfsvers=4,<StorageClass mount options>`,
+  with `nconnect=` from `nfs.nconnect` and `max_connect=` for trunking replacing
+  theirs, at the same staging path, so a volume staged by either plugin is
+  taken over by the other;
+- NFSv4.1+ session trunking from the publish context's `addresses`, with the
+  same fallback without `max_connect`, the 4.1 check, the probe mounts and their
+  cleanup on unstage;
+- the legacy direct publish without a staging path;
+- the same errors, events (`NFSMountFailed`, `NFSTrunkingDegraded`,
+  `NFSTrunkingUnavailable`, `MountFailed`), metrics (`node_connect_total` with
+  `transport="nfs"`, `nfs_trunk_connect_total`), stats (bytes and inodes, after
+  a mount-table check that never touches a hung mount) and expansion (nothing to
+  do on the node);
+- an NFS unmount that fails falls back to a lazy unmount, as before.
+
+The chart and the agent now refuse only iSCSI: `node.implementation: rust` and
+`node.rustNodes` work with NFS enabled, alone or beside NVMe-oF. One difference
+from the Go plugin: when it unstages an NFS volume, the agent does not look for
+an iSCSI session named after it, as the Go plugin does (an NFS volume has none).
 
 ## v1.16.0 — publication records in Kubernetes
 

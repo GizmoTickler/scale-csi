@@ -213,13 +213,12 @@ node:
 
   # Which node plugin the DaemonSet runs, from the same image: go (scale-csi)
   # or rust (scale-csi-node, the Rust node agent). The Rust agent serves
-  # NVMe-oF (kernel initiator and nvmeublkd) and iSCSI so far: the chart
-  # refuses rust together with NFS.
+  # NVMe-oF (kernel initiator and nvmeublkd), iSCSI and NFS.
   implementation: go
 
   # A canary of the Rust agent in a Go cluster: node names (kubernetes.io/
   # hostname) that run it in a second DaemonSet, <fullname>-node-rust, while
-  # the Go DaemonSet avoids them. The same no-NFS rule applies. Leave
+  # the Go DaemonSet avoids them. Leave
   # node.affinity empty with it. Empty: one DaemonSet on every node.
   rustNodes: []
 
@@ -457,6 +456,19 @@ nfs:
   # Networks allowed to mount dynamically-created shares. An empty list allows
   # all networks and should be restricted in production.
   shareAllowedNetworks: []
+
+  # Storage networks (CIDRs, or single IPs) the nodes reach the NFS server over,
+  # when that is not the Kubernetes node network. Each node plugin adds its
+  # interface addresses inside these networks to its node identity, so fencing
+  # (fencing.mode strict/additive) grants the address the NAS actually sees on a
+  # fabric mount. Empty (the default) leaves every node's CSI node ID unchanged.
+  # Setting it changes the node ID of each node with an address in a listed
+  # network (kubelet re-registers the node; exports pick the new address up on
+  # their next publish). List only the storage subnets: a pod or CNI range here
+  # would make node IDs change with CNI addresses. If shareAllowedNetworks is
+  # set, it must cover these networks too.
+  #   nodeIdentityNetworks: [192.168.201.0/24, 192.168.202.0/24]
+  nodeIdentityNetworks: []
 
   # maproot_* and mapall_* are MUTUALLY EXCLUSIVE in TrueNAS: sharing.nfs.create
   # rejects a payload carrying both. To use mapall, clear the maproot values here

@@ -8,7 +8,8 @@
 //! a raw-block volume gets a symlink to its device at the staging path, a
 //! filesystem volume is formatted if blank and mounted there.
 //!
-//! This agent serves NVMe-oF and iSCSI so far. An NFS volume is refused with
+//! This agent serves NVMe-oF (nvmeublkd and the kernel initiator), iSCSI where
+//! the install enables it, and NFS (`nfs.rs`). Any other volume is refused with
 //! FailedPrecondition before anything is changed.
 
 use std::collections::HashMap;
@@ -27,7 +28,8 @@ use crate::config::DataPath;
 use crate::csi;
 use crate::events::node_volume_ref;
 use crate::locks::node_volume_key;
-use crate::mount::Mounter;
+use crate::mount::{Mounter, is_nfs_mount_source};
+use crate::nfs;
 use crate::nvme_kernel;
 use crate::records::MountRecord;
 use crate::service::State;
@@ -294,7 +296,7 @@ pub async fn node_stage(
     let share = capability::attach_driver(&req.volume_context, &state.driver_name);
     // iSCSI is served where the install enables it (the Go node would try
     // anyway; an install without it has no iSCSI settings to stage with).
-    if share == ShareType::Nfs || (share == ShareType::Iscsi && !state.config.iscsi_enabled) {
+    if share == ShareType::Iscsi && !state.config.iscsi_enabled {
         return Err(not_served(format!(
             "volume {volume_id} is a {} volume",
             share_name(share)
@@ -326,6 +328,20 @@ pub async fn node_stage(
                 &stage_context,
                 &req.secrets,
                 staging,
+                event.as_ref(),
+                deadline,
+            )
+            .await;
+            info!("Volume {volume_id} is already staged compatibly at {staging}");
+            return Ok(());
+        }
+        if share == ShareType::Nfs {
+            let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+            nfs::converge_existing(
+                state,
+                &stage_context,
+                staging,
+                Some(capability),
                 event.as_ref(),
                 deadline,
             )
@@ -372,6 +388,23 @@ pub async fn node_stage(
                 event: event.as_ref(),
                 deadline,
             },
+        )
+        .await?;
+        if !handle_existing_stage(state, &want).await? {
+            remember_stage(state, &want).await;
+        }
+        info!("Volume {volume_id} staged successfully at {staging}");
+        return Ok(());
+    }
+
+    if share == ShareType::Nfs {
+        nfs::stage(
+            state,
+            &stage_context,
+            staging,
+            Some(capability),
+            event.as_ref(),
+            deadline,
         )
         .await?;
         if !handle_existing_stage(state, &want).await? {
@@ -447,6 +480,8 @@ pub async fn node_unstage(
         .try_lock(node_volume_key(volume_id))
         .ok_or_else(|| Status::aborted("operation already in progress"))?;
 
+    nfs::cleanup_trunk_probes(state, staging, deadline).await;
+
     // The device, read before anything is unmounted; a block volume's staging
     // path is a symlink to it, not a mount.
     let device = match state.mounter.mount_source(staging, deadline).await {
@@ -462,10 +497,12 @@ pub async fn node_unstage(
             }
         },
     };
-    // Without iSCSI only NVMe-oF is served: another device is refused before
-    // anything changes rather than half unstaged. With it, a device that is
-    // not NVMe-oF is cleaned up as iSCSI, as in the Go node.
-    if !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") && !state.config.iscsi_enabled {
+    // An NFS mount's source is server:/share; it holds no session.
+    let nfs = is_nfs_mount_source(&device);
+    // Without iSCSI only NVMe-oF and NFS are served: another device is refused
+    // before anything changes rather than half unstaged. With it, a device that
+    // is not NVMe-oF is cleaned up as iSCSI, as in the Go node.
+    if !nfs && !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") && !state.config.iscsi_enabled {
         return Err(not_served(format!(
             "volume {volume_id} is staged on {device}, which is not an NVMe-oF device"
         )));
@@ -499,6 +536,11 @@ pub async fn node_unstage(
         if let Err(e) = remove_all(staging) {
             warn!("Failed to remove staging directory: {e}");
         }
+    }
+    if nfs {
+        state.records.delete_stage(staging);
+        info!("Volume {volume_id} unstaged successfully");
+        return Ok(());
     }
 
     // The userspace data path holds no kernel session: detach from nvmeublkd

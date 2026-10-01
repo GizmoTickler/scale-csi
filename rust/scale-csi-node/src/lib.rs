@@ -16,6 +16,7 @@ pub mod iscsi_stage;
 pub mod locks;
 pub mod metrics;
 pub mod mount;
+pub mod nfs;
 pub mod node_id;
 pub mod nvme;
 pub mod nvme_addresses;
@@ -38,6 +39,8 @@ mod iscsi_stage_tests;
 mod iscsi_testing;
 #[cfg(test)]
 mod iscsi_tests;
+#[cfg(test)]
+mod nfs_tests;
 #[cfg(test)]
 mod nvme_kernel_tests;
 #[cfg(test)]

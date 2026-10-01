@@ -131,7 +131,7 @@ func TestDiscoverNodeIdentityRejectsDenyAllSentinelIQN(t *testing.T) {
 		return nil, fmt.Errorf("no such file")
 	}
 
-	identity := discoverNodeIdentity(context.Background(), "worker-a")
+	identity := discoverNodeIdentity(context.Background(), "worker-a", nil)
 	assert.Equal(t, "worker-a", identity.Name)
 	assert.Empty(t, identity.ISCSIIQN, "the reserved deny-all sentinel must never be accepted as a node IQN")
 }

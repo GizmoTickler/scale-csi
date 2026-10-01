@@ -67,7 +67,10 @@ unpublish, and they are maintained in **every** fencing mode (including `off`).
 mutated: in `additive`/`strict`, NVMe-oF authorizes the publishing node's host
 NQN, iSCSI authorizes its initiator IQN, and NFS authorizes its node IP after
 checking that IP against `nfs.shareAllowedNetworks`; `ControllerUnpublishVolume`
-removes that identity. In `off` the allowlists are left untouched and the
+removes that identity. A node's NFS identity IPs are its Kubernetes address
+(`status.hostIP`); when nodes reach the NAS over a separate storage network, list
+that network in `nfs.nodeIdentityNetworks` so each node also reports its address
+there, or the NAS refuses the mount from it. In `off` the allowlists are left untouched and the
 publication records alone enforce exclusivity. The durable record also keeps
 unpublish possible after the Kubernetes Node has disappeared.
 If an operator force-removes a stuck VolumeAttachment finalizer, the periodic
@@ -195,6 +198,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nfs.trunking` | Opt into NFSv4.1+ multi-address session trunking | `false` |
 | `nfs.addresses` | Up to 16 additional NFS server IP literals; required with trunking, with the effective set including the primary capped at 16 | `[]` |
 | `nfs.shareAllowedNetworks` | CIDRs allowed to mount created shares | `[]` |
+| `nfs.nodeIdentityNetworks` | Storage networks (CIDRs or IPs, up to 16) whose interface addresses each node adds to its node identity, so fencing grants a node mounting over a storage fabric its fabric address; setting it changes those nodes' node IDs | `[]` |
 | `nfs.shareMaprootUser` | NFS maproot user | `root` |
 | `nfs.shareMaprootGroup` | NFS maproot group | `wheel` |
 | `nfs.shareMapallUser` | NFS mapall user | `""` |
@@ -587,7 +591,7 @@ Operator caveats:
 | `controller.podSecurityContext` | Controller-only pod security context, deep-merged over the shared `podSecurityContext` (controller keys win); the node DaemonSet deliberately gets no pod-level seccomp profile | `{seccompProfile: {type: RuntimeDefault}}` |
 | `controller.resources` | Controller driver resources | requests `10m` CPU, `32Mi` memory; memory limit `256Mi` |
 | `node.enabled` | Deploy the node DaemonSet | `true` |
-| `node.implementation` | Node plugin binary: `go` (scale-csi) or `rust` (scale-csi-node, the Rust node agent; NVMe-oF and iSCSI so far, not NFS) | `go` |
+| `node.implementation` | Node plugin binary: `go` (scale-csi) or `rust` (scale-csi-node, the Rust node agent; NVMe-oF, iSCSI and NFS) | `go` |
 | `node.rustNodes` | Node names that run the Rust agent in a second DaemonSet (`<fullname>-node-rust`) while the Go DaemonSet avoids them: a canary. Not with `node.implementation: rust` or `node.affinity` | `[]` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |
 | `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
