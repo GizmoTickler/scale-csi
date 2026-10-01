@@ -520,7 +520,7 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			// entry's Status carries PublishedNodeIds decoded from the volume's
 			// own publication records, which ride on the same per-page
 			// pool.dataset.query hydration the entry is built from — zero extra
-			// API cost. See publishedNodeIDsFromDataset.
+			// API cost. See publishedNodeIDs.
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_LIST_VOLUMES_PUBLISHED_NODES,
@@ -1761,6 +1761,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			} else {
 				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
 			}
+			// A retry after a failed forget below lands here: best effort too.
+			if forgetErr := d.publications().forget(ctx, datasetName); forgetErr != nil {
+				klog.Warningf("Failed to remove the publication records of deleted volume %s: %v", volumeID, forgetErr)
+			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
 		return nil, status.Errorf(codes.Internal, "failed to verify volume %s: %v", volumeID, err)
@@ -2035,6 +2039,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			klog.Errorf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete clone origin snapshot %s: %v", originSnapshotID, err)
 		}
+	}
+
+	// Records kept outside the dataset (VolumePublications) did not go with
+	// it. A failure fails this attempt; its retry finds the dataset gone and
+	// tries again above.
+	if err := d.publications().forget(ctx, datasetName); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to remove the publication records of volume %s: %v", volumeID, err)
 	}
 
 	// Drop the volume's per-volume usage series so a deleted volume cannot leave
@@ -2388,7 +2399,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				// free. Requires the source-bearing pool.dataset.query read
 				// above — publicationRecordsFromDataset only trusts LOCAL
 				// properties, and the resource-query listing strips sources.
-				PublishedNodeIds: publishedNodeIDsFromDataset(ds),
+				PublishedNodeIds: d.publishedNodeIDs(ctx, ds),
 			},
 		})
 	}
@@ -2469,7 +2480,7 @@ func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page [
 	return datasets[offset:end], end < len(datasets)
 }
 
-// publishedNodeIDsFromDataset derives a ListVolumes entry's PublishedNodeIds
+// publishedNodeIDs derives a ListVolumes entry's PublishedNodeIds
 // from the volume's own publication records (F-1). record.EncodedID is the CSI
 // NodeId the CO passed to ControllerPublishVolume, which is exactly the
 // identifier the CO correlates published nodes by.
@@ -2486,8 +2497,8 @@ func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page [
 // publication/unpublication authorization loudly, but a read-only listing must
 // not go dark over one corrupt property — the entry is returned without
 // published-node data instead.
-func publishedNodeIDsFromDataset(ds *truenas.Dataset) []string {
-	records, err := publicationRecordsFromDataset(ds)
+func (d *Driver) publishedNodeIDs(ctx context.Context, ds *truenas.Dataset) []string {
+	records, err := readPublicationRecordsCached(ctx, d.publications(), ds.Name, ds)
 	if err != nil {
 		klog.Warningf("ListVolumes: skipping published-node ids for %s: %v", ds.Name, err)
 		return nil
@@ -3367,7 +3378,7 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			PublishedNodeIds: publishedNodeIDsFromDataset(ds),
+			PublishedNodeIds: d.publishedNodeIDs(ctx, ds),
 		},
 	}, nil
 }

@@ -93,6 +93,11 @@ jobs:
         # (GF5/H1 shipped exactly that way). Kept as its own step so a
         # shuffle-only failure is easy to spot separately from the coverage run.
         run: go test -count=1 -shuffle=on ./pkg/driver/
+      - name: Run driver tests with records in Kubernetes
+        # The record, fencing and reconcile tests again, every driver keeping
+        # publication records as VolumePublications (with the import from ZFS)
+        # instead of ZFS properties, as the chart runs the controller.
+        run: SCALE_CSI_TEST_PUBLICATION_STORE=kubernetes go test -race -count=1 ./pkg/driver/
       - name: Check coverage threshold
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')

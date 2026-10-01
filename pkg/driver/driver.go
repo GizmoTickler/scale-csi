@@ -278,6 +278,13 @@ type Driver struct {
 	capacityCancel  context.CancelFunc
 	capacityWg      sync.WaitGroup
 
+	// The background import of publication records left on ZFS; the same
+	// mutex + terminal-flag pattern as the capacity loop.
+	publicationImportStateMu sync.Mutex
+	publicationImportStopped bool
+	publicationImportCancel  context.CancelFunc
+	publicationImportWg      sync.WaitGroup
+
 	// Controller-side poll of the durable last-reap record on .csi-bookkeeping.
 	// The delete-capable pass runs in the ephemeral CronJob; this loop is what
 	// keeps last-reap gauges (and a just-drained backlog) fresh on the scraped
@@ -310,7 +317,12 @@ type Driver struct {
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
 	stalePublicationRecordsSeen sync.Map
-	fencingDeferredLogs         sync.Map
+	// publicationStore holds publication records; nil means the ZFS store.
+	publicationStore publicationStore
+	// publicationCacheRef is the store's watch, for Stop() to end; it races
+	// Run()'s startup, hence atomic.
+	publicationCacheRef atomic.Pointer[publicationCache]
+	fencingDeferredLogs sync.Map
 
 	// Track when orphaned sessions were first seen (for grace period). The
 	// protocol maps must remain independent: a cleanup pass may only retire
@@ -569,6 +581,12 @@ func (d *Driver) Run() error {
 		addr = u.Host
 	}
 
+	// Decided once, before anything serves: a controller told to keep records
+	// in Kubernetes that cannot stops here.
+	if storeErr := d.selectPublicationStore(context.Background()); storeErr != nil {
+		return storeErr
+	}
+
 	// Create listener
 	listener, err := net.Listen(u.Scheme, addr)
 	if err != nil {
@@ -666,6 +684,7 @@ func (d *Driver) Run() error {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
+		d.startPublicationImport()
 		SetReconcileDeleteEnabled(d.config != nil && d.config.Reconcile.Delete.Enabled)
 		d.startTombstoneReapRecordPoll()
 	}
@@ -701,7 +720,11 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
+	d.stopPublicationImport()
 	d.stopTombstoneReapRecordPoll()
+	if publicationCache := d.publicationCacheRef.Load(); publicationCache != nil {
+		publicationCache.close()
+	}
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

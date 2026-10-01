@@ -839,7 +839,7 @@ func TestStalePublicationRechecksGenerationAtDestructiveBoundary(t *testing.T) {
 	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, t0.Add(time.Second))
 	fresh, err := base.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Contains(t, records, key)
 	assert.Equal(t, replacement.UpdatedAt, records[key].UpdatedAt,
@@ -968,7 +968,7 @@ func TestStalePublicationMassAbsenceBrakeDefersAllRecords(t *testing.T) {
 	for _, dataset := range datasets {
 		fresh, err := client.DatasetGet(ctx, dataset.Name)
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(d, fresh)
 		require.NoError(t, err)
 		assert.Len(t, records, 1)
 	}

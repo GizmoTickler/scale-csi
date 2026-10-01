@@ -169,7 +169,7 @@ func TestStartupReconcileConvergesAroundThePermanentGeometryRefusal(t *testing.T
 	// The unrelated volume still converged in the same pass.
 	healthy, err := client.DatasetGet(ctx, "pool/parent/healthy")
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(healthy)
+	records, err := storedPublicationRecords(d, healthy)
 	require.NoError(t, err)
 	assert.Len(t, records, 1, "one un-resolvable volume must not stop every other volume from converging")
 

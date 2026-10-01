@@ -1361,6 +1361,7 @@ func iscsiPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRe
 // ServiceReload can issue both service.reload and service.control), all folded
 // into one count here.
 func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
+	skipWithRecordsInKubernetes(t, "pins the record writes TrueNAS serves; see api_call_count_kubernetes_test.go")
 	ctx := context.Background()
 
 	// (a) fencing OFF + NFS — the records-only floor. Backend allowlist
@@ -1828,6 +1829,7 @@ func TestGF2FeaturesDefaultOffMakeNoNewAPICalls(t *testing.T) {
 // job wait, AND one extra core.get_jobs (fetchJobResult). These goldens count
 // ClientInterface calls, not wire RTTs (see the header of the publish goldens).
 func TestControllerPublishEncryptedGoldenAPICallCounts(t *testing.T) {
+	skipWithRecordsInKubernetes(t, "pins the record writes TrueNAS serves")
 	ctx := context.Background()
 	const passphrase = "enc-passphrase-1"
 	const rotatedPassphrase = "enc-passphrase-2"

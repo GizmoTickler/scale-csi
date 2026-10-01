@@ -9,3 +9,4 @@
 check:
 	go test -race -short ./...
 	go test -count=1 -shuffle=on ./pkg/driver/
+	SCALE_CSI_TEST_PUBLICATION_STORE=kubernetes go test -race -count=1 ./pkg/driver/
