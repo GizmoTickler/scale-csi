@@ -490,7 +490,6 @@ async fn a_staged_filesystem_requested_as_block_is_already_exists() {
 #[tokio::test]
 async fn other_paths_are_refused_before_anything_changes() {
     for (name, extra) in [
-        ("kernel data path", vec![("nvmeof/dataPath", "kernel")]),
         (
             "iscsi",
             vec![("node_attach_driver", "iscsi"), ("iqn", "iqn.2005-10.org.example:x")],

@@ -18,8 +18,10 @@ use crate::csi::{self, identity_server::Identity, node_server::Node};
 use crate::events::{Events, LogEvents};
 use crate::locks::OperationLocks;
 use crate::metrics::Metrics;
-use crate::mount::{Mounter, Timeouts};
+use crate::mount::{CLocaleRunner, Mounter, Timeouts};
+use crate::nvme::Nvme;
 use crate::records::Records;
+use crate::session_registry::SessionRegistry;
 use crate::ublk_client::{self, Daemon};
 
 /// Where the node looks at the host; the tests point it elsewhere.
@@ -56,6 +58,10 @@ pub struct State {
     pub ublk: Arc<dyn Daemon>,
     pub events: Arc<dyn Events>,
     pub host: Host,
+    /// The kernel NVMe-oF initiator (nvme-cli and sysfs).
+    pub nvme: Nvme,
+    /// The NVMe-oF sessions this plugin connected, beside the CSI socket.
+    pub nvme_sessions: Option<SessionRegistry>,
     /// Shared by each running volume operation; see run_to_completion.
     pub operations: Arc<RwLock<()>>,
 }
@@ -69,6 +75,7 @@ impl State {
             mount: config.command_timeouts.mount(),
             format: config.command_timeouts.format(),
         };
+        let nvme_timeout = config.command_timeouts.nvme();
         State {
             metrics,
             driver_name,
@@ -82,6 +89,13 @@ impl State {
             records: Records::default(),
             ublk,
             events: Arc::new(LogEvents),
+            nvme: Nvme {
+                runner: Arc::new(CLocaleRunner),
+                timeout: nvme_timeout,
+                sysfs: PathBuf::from("/sys"),
+                dev: PathBuf::from("/dev"),
+            },
+            nvme_sessions: None,
             host: Host::default(),
             operations: Arc::default(),
         }

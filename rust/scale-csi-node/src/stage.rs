@@ -29,6 +29,7 @@ use crate::csi;
 use crate::events::node_volume_ref;
 use crate::locks::node_volume_key;
 use crate::mount::Mounter;
+use crate::nvme_kernel;
 use crate::records::MountRecord;
 use crate::service::State;
 use crate::ublk_client::is_ublk_device;
@@ -68,15 +69,15 @@ pub fn with_publish_hint(
     merged
 }
 
-/// The device a block staging link resolves to, when that is a present /dev
-/// node (Go stagedBlockDevicePath).
-pub fn staged_block_device_path(staging: &str) -> Option<String> {
+/// The device a block staging link resolves to, when that is a present node
+/// under the device directory, `/dev` (Go stagedBlockDevicePath).
+pub fn staged_block_device_path(staging: &str, dev_dir: &Path) -> Option<String> {
     let meta = std::fs::symlink_metadata(staging).ok()?;
     if !meta.file_type().is_symlink() {
         return None;
     }
     let device = std::fs::canonicalize(staging).ok()?.to_str()?.to_string();
-    if !device.starts_with("/dev/") {
+    if !Path::new(&device).starts_with(dev_dir) {
         return None;
     }
     std::fs::metadata(&device).ok()?;
@@ -99,6 +100,7 @@ async fn verify_stage_device_source(
         ShareType::Nvmeof if is_ublk_device(device) => {
             ublk_stage::verify_stage_source(state, volume_id, device, context, deadline).await
         }
+        ShareType::Nvmeof => nvme_kernel::verify_stage_source(state, device, context),
         _ => Err(not_served(format!(
             "staging target is backed by {device}, a kernel {} device",
             share_name(share)
@@ -253,7 +255,7 @@ pub async fn handle_existing_stage(state: &State, want: &Wanted<'_>) -> Result<b
 async fn remember_stage(state: &State, want: &Wanted<'_>) {
     let mut live_source = want.expected_source.to_string();
     if want.capability.access_type == AccessType::Block {
-        if let Some(device) = staged_block_device_path(want.staging) {
+        if let Some(device) = staged_block_device_path(want.staging, &state.host.dev_dir) {
             live_source = normalize_mount_source(&device);
         }
     } else if let Ok(info) = state.mounter.mount_info(want.staging, want.deadline).await {
@@ -313,6 +315,16 @@ pub async fn node_stage(
         deadline,
     };
     if handle_existing_stage(state, &want).await? {
+        // Kernel path convergence is for kernel controllers only: a ublk
+        // device has none, and the daemon runs its own multipath.
+        let ublk = state
+            .records
+            .stage(staging)
+            .is_some_and(|record| is_ublk_device(&record.live_source));
+        if !ublk {
+            let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+            nvme_kernel::converge_existing(state, &stage_context, event.as_ref(), deadline).await;
+        }
         info!("Volume {volume_id} is already staged compatibly at {staging}");
         return Ok(());
     }
@@ -347,9 +359,18 @@ pub async fn node_stage(
             .await?
         }
         DataPath::Kernel => {
-            return Err(not_served(format!(
-                "volume {volume_id} uses the kernel NVMe-oF data path"
-            )));
+            nvme_kernel::stage(
+                state,
+                StageRequest {
+                    volume_id,
+                    context: &stage_context,
+                    staging,
+                    capability,
+                    event: event.as_ref(),
+                    deadline,
+                },
+            )
+            .await?
         }
     }
 

@@ -70,7 +70,28 @@ pub struct NvmeofConfig {
     /// Around a volume's subsystem name: `<prefix><share name><suffix>`.
     pub name_prefix: String,
     pub name_suffix: String,
+    pub transport_address: String,
+    pub transport_service_id: i64,
+    /// Multipath across `transportAddress` and `addresses`.
+    pub multipath: bool,
+    pub addresses: Vec<String>,
+    /// Seconds a stage waits for a connected device; 0 takes 60.
+    pub device_wait_timeout: i64,
+    pub connect: ConnectConfig,
     pub ublk: UblkConfig,
+}
+
+/// `nvmeof.connect`: knobs for `nvme connect`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConnectConfig {
+    /// Seconds. 0: 15 with multipath, omitted without; negative: omitted.
+    #[serde(rename = "fastIOFailTmo")]
+    pub fast_io_fail_tmo: i64,
+    #[serde(rename = "nrIOQueues")]
+    pub nr_io_queues: Option<i64>,
+    pub nr_write_queues: Option<i64>,
+    pub keep_alive_tmo: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,9 +127,47 @@ impl Default for UblkConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct NodeConfig {
     pub max_volumes_per_node: i64,
+    /// Milliseconds a stage waits for a disconnected session to clear; 0 takes 500.
+    pub session_cleanup_delay: i64,
+}
+
+impl NodeConfig {
+    pub fn session_cleanup_delay(&self) -> Duration {
+        Duration::from_millis(
+            u64::try_from(self.session_cleanup_delay)
+                .ok()
+                .filter(|v| *v > 0)
+                .unwrap_or(500),
+        )
+    }
 }
 
 impl NvmeofConfig {
+    /// The configured portal addresses when multipath is on (transportAddress
+    /// first, trimmed, duplicates dropped); empty without multipath.
+    pub fn multipath_addresses(&self) -> Vec<String> {
+        if !self.multipath {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for address in std::iter::once(&self.transport_address).chain(&self.addresses) {
+            let address = address.trim();
+            if !address.is_empty() && !out.iter().any(|a| a == address) {
+                out.push(address.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn device_wait_timeout(&self) -> Duration {
+        Duration::from_secs(
+            u64::try_from(self.device_wait_timeout)
+                .ok()
+                .filter(|v| *v > 0)
+                .unwrap_or(60),
+        )
+    }
+
     /// The install-wide default data path; anything but "ublk" is the kernel's.
     pub fn default_data_path(&self) -> DataPath {
         if self.data_path.trim().eq_ignore_ascii_case("ublk") {
@@ -212,6 +271,21 @@ fn validate(config: &Config) -> Result<()> {
         if n.ublk.napi_us > 1_000_000 {
             bail!("nvmeof.ublk.napiUs must be 0..1000000");
         }
+    }
+    for (name, value) in [
+        ("nvmeof.connect.nrIOQueues", n.connect.nr_io_queues),
+        ("nvmeof.connect.nrWriteQueues", n.connect.nr_write_queues),
+        ("nvmeof.connect.keepAliveTmo", n.connect.keep_alive_tmo),
+    ] {
+        if value.is_some_and(|v| v < 1) {
+            bail!("{name} must be at least 1");
+        }
+    }
+    if n.device_wait_timeout < 0 {
+        bail!("nvmeof.deviceWaitTimeout must not be negative");
+    }
+    if config.node.session_cleanup_delay < 0 {
+        bail!("node.sessionCleanupDelay must not be negative");
     }
     let t = &config.command_timeouts;
     for (name, value) in [

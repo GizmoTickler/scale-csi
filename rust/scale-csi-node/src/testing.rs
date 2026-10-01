@@ -26,6 +26,8 @@ pub struct HostState {
     pub mountinfo: Option<PathBuf>,
     /// Commands (by prefix of "program args") that fail with exit 32.
     pub failing: Vec<String>,
+    /// A fake kernel NVMe initiator, when set.
+    pub kernel: Option<FakeKernel>,
     /// device -> filesystem
     pub filesystems: HashMap<String, String>,
     pub calls: Vec<String>,
@@ -171,6 +173,7 @@ impl Runner for FakeHost {
                 output(0, "")
             }
             ("resize2fs" | "xfs_growfs" | "btrfs", _) => output(0, ""),
+            ("nvme", _) if host.kernel.is_some() => host.kernel.as_mut().unwrap().run(args),
             _ => output(127, ""),
         })
     }
@@ -379,6 +382,15 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
         sysfs: dir.path().join("sys"),
         host_id_files: vec![dir.path().join("no-hostid")],
     };
+    let nvme_runner: Arc<dyn Runner> = host.clone();
+    state.nvme = crate::nvme::Nvme {
+        runner: nvme_runner,
+        timeout: std::time::Duration::from_secs(30),
+        sysfs: dir.path().join("sys"),
+        dev: daemon.dev_dir.path().to_path_buf(),
+    };
+    state.nvme_sessions =
+        Some(crate::session_registry::SessionRegistry::at(dir.path().join("sessions/nvmeof")).unwrap());
     tweak(&mut state);
     Node {
         state: Arc::new(state),
@@ -442,5 +454,150 @@ pub fn filesystem() -> csi::VolumeCapability {
         access_mode: Some(volume_capability::AccessMode {
             mode: volume_capability::access_mode::Mode::SingleNodeWriter as i32,
         }),
+    }
+}
+
+/// A kernel NVMe initiator as nvme-cli and sysfs show it: `connect` adds a
+/// live controller (and, for a new subsystem, its sysfs entries and one
+/// namespace device), `disconnect` removes the subsystem, `list-subsys` lists
+/// them in nvme-cli 2.x's shape. Addresses in `unreachable` refuse connects.
+/// (subsystem index, [(controller, address, state)])
+pub type FakeSubsystem = (u32, Vec<(String, String, String)>);
+
+pub struct FakeKernel {
+    pub sys: PathBuf,
+    pub dev: PathBuf,
+    pub subsystems: BTreeMap<String, FakeSubsystem>,
+    pub unreachable: Vec<String>,
+    /// Disconnects fail (EINVAL), as for a controller the kernel will not drop.
+    pub refuse_disconnect: bool,
+    next_subsystem: u32,
+    next_controller: u32,
+}
+
+impl FakeKernel {
+    pub fn new(sys: PathBuf, dev: PathBuf) -> Self {
+        std::fs::create_dir_all(sys.join("class/nvme-subsystem")).unwrap();
+        std::fs::create_dir_all(sys.join("class/nvme")).unwrap();
+        std::fs::create_dir_all(&dev).unwrap();
+        FakeKernel {
+            sys,
+            dev,
+            subsystems: BTreeMap::new(),
+            unreachable: Vec::new(),
+            refuse_disconnect: false,
+            next_subsystem: 0,
+            next_controller: 0,
+        }
+    }
+
+    /// The namespace device of a subsystem.
+    pub fn device(&self, nqn: &str) -> Option<String> {
+        let (index, _) = self.subsystems.get(nqn)?;
+        Some(self.dev.join(format!("nvme{index}n1")).to_string_lossy().into_owned())
+    }
+
+    /// A live controller connected by someone else (or a previous stage).
+    pub fn add_live(&mut self, nqn: &str, address: &str) {
+        self.add_path(nqn, address, "live");
+    }
+
+    /// A subsystem whose controllers all lost their connection.
+    pub fn add_dead(&mut self, nqn: &str, address: &str) {
+        self.add_path(nqn, address, "connecting");
+    }
+
+    fn add_path(&mut self, nqn: &str, address: &str, state: &str) {
+        let controller = format!("nvme{}", self.next_controller);
+        self.next_controller += 1;
+        std::fs::create_dir_all(self.sys.join("class/nvme").join(&controller)).unwrap();
+        std::fs::write(
+            self.sys.join("class/nvme").join(&controller).join("subsysnqn"),
+            format!("{nqn}\n"),
+        )
+        .unwrap();
+        if !self.subsystems.contains_key(nqn) {
+            let index = self.next_subsystem;
+            self.next_subsystem += 1;
+            let dir = self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}"));
+            std::fs::create_dir_all(dir.join(format!("nvme{index}n1"))).unwrap();
+            std::fs::write(dir.join("subsysnqn"), format!("{nqn}\n")).unwrap();
+            std::fs::write(dir.join("iopolicy"), "numa").unwrap();
+            std::fs::write(self.dev.join(format!("nvme{index}n1")), b"").unwrap();
+            self.subsystems.insert(nqn.to_string(), (index, Vec::new()));
+        }
+        let entry = self.subsystems.get_mut(nqn).unwrap();
+        entry.1.push((controller, address.to_string(), state.to_string()));
+    }
+
+    fn remove(&mut self, nqn: &str) -> bool {
+        let Some((index, paths)) = self.subsystems.remove(nqn) else {
+            return false;
+        };
+        let _ = std::fs::remove_dir_all(self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}")));
+        let _ = std::fs::remove_file(self.dev.join(format!("nvme{index}n1")));
+        for (controller, _, _) in paths {
+            let _ = std::fs::remove_dir_all(self.sys.join("class/nvme").join(controller));
+        }
+        true
+    }
+
+    fn list_json(&self) -> String {
+        let subsystems: Vec<serde_json::Value> = self
+            .subsystems
+            .iter()
+            .map(|(nqn, (index, paths))| {
+                serde_json::json!({
+                    "Name": format!("nvme-subsys{index}"),
+                    "NQN": nqn,
+                    "Paths": paths.iter().map(|(name, address, state)| serde_json::json!({
+                        "Name": name,
+                        "Transport": "tcp",
+                        "Address": format!("traddr={address},trsvcid=4420"),
+                        "State": state,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::json!([{"HostNQN": "nqn.host", "Subsystems": subsystems}]).to_string()
+    }
+
+    fn run(&mut self, args: &[&str]) -> Output {
+        let flag = |name: &str| args.iter().position(|a| *a == name).map(|i| args[i + 1].to_string());
+        match args.first().copied() {
+            Some("list-subsys") => output(0, &self.list_json()),
+            Some("connect") => {
+                let (nqn, address) = (flag("-n").unwrap(), flag("-a").unwrap());
+                if self.unreachable.contains(&address) {
+                    return Output {
+                        code: Some(1),
+                        stdout: Vec::new(),
+                        stderr: b"could not add new controller: Connection refused".to_vec(),
+                        wedged: false,
+                        timed_out: false,
+                    };
+                }
+                let live = self
+                    .subsystems
+                    .get(&nqn)
+                    .is_some_and(|(_, paths)| paths.iter().any(|(_, a, s)| *a == address && s == "live"));
+                if live {
+                    return output(1, "already connected");
+                }
+                self.add_path(&nqn, &address, "live");
+                output(0, "")
+            }
+            Some("disconnect") if self.refuse_disconnect => output(1, "Failed to disconnect: Invalid argument"),
+            Some("disconnect") => {
+                let nqn = flag("-n").unwrap();
+                if self.remove(&nqn) {
+                    output(0, &format!("NQN:{nqn} disconnected 1 controller(s)"))
+                } else {
+                    output(1, &format!("{nqn} not found"))
+                }
+            }
+            Some("ns-rescan") => output(0, ""),
+            _ => output(127, ""),
+        }
     }
 }

@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use log::info;
+use log::{info, warn};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
@@ -11,6 +11,7 @@ use scale_csi_node::csi::{identity_server::IdentityServer, node_server::NodeServ
 use scale_csi_node::metrics::{Metrics, OperationsLayer};
 use scale_csi_node::node_id::{self, Protocols};
 use scale_csi_node::service::{IdentityService, NodeService, State};
+use scale_csi_node::session_registry::SessionRegistry;
 use scale_csi_node::{args, config, discovery, health};
 
 #[tokio::main]
@@ -83,7 +84,15 @@ async fn run() -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
 
     let metrics = Arc::new(Metrics::new());
-    let state = Arc::new(State::new(config, driver_name, node_name, node_id, metrics.clone()));
+    let mut state = State::new(config, driver_name, node_name, node_id, metrics.clone());
+    state.nvme_sessions = match SessionRegistry::beside(&socket) {
+        Ok(registry) => Some(registry),
+        Err(e) => {
+            warn!("no NVMe-oF session registry ({e:#}): session GC will not collect NVMe-oF sessions");
+            None
+        }
+    };
+    let state = Arc::new(state);
     if args.health_port > 0 {
         let health = health::bind(args.health_port)
             .await

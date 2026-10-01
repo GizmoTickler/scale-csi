@@ -244,7 +244,7 @@ pub async fn stage(state: &State, req: StageRequest<'_>) -> Result<(), Status> {
     if matches!(
         req.capability.access_type,
         Some(csi::volume_capability::AccessType::Block(_))
-    ) && let Some(device) = staged_block_device_path(req.staging)
+    ) && let Some(device) = staged_block_device_path(req.staging, &state.host.dev_dir)
         && is_ublk_device(&device)
     {
         match verify_stage_source(state, req.volume_id, &device, req.context, req.deadline).await {

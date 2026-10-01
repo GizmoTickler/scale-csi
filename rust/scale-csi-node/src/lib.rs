@@ -17,9 +17,11 @@ pub mod mount;
 pub mod node_id;
 pub mod nvme;
 pub mod nvme_addresses;
+pub mod nvme_kernel;
 pub mod publish;
 pub mod records;
 pub mod service;
+pub mod session_registry;
 pub mod stage;
 pub mod ublk_client;
 pub mod ublk_stage;
@@ -27,6 +29,8 @@ pub mod ublk_state;
 
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod nvme_kernel_tests;
 #[cfg(test)]
 mod publish_tests;
 #[cfg(test)]
