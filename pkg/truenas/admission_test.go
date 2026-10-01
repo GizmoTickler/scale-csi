@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,53 +153,81 @@ func TestAdmissionGateGrantRacingCancellationNeverLeaks(t *testing.T) {
 	}
 }
 
-// Aging bounds how long a lower class waits: a delete that has queued for two
-// aging steps ranks with attach, and as the older operation goes first.
-func TestAdmissionGateAgesLowerClasses(t *testing.T) {
+// admitInOrder queues each waiter in turn (advancing the gate's clock by the
+// given amount after each) behind one held slot, then releases one slot at a
+// time and returns the order they were admitted in.
+func admitInOrder(t *testing.T, g *admissionGate, now *time.Time, waiters []struct {
+	name  string
+	ctx   context.Context
+	after time.Duration
+}) []string {
+	t.Helper()
+	require.NoError(t, g.acquire(context.Background()))
+	admitted := make(chan string, len(waiters))
+	for i, w := range waiters {
+		go func(name string, ctx context.Context) {
+			if g.acquire(ctx) == nil {
+				admitted <- name
+			}
+		}(w.name, w.ctx)
+		waitQueued(t, g, i+1)
+		*now = now.Add(w.after)
+	}
+	order := make([]string, 0, len(waiters))
+	for range waiters {
+		g.release()
+		order = append(order, <-admitted)
+	}
+	g.release()
+	return order
+}
+
+// Aging bounds how long a delete waits behind default work: after one aging
+// step it ranks with the default class, where its older operation goes first.
+func TestAdmissionGateAgesDeletesIntoTheDefaultClass(t *testing.T) {
 	g := newAdmissionGate(1)
 	now := time.Unix(1000, 0)
 	g.now = func() time.Time { return now }
-	require.NoError(t, g.acquire(context.Background()))
-	admitted := make(chan string, 2)
-	go func() {
-		if g.acquire(WithPriority(context.Background(), PriorityDelete)) == nil {
-			admitted <- "delete"
-		}
-	}()
-	waitQueued(t, g, 1)
-	now = now.Add(2*agingStep + time.Millisecond)
-	go func() {
-		if g.acquire(WithPriority(context.Background(), PriorityAttach)) == nil {
-			admitted <- "attach"
-		}
-	}()
-	waitQueued(t, g, 2)
-	g.release()
-	assert.Equal(t, "delete", <-admitted, "aged to attach rank, and its operation is older")
-	g.release()
-	assert.Equal(t, "attach", <-admitted)
-	g.release()
+	type waiter = struct {
+		name  string
+		ctx   context.Context
+		after time.Duration
+	}
+	order := admitInOrder(t, g, &now, []waiter{
+		{"delete", WithPriority(context.Background(), PriorityDelete), agingStep + time.Millisecond},
+		{"default", context.Background(), 0},
+	})
+	assert.Equal(t, []string{"delete", "default"}, order, "aged into the default class, and its operation is older")
 
-	// Without the wait, the attach goes first.
+	// Without the wait, the default goes first.
 	now = now.Add(time.Hour)
-	require.NoError(t, g.acquire(context.Background()))
-	go func() {
-		if g.acquire(WithPriority(context.Background(), PriorityDelete)) == nil {
-			admitted <- "delete"
-		}
-	}()
-	waitQueued(t, g, 1)
-	go func() {
-		if g.acquire(WithPriority(context.Background(), PriorityAttach)) == nil {
-			admitted <- "attach"
-		}
-	}()
-	waitQueued(t, g, 2)
-	g.release()
-	assert.Equal(t, "attach", <-admitted)
-	g.release()
-	assert.Equal(t, "delete", <-admitted)
-	g.release()
+	order = admitInOrder(t, g, &now, []waiter{
+		{"delete", WithPriority(context.Background(), PriorityDelete), 0},
+		{"default", context.Background(), 0},
+	})
+	assert.Equal(t, []string{"default", "delete"}, order)
+}
+
+// Nothing ages into the attach class: however long default and delete work
+// has waited, and however much older its operations are, a publish goes
+// first. Otherwise, under overload, every operation that started before a
+// publish would be admitted ahead of it.
+func TestAdmissionGateNeverAgesAnythingPastAttach(t *testing.T) {
+	g := newAdmissionGate(1)
+	now := time.Unix(1000, 0)
+	g.now = func() time.Time { return now }
+	type waiter = struct {
+		name  string
+		ctx   context.Context
+		after time.Duration
+	}
+	old := now.Add(-time.Hour)
+	order := admitInOrder(t, g, &now, []waiter{
+		{"delete", WithOperationStart(WithPriority(context.Background(), PriorityDelete), old), 0},
+		{"default", WithOperationStart(context.Background(), old), 10 * agingStep},
+		{"attach", WithPriority(context.Background(), PriorityAttach), 0},
+	})
+	assert.Equal(t, []string{"attach", "delete", "default"}, order)
 }
 
 func TestAdmissionGateUnbalancedReleasePanics(t *testing.T) {
@@ -292,4 +321,57 @@ func TestClientCallsAreAdmittedByTheCallersClass(t *testing.T) {
 	require.NoError(t, <-errs)
 	assert.Equal(t, "attach.class.query", <-order)
 	assert.Equal(t, "delete.class.query", <-order)
+}
+
+// flipContext passes the gate's entry check, then reports itself canceled,
+// while its Done channel never closes: the waiter can only learn of the
+// cancellation after its slot is granted.
+type flipContext struct {
+	context.Context
+	checks atomic.Int32
+}
+
+func (c *flipContext) Err() error {
+	if c.checks.Add(1) == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+func TestAdmissionGateGrantToAnOperationThatGaveUpIsReleased(t *testing.T) {
+	waits := 0
+	g := newAdmissionGateWithMetrics(1, AdmissionMetrics{
+		Waited: func(string, float64) { waits++ },
+	})
+	err := g.acquire(&flipContext{Context: context.Background()})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, g.inFlight(), "a slot granted to a caller that has given up is released")
+	assert.Zero(t, waits, "a released grant is not a wait")
+	require.NoError(t, g.acquire(context.Background()))
+	g.release()
+}
+
+// A waiter that gives up leaves the queue gauge, so sidecar timeouts do not
+// leave phantom waiters behind.
+func TestAdmissionGateCanceledWaiterLeavesTheQueueGauge(t *testing.T) {
+	var mu sync.Mutex
+	queued := map[string]int{}
+	waits := 0
+	g := newAdmissionGateWithMetrics(1, AdmissionMetrics{
+		Waited: func(string, float64) { mu.Lock(); waits++; mu.Unlock() },
+		Queued: func(class string, n int) { mu.Lock(); queued[class] = n; mu.Unlock() },
+	})
+	require.NoError(t, g.acquire(context.Background()))
+	ctx, cancel := context.WithCancel(WithPriority(context.Background(), PriorityDelete))
+	done := acquireAsync(t, g, ctx)
+	mu.Lock()
+	assert.Equal(t, 1, queued["delete"])
+	mu.Unlock()
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	mu.Lock()
+	assert.Equal(t, 0, queued["delete"], "the canceled waiter left the gauge")
+	assert.Equal(t, 1, waits, "only the held slot's (zero) wait was recorded")
+	mu.Unlock()
+	g.release()
 }

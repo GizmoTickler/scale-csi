@@ -53,11 +53,15 @@ func operationStartOf(ctx context.Context, fallback time.Time) time.Time {
 	return fallback
 }
 
-// agingStep is how long a waiting request takes to climb one priority class.
-// It bounds how long a lower class can be kept waiting, which matters because
-// operations hold per-volume locks across their calls: a DeleteSnapshot that
-// waits holding its source volume's lock would otherwise block that volume's
-// publish for as long as higher-class work keeps arriving.
+// agingStep is how long a waiting delete takes to climb into the default
+// class. It bounds how long a delete can be kept waiting, which matters
+// because operations hold per-volume locks across their calls: a
+// DeleteSnapshot that waits holding its source volume's lock would otherwise
+// block that volume's publish for as long as default work keeps arriving.
+// Nothing ages into the attach class: under overload, default work that
+// started before a publish would otherwise tie with it and go first, and
+// attach demand is bounded by the attacher's workers, so it cannot starve the
+// rest.
 const agingStep = 2 * time.Second
 
 // admissionGate is a counting semaphore whose waiters are admitted by
@@ -75,7 +79,8 @@ type admissionGate struct {
 
 // AdmissionMetrics receives the gate's observations; either function may be nil.
 type AdmissionMetrics struct {
-	// Waited is called once per admitted request with how long it queued.
+	// Waited is called once per admitted request the caller keeps, with how
+	// long it queued.
 	Waited func(class string, seconds float64)
 	// Queued is called with the number of requests of a class waiting, each
 	// time it changes.
@@ -102,6 +107,8 @@ type admissionWaiter struct {
 	seq      uint64
 	ready    chan struct{}
 	granted  bool
+	// grantedAt is set under the gate's lock before ready is closed.
+	grantedAt time.Time
 }
 
 func newAdmissionGate(capacity int) *admissionGate {
@@ -116,11 +123,14 @@ func newAdmissionGateWithMetrics(capacity int, metrics AdmissionMetrics) *admiss
 }
 
 // rank is the waiter's class after aging: one class higher per agingStep
-// waited, never above PriorityAttach.
+// waited, never above PriorityDefault for a waiter that is not an attach.
 func (w *admissionWaiter) rank(now time.Time) int {
+	if w.priority <= PriorityDefault {
+		return int(w.priority)
+	}
 	r := int(w.priority) - int(now.Sub(w.enqueued)/agingStep)
-	if r < int(PriorityAttach) {
-		return int(PriorityAttach)
+	if r < int(PriorityDefault) {
+		return int(PriorityDefault)
 	}
 	return r
 }
@@ -162,6 +172,10 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			g.release()
 			return err
+		}
+		// Only a slot the caller keeps counts as a wait.
+		if g.metrics.Waited != nil {
+			g.metrics.Waited(w.priority.String(), w.grantedAt.Sub(w.enqueued).Seconds())
 		}
 		return nil
 	case <-ctx.Done():
@@ -207,10 +221,8 @@ func (g *admissionGate) dispatchLocked() {
 		g.waiting = append(g.waiting[:best], g.waiting[best+1:]...)
 		g.inUse++
 		w.granted = true
+		w.grantedAt = now
 		close(w.ready)
-		if g.metrics.Waited != nil {
-			g.metrics.Waited(w.priority.String(), now.Sub(w.enqueued).Seconds())
-		}
 		g.reportQueuedLocked(w.priority)
 	}
 }

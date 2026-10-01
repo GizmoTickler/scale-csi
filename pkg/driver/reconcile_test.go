@@ -182,6 +182,36 @@ func TestReconcileOrphansGuardedDeleteRefusesDependentVolume(t *testing.T) {
 	}
 }
 
+// The orphan reaper calls DeleteVolume and DeleteSnapshot directly, outside
+// the gRPC interceptor that classes CSI deletes, so it must mark its own
+// requests as deletes: otherwise a reconcile pass competes with publishes as
+// default work.
+func TestReconcileOrphanDeletesAreAdmittedAsDeletes(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false,
+		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")},
+		[]runtime.Object{reconcileSnapshotContent("live-content", "storage", "live-snapshot", "live-handle", "csi.scale.io")},
+	)
+	old := time.Now().Add(-48 * time.Hour)
+	addReconcileDataset(client, "live-volume", old, true, 100)
+	addReconcileSnapshot(t, client, "live-volume", "live-handle", old, true, 20)
+	addReconcileDataset(client, "orphan-volume", old, true, 100)
+	addReconcileSnapshot(t, client, "orphan-source", "orphan-handle", old, true, 20)
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Contains(t, report.DeletedVolumes, "orphan-volume")
+	require.NotEmpty(t, report.DeletedSnapshots)
+
+	require.NotEmpty(t, client.DatasetDeleteCalls)
+	for _, call := range client.DatasetDeleteCalls {
+		assert.Equal(t, truenas.PriorityDelete, call.Priority, "dataset delete %s", call.Name)
+	}
+	require.NotEmpty(t, client.SnapshotDeleteCalls)
+	for _, call := range client.SnapshotDeleteCalls {
+		assert.Equal(t, truenas.PriorityDelete, call.Priority, "snapshot delete %s", call.ID)
+	}
+}
+
 func TestReconcileVolumeDeleteFinalLiveGetVetoesNewPV(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false,
 		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")}, nil,
