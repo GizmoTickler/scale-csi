@@ -245,6 +245,7 @@ async fn validate_raw_block_ownership(
         ShareType::Nvmeof if is_ublk_device(device) => {
             ublk_stage::validate_raw_block_ownership(state, volume_id, device, deadline).await
         }
+        ShareType::Nvmeof => crate::nvme_kernel::validate_raw_block_ownership(state, volume_id, device),
         // NFS never publishes a raw block volume.
         ShareType::Nfs => Ok(()),
         _ => Err(Status::failed_precondition(format!(

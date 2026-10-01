@@ -539,10 +539,8 @@ async fn unstage() {
         MountedUblk,
         LinkToUblk,
         MarkerOnly,
-        MountedKernel,
         MarkerAndKernel,
         Nothing,
-        NothingButKernelSession,
     }
     let cases = [
         (
@@ -587,31 +585,16 @@ async fn unstage() {
             Code::Internal,
             true,
         ),
-        // The Go node detaches the marker's attachment and then cleans up the
-        // kernel session; until the kernel path is ported this agent refuses
-        // a kernel device before changing anything.
+        // A stale marker beside a live kernel device: the daemon's attachment
+        // is detached and the kernel session still gets its cleanup.
         (
-            "a kernel device is refused untouched",
-            Setup::MountedKernel,
-            None,
-            Code::FailedPrecondition,
-            false,
-        ),
-        (
-            "a marker beside a kernel device is refused untouched",
+            "a marker beside a kernel device detaches and still cleans up the kernel session",
             Setup::MarkerAndKernel,
             None,
-            Code::FailedPrecondition,
-            false,
+            Code::Ok,
+            true,
         ),
         ("nothing left: an unstage replay", Setup::Nothing, None, Code::Ok, false),
-        (
-            "nothing staged but a live kernel session",
-            Setup::NothingButKernelSession,
-            None,
-            Code::FailedPrecondition,
-            false,
-        ),
     ];
     for (name, setup, detach_err, want, detached) in cases {
         let n = ublk_node();
@@ -629,21 +612,17 @@ async fn unstage() {
                 mark();
             }
             Setup::MarkerOnly => mark(),
-            Setup::MountedKernel => {
-                std::fs::create_dir_all(&staging).unwrap();
-                n.host.mount(&staging, "/dev/nvme7n1", "ext4");
-            }
             Setup::MarkerAndKernel => {
+                let mut kernel =
+                    crate::testing::FakeKernel::new(n.dir.path().join("sys"), n.daemon.dev_dir.path().to_path_buf());
+                kernel.add_live(NQN, "192.0.2.20");
+                let device = kernel.device(NQN).unwrap();
+                n.host.0.lock().unwrap().kernel = Some(kernel);
                 std::fs::create_dir_all(&staging).unwrap();
-                n.host.mount(&staging, "/dev/nvme7n1", "ext4");
+                n.host.mount(&staging, &device, "ext4");
                 mark();
             }
             Setup::Nothing => {}
-            Setup::NothingButKernelSession => {
-                let subsys = n.dir.path().join("sys/class/nvme-subsystem/nvme-subsys7");
-                std::fs::create_dir_all(&subsys).unwrap();
-                std::fs::write(subsys.join("subsysnqn"), format!("{NQN}\n")).unwrap();
-            }
         }
 
         let got = node_unstage(&n.state, &unstage_request(&staging), None).await;
@@ -668,13 +647,15 @@ async fn unstage() {
             }
             _ => {}
         }
-        if matches!(setup, Setup::MountedKernel | Setup::MarkerAndKernel) {
+        if matches!(setup, Setup::MarkerAndKernel) {
             assert!(
-                n.host.is_mounted(&staging),
-                "{name}: a refused unstage leaves the mount alone"
+                n.host.calls().contains(&format!("nvme disconnect -n {NQN}")),
+                "{name}: {:?}",
+                n.host.calls()
             );
+        } else if !matches!(setup, Setup::Nothing) {
+            assert_no_nvme_cli(&n.host);
         }
-        assert_no_nvme_cli(&n.host);
     }
 }
 

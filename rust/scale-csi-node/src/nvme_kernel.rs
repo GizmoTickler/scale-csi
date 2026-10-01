@@ -553,3 +553,97 @@ pub fn verify_stage_source(state: &State, device: &str, context: &HashMap<String
     }
     Ok(())
 }
+
+/// Disconnects the subsystem behind a device read from a live mount (Go's
+/// primary disconnect). Whether it did: if not, the caller falls back to the
+/// lookup by subsystem name.
+pub async fn disconnect_device(state: &State, device: &str, deadline: Option<Instant>) -> bool {
+    let nqn = match state.nvme.nqn_of_device(device) {
+        Ok(nqn) => nqn,
+        Err(e) => {
+            debug!("Could not get NVMe info from device {device}: {e:#}");
+            return false;
+        }
+    };
+    match state.nvme.disconnect(&nqn, deadline).await {
+        Ok(()) => {
+            info!("Disconnected NVMe-oF session {nqn}");
+            forget(state, &nqn);
+            true
+        }
+        Err(e) => {
+            warn!("Failed to disconnect NVMe-oF session {nqn}: {e:#}");
+            false
+        }
+    }
+}
+
+/// Disconnects the session named for the volume (Go
+/// cleanupOrphanedSessionByVolumeID): success when there is none, and when the
+/// sessions cannot be listed (an unknown state must not by itself fail an
+/// unstage); an error only when a found session would not disconnect.
+pub async fn cleanup_by_volume(state: &State, volume_id: &str, deadline: Option<Instant>) -> Result<()> {
+    let n = &state.config.nvmeof;
+    let name = format!(
+        "{}{}{}",
+        n.name_prefix,
+        crate::capability::protocol_share_name(volume_id),
+        n.name_suffix
+    );
+    let subsystems = match state.nvme.list_subsystems(deadline).await {
+        Ok(subsystems) => subsystems,
+        Err(e) => {
+            debug!("No active NVMe-oF session found for volume {volume_id} (nqn: {name}): {e:#}");
+            return Ok(());
+        }
+    };
+    let suffix = format!(":{name}");
+    let Some(nqn) = subsystems
+        .iter()
+        .map(|s| s.nqn.as_str())
+        .find(|nqn| nqn.ends_with(&suffix))
+    else {
+        debug!("No active NVMe-oF session found for volume {volume_id} (nqn: {name})");
+        return Ok(());
+    };
+    info!("Found orphaned NVMe-oF session for volume {volume_id}: {nqn}");
+    state
+        .nvme
+        .disconnect(nqn, deadline)
+        .await
+        .map_err(|e| anyhow!("failed to disconnect NVMe-oF session {nqn}: {e:#}"))?;
+    info!("Successfully cleaned up orphaned NVMe-oF session {nqn}");
+    forget(state, nqn);
+    Ok(())
+}
+
+fn forget(state: &State, nqn: &str) {
+    if let Some(registry) = &state.nvme_sessions
+        && let Err(e) = registry.forget(nqn)
+    {
+        warn!("NVMe-oF unstage: {e:#}");
+    }
+}
+
+/// That a kernel NVMe raw-block device belongs to the volume: its subsystem is
+/// the one named for the volume.
+pub fn validate_raw_block_ownership(state: &State, volume_id: &str, device: &str) -> Result<(), Status> {
+    let nqn = state.nvme.nqn_of_device(device).map_err(|e| {
+        Status::internal(format!(
+            "failed to identify NVMe-oF session for raw block device {device}: {e:#}"
+        ))
+    })?;
+    let n = &state.config.nvmeof;
+    let expected = format!(
+        "{}{}{}",
+        n.name_prefix,
+        crate::capability::protocol_share_name(volume_id),
+        n.name_suffix
+    );
+    if !crate::capability::session_target_matches(&nqn, &expected) {
+        return Err(Status::failed_precondition(format!(
+            "raw block staging device {device} belongs to NVMe-oF subsystem {nqn}, expected volume subsystem {expected}"
+        )));
+    }
+    Ok(())
+}

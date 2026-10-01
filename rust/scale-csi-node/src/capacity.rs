@@ -14,7 +14,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
@@ -234,7 +234,98 @@ pub async fn node_expand_volume(
         }
         return Err(Status::internal("failed to resolve block device for expansion"));
     }
-    Err(Status::failed_precondition(format!(
-        "volume {volume_id} is on {device}, a kernel device, which the Rust node agent does not serve yet"
-    )))
+    if crate::nvme::controller_of(&device).is_none() {
+        return Err(Status::failed_precondition(format!(
+            "volume {volume_id} is on {device}, which is not an NVMe-oF device; the Rust node agent does not serve it yet"
+        )));
+    }
+    expand_kernel_nvme(state, volume_id, path, &device, raw_block, capacity, deadline).await
+}
+
+/// How long a rescanned device may take to show its new size.
+const SIZE_SETTLE: Duration = Duration::from_secs(5);
+const SIZE_POLL: Duration = Duration::from_millis(200);
+
+/// Polls the device's size after a rescan (Go waitForDeviceSize): settled at
+/// the requested capacity, or, with none requested, once it grew.
+async fn wait_for_device_size(state: &State, device: &str, before: Option<i64>, capacity: i64) -> Result<i64> {
+    let until = Instant::now() + SIZE_SETTLE;
+    loop {
+        let size = device_size(state, device);
+        if let Ok(size) = size {
+            let settled = if capacity > 0 {
+                size >= capacity
+            } else {
+                before.is_none_or(|b| b <= 0 || size > b)
+            };
+            if settled {
+                return Ok(size);
+            }
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let size = size?;
+            bail!(
+                "capacity remained at {size} bytes (before={}, requested={capacity}) for {SIZE_SETTLE:?}",
+                before.unwrap_or(0)
+            );
+        }
+        tokio::time::sleep(left.min(SIZE_POLL)).await;
+    }
+}
+
+/// Kernel NVMe-oF: rescan the namespace, wait for the size, then grow the
+/// filesystem (or, raw block, just check the size).
+async fn expand_kernel_nvme(
+    state: &State,
+    volume_id: &str,
+    path: &str,
+    device: &str,
+    raw_block: bool,
+    capacity: i64,
+    deadline: Option<Instant>,
+) -> Result<csi::NodeExpandVolumeResponse, Status> {
+    if raw_block {
+        crate::nvme_kernel::validate_raw_block_ownership(state, volume_id, device)?;
+    }
+    let before = match device_size(state, device) {
+        Ok(size) => {
+            info!("Device {device} size before rescan: {size} bytes");
+            Some(size)
+        }
+        Err(e) => {
+            log::warn!("Could not read device size before rescan for {device}: {e:#}");
+            None
+        }
+    };
+    state
+        .nvme
+        .rescan(device, deadline)
+        .await
+        .map_err(|e| Status::internal(format!("failed to rescan NVMe-oF device {device}: {e:#}")))?;
+    let after = wait_for_device_size(state, device, before, capacity)
+        .await
+        .map_err(|e| Status::internal(format!("device size did not settle after rescan for {device}: {e:#}")))?;
+    info!("Device {device} size after rescan: {after} bytes");
+    if raw_block {
+        if capacity > 0 && after < capacity {
+            return Err(Status::internal(format!(
+                "raw block device {device} capacity is {after} bytes after rescan, below requested {capacity} bytes"
+            )));
+        }
+        info!("Raw block volume {volume_id} rescanned; skipping filesystem resize");
+        return Ok(csi::NodeExpandVolumeResponse { capacity_bytes: after });
+    }
+    state
+        .mounter
+        .resize_filesystem(path, deadline)
+        .await
+        .map_err(|e| Status::internal(format!("failed to resize filesystem: {e:#}")))?;
+    if capacity > 0 && after < capacity {
+        return Err(Status::internal(format!(
+            "block device {device} capacity is {after} bytes after resize, below requested {capacity} bytes"
+        )));
+    }
+    info!("Volume {volume_id} expanded successfully");
+    Ok(csi::NodeExpandVolumeResponse { capacity_bytes: after })
 }

@@ -22,7 +22,6 @@ use tonic::{Code, Status};
 
 use crate::capability::{
     self, AccessType, ShareType, Signature, mount_flags_for_fs, mount_sources_equal, normalize_mount_source,
-    protocol_share_name,
 };
 use crate::config::DataPath;
 use crate::csi;
@@ -391,20 +390,6 @@ pub(crate) fn remove_all(path: &str) -> std::io::Result<()> {
     }
 }
 
-/// A live kernel NVMe-oF subsystem for this volume, if one exists. A sysfs
-/// that cannot be read shows none: an unknown state must not by itself fail
-/// an unstage that may have nothing to clean up (as the Go node's lookup).
-fn kernel_nvme_session(state: &State, volume_id: &str) -> Option<String> {
-    let n = &state.config.nvmeof;
-    let suffix = format!(":{}{}{}", n.name_prefix, protocol_share_name(volume_id), n.name_suffix);
-    let entries = std::fs::read_dir(state.host.sysfs.join("class/nvme-subsystem")).ok()?;
-    entries.flatten().find_map(|entry| {
-        let nqn = std::fs::read_to_string(entry.path().join("subsysnqn")).ok()?;
-        let nqn = nqn.trim();
-        nqn.ends_with(&suffix).then(|| nqn.to_string())
-    })
-}
-
 pub async fn node_unstage(
     state: &State,
     req: &csi::NodeUnstageVolumeRequest,
@@ -438,11 +423,11 @@ pub async fn node_unstage(
             }
         },
     };
-    // A kernel device needs the kernel session cleanup: refuse before
-    // changing anything rather than do half of it.
-    if !device.is_empty() && !is_ublk_device(&device) {
+    // Only NVMe-oF is served: an iSCSI (or other) device is refused before
+    // anything changes rather than half unstaged.
+    if !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") {
         return Err(not_served(format!(
-            "volume {volume_id} is staged on {device}, a kernel device"
+            "volume {volume_id} is staged on {device}, which is not an NVMe-oF device"
         )));
     }
 
@@ -476,20 +461,25 @@ pub async fn node_unstage(
         }
     }
 
-    match ublk_stage::unstage(state, volume_id, &device, deadline).await? {
-        Unstaged::Done => {}
-        Unstaged::DetachedKernelRemains => {
-            return Err(not_served(format!(
-                "volume {volume_id} still has a kernel device {device}"
-            )));
-        }
-        Unstaged::NotUblk => {
-            if let Some(nqn) = kernel_nvme_session(state, volume_id) {
-                return Err(not_served(format!(
-                    "volume {volume_id} has a kernel NVMe-oF session {nqn}"
-                )));
-            }
-        }
+    // The userspace data path holds no kernel session: detach from nvmeublkd
+    // and stop there, unless a stale ublk marker sat beside a kernel device.
+    if ublk_stage::unstage(state, volume_id, &device, deadline).await? != Unstaged::Done {
+        // A block link's literal /dev name can be stale after a reboot: the
+        // session is found by the volume's subsystem name instead. A device
+        // read from the live mount before the unmount is safe to use.
+        let cleanup =
+            if !symlink && !device.is_empty() && nvme_kernel::disconnect_device(state, &device, deadline).await {
+                Ok(())
+            } else {
+                nvme_kernel::cleanup_by_volume(state, volume_id, deadline).await
+            };
+        // Fail closed: a session that was found but would not disconnect is
+        // not unstaged, so kubelet retries rather than leaking it.
+        cleanup.map_err(|e| {
+            Status::internal(format!(
+                "failed to disconnect orphaned session for volume {volume_id}: {e:#}"
+            ))
+        })?;
     }
     state.records.delete_stage(staging);
     info!("Volume {volume_id} unstaged successfully");

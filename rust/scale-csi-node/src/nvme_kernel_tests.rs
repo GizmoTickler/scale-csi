@@ -371,3 +371,234 @@ fn connect_options_follow_the_go_rule() {
         (Some(4), Some(2), Some(5))
     );
 }
+
+fn unstage_request(n: &Node) -> csi::NodeUnstageVolumeRequest {
+    csi::NodeUnstageVolumeRequest {
+        volume_id: VOLUME.into(),
+        staging_target_path: n.path("staging/globalmount"),
+    }
+}
+
+#[tokio::test]
+async fn unstage_disconnects_the_mounted_devices_session() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, filesystem(), None), None)
+        .await
+        .unwrap();
+    crate::stage::node_unstage(&n.state, &unstage_request(&n), None)
+        .await
+        .unwrap();
+    let calls = nvme_calls(&n);
+    assert!(calls.contains(&format!("nvme disconnect -n {NQN}")), "{calls:?}");
+    assert!(!n.host.is_mounted(&n.path("staging/globalmount")));
+    assert!(
+        !n.state.nvme_sessions.as_ref().unwrap().has(NQN),
+        "a disconnect forgets the session"
+    );
+    assert!(n.host.0.lock().unwrap().kernel.as_ref().unwrap().device(NQN).is_none());
+}
+
+/// A block link names a /dev node that can be another volume's after a
+/// reboot: the session is found by the volume's subsystem name instead.
+#[tokio::test]
+async fn unstage_of_a_block_link_finds_the_session_by_name() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    // The link now points at another subsystem's device.
+    let other = {
+        let mut host = n.host.0.lock().unwrap();
+        let kernel = host.kernel.as_mut().unwrap();
+        kernel.add_live("nqn.2011-06.com.example:pvc-other", "192.0.2.20");
+        kernel.device("nqn.2011-06.com.example:pvc-other").unwrap()
+    };
+    let staging = n.path("staging/globalmount");
+    std::fs::remove_file(&staging).unwrap();
+    std::os::unix::fs::symlink(&other, &staging).unwrap();
+    crate::stage::node_unstage(&n.state, &unstage_request(&n), None)
+        .await
+        .unwrap();
+    let disconnects: Vec<String> = nvme_calls(&n)
+        .into_iter()
+        .filter(|c| c.starts_with("nvme disconnect"))
+        .collect();
+    assert_eq!(
+        disconnects,
+        [format!("nvme disconnect -n {NQN}")],
+        "never the other volume's session"
+    );
+    assert!(!crate::testing::exists(&staging));
+}
+
+#[tokio::test]
+async fn an_unstage_replay_with_a_leftover_session_disconnects_it() {
+    let n = kernel_node(SINGLE);
+    n.host
+        .0
+        .lock()
+        .unwrap()
+        .kernel
+        .as_mut()
+        .unwrap()
+        .add_live(NQN, "192.0.2.20");
+    crate::stage::node_unstage(&n.state, &unstage_request(&n), None)
+        .await
+        .unwrap();
+    assert!(nvme_calls(&n).contains(&format!("nvme disconnect -n {NQN}")));
+    // Nothing at all: success, nothing disconnected.
+    let n = kernel_node(SINGLE);
+    crate::stage::node_unstage(&n.state, &unstage_request(&n), None)
+        .await
+        .unwrap();
+    assert!(!nvme_calls(&n).iter().any(|c| c.starts_with("nvme disconnect")));
+}
+
+/// A session that is found but will not disconnect fails the unstage, so
+/// kubelet retries instead of leaking it.
+#[tokio::test]
+async fn a_session_that_will_not_disconnect_fails_the_unstage() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    n.host.0.lock().unwrap().kernel.as_mut().unwrap().refuse_disconnect = true;
+    let err = crate::stage::node_unstage(&n.state, &unstage_request(&n), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message().contains("failed to disconnect orphaned session"),
+        "{}",
+        err.message()
+    );
+    assert!(
+        n.state.nvme_sessions.as_ref().unwrap().has(NQN),
+        "still recorded for the retry"
+    );
+}
+
+#[tokio::test]
+async fn an_iscsi_device_is_refused_untouched() {
+    let n = kernel_node(SINGLE);
+    let staging = n.path("staging/globalmount");
+    std::fs::create_dir_all(&staging).unwrap();
+    n.host.mount(&staging, "/dev/sdb", "ext4");
+    let err = crate::stage::node_unstage(&n.state, &unstage_request(&n), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(n.host.is_mounted(&staging));
+}
+
+fn set_size(n: &Node, name: &str, bytes: i64) -> std::path::PathBuf {
+    let dir = n.dir.path().join("sys/class/block").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("size");
+    std::fs::write(&file, format!("{}\n", bytes / 512)).unwrap();
+    file
+}
+
+fn expand_request(
+    n: &Node,
+    path: &str,
+    capacity: i64,
+    capability: csi::VolumeCapability,
+) -> csi::NodeExpandVolumeRequest {
+    csi::NodeExpandVolumeRequest {
+        volume_id: VOLUME.into(),
+        volume_path: path.into(),
+        staging_target_path: n.path("staging/globalmount"),
+        capacity_range: Some(csi::CapacityRange {
+            required_bytes: capacity,
+            limit_bytes: 0,
+        }),
+        volume_capability: Some(capability),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_kernel_filesystem_grows_after_a_rescan() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, filesystem(), None), None)
+        .await
+        .unwrap();
+    let size = set_size(&n, "nvme0n1", 10 << 30);
+    n.host.0.lock().unwrap().kernel.as_mut().unwrap().on_rescan = Some((size, format!("{}\n", (20i64 << 30) / 512)));
+    let path = n.path("staging/globalmount");
+    let resp = crate::capacity::node_expand_volume(&n.state, &expand_request(&n, &path, 20 << 30, filesystem()), None)
+        .await
+        .unwrap();
+    assert_eq!(resp.capacity_bytes, 20 << 30);
+    let calls = n.host.calls();
+    let dev = device(&n);
+    let rescan = calls.iter().position(|c| c.starts_with("nvme ns-rescan"));
+    let resize = calls.iter().position(|c| *c == format!("resize2fs {dev}"));
+    assert!(rescan.is_some() && resize.is_some() && rescan < resize, "{calls:?}");
+}
+
+#[tokio::test]
+async fn kernel_raw_block_expansion_checks_ownership_and_never_resizes() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    set_size(&n, "nvme0n1", 20 << 30);
+    std::fs::create_dir_all(n.path("pods/p")).unwrap();
+    let target = n.path("pods/p/dev");
+    std::fs::write(&target, b"").unwrap();
+    let resp = crate::capacity::node_expand_volume(&n.state, &expand_request(&n, &target, 20 << 30, block()), None)
+        .await
+        .unwrap();
+    assert_eq!(resp.capacity_bytes, 20 << 30);
+    assert!(!n.host.calls().iter().any(|c| c.starts_with("resize2fs")));
+
+    // The device's subsystem is not this volume's: refused before any rescan.
+    std::fs::write(
+        n.dir.path().join("sys/class/nvme/nvme0/subsysnqn"),
+        "nqn.2011-06.com.example:pvc-other\n",
+    )
+    .unwrap();
+    let rescans = nvme_calls(&n)
+        .iter()
+        .filter(|c| c.starts_with("nvme ns-rescan"))
+        .count();
+    let err = crate::capacity::node_expand_volume(&n.state, &expand_request(&n, &target, 20 << 30, block()), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert_eq!(
+        nvme_calls(&n)
+            .iter()
+            .filter(|c| c.starts_with("nvme ns-rescan"))
+            .count(),
+        rescans
+    );
+}
+
+#[tokio::test]
+async fn a_kernel_publish_checks_raw_block_ownership() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    let publish = csi::NodePublishVolumeRequest {
+        volume_id: VOLUME.into(),
+        staging_target_path: n.path("staging/globalmount"),
+        target_path: n.path("pods/p/volumeDevices/publish/pv"),
+        volume_capability: Some(block()),
+        volume_context: kernel_context(),
+        ..Default::default()
+    };
+    crate::publish::node_publish(&n.state, &publish, None).await.unwrap();
+    std::fs::write(
+        n.dir.path().join("sys/class/nvme/nvme0/subsysnqn"),
+        "nqn.2011-06.com.example:pvc-other\n",
+    )
+    .unwrap();
+    let mut other = publish.clone();
+    other.target_path = n.path("pods/q/volumeDevices/publish/pv");
+    let err = crate::publish::node_publish(&n.state, &other, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+}

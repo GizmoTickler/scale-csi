@@ -471,6 +471,8 @@ pub struct FakeKernel {
     pub unreachable: Vec<String>,
     /// Disconnects fail (EINVAL), as for a controller the kernel will not drop.
     pub refuse_disconnect: bool,
+    /// Written on `ns-rescan`: (file, content), e.g. a grown size.
+    pub on_rescan: Option<(PathBuf, String)>,
     next_subsystem: u32,
     next_controller: u32,
 }
@@ -486,6 +488,7 @@ impl FakeKernel {
             subsystems: BTreeMap::new(),
             unreachable: Vec::new(),
             refuse_disconnect: false,
+            on_rescan: None,
             next_subsystem: 0,
             next_controller: 0,
         }
@@ -596,7 +599,12 @@ impl FakeKernel {
                     output(1, &format!("{nqn} not found"))
                 }
             }
-            Some("ns-rescan") => output(0, ""),
+            Some("ns-rescan") => {
+                if let Some((file, content)) = &self.on_rescan {
+                    std::fs::write(file, content).unwrap();
+                }
+                output(0, "")
+            }
             _ => output(127, ""),
         }
     }

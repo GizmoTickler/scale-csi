@@ -211,15 +211,15 @@ async fn expansion_of_other_devices() {
     assert_eq!(err.code(), Code::Internal);
     assert!(err.message().contains("failed to resolve block device"));
 
-    // A kernel device: not served yet, and untouched.
-    let kernel = n.daemon.dev_dir.path().join("nvme3n1");
+    // A SCSI disk (iSCSI): not served yet, and untouched.
+    let kernel = n.daemon.dev_dir.path().join("sdb");
     std::fs::write(&kernel, b"").unwrap();
     n.host.mount(&path, kernel.to_str().unwrap(), "ext4");
     let err = node_expand_volume(&n.state, &expand_request(&path, "", 1 << 30, filesystem()), None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
-    assert!(err.message().contains("does not serve yet"));
+    assert!(err.message().contains("does not serve"), "{}", err.message());
     assert!(
         !n.host
             .calls()
