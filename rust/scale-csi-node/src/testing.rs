@@ -71,6 +71,8 @@ impl FakeHost {
     pub fn device_number(&self, path: &str) -> Option<u64> {
         let host = self.0.lock().unwrap();
         let device = match host.mounts.get(path) {
+            // As a hung server would: the agent must never stat one.
+            Some((_, fs, _)) if fs.starts_with("nfs") => panic!("stat of the network mount {path}"),
             Some((source, fs, _)) if fs == "devtmpfs" => source
                 .strip_prefix("udev[")
                 .and_then(|s| s.strip_suffix(']'))

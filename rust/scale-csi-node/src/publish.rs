@@ -241,7 +241,25 @@ async fn ensure_target_allowed(
         {
             continue;
         }
-        if mount_sources_equal(&mount.source, expected) {
+        let mut same = mount_sources_equal(&mount.source, expected);
+        // A raw-block publication is a bind-mounted device node: the table
+        // shows it on devtmpfs ("udev[/nvme0n1]"), never as the staged
+        // device, so it is identified by its device number. Only devtmpfs
+        // entries are stat'ed: a stat of a hung network mount would hang
+        // this publish.
+        if !same && capability.access_type == AccessType::Block && mount.fs_type == "devtmpfs" {
+            let number = |path: &str| {
+                (state.host.device_number)(path).map_err(|e| {
+                    Status::internal(format!(
+                        "failed to verify existing publication at {}: {e}",
+                        mount.target
+                    ))
+                })
+            };
+            let bound = number(&mount.target)?;
+            same = bound.is_some() && bound == number(expected)?;
+        }
+        if same {
             return Err(blocked_by(req, capability, &mount.target));
         }
     }

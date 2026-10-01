@@ -378,6 +378,27 @@ async fn a_replay_without_a_record_is_checked_against_the_live_mount() {
     assert!(err.message().contains("is backed by /dev/ublkb9"), "{}", err.message());
 }
 
+/// Without its record (the agent restarted), a single-writer raw-block volume
+/// still bound at another pod's target is found in the mount table by device
+/// number: its source there is devtmpfs, never the device. A network mount is
+/// never stat'ed on the way.
+#[tokio::test]
+async fn a_raw_block_volume_bound_elsewhere_blocks_a_second_target_after_a_restart() {
+    let (n, staging) = staged(block()).await;
+    n.host.mount(
+        &n.path("pods/p9/volumes/kubernetes.io~csi/share/mount"),
+        "nas:/export",
+        "nfs4",
+    );
+    let first = publish_request(&n, &staging, "p1", block());
+    node_publish(&n.state, &first, None).await.unwrap();
+    n.state.records.delete_publication(&first.target_path);
+    let second = publish_request(&n, &staging, "p2", block());
+    let err = node_publish(&n.state, &second, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains(&first.target_path), "{}", err.message());
+}
+
 /// A recorded publication at a target the mount-table scan would not
 /// recognise as a pod's still blocks a second single-writer target.
 #[tokio::test]
