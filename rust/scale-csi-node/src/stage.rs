@@ -452,6 +452,42 @@ pub async fn node_stage(
     Ok(())
 }
 
+/// The source of the topmost mount on `path`, from mountinfo (never stats
+/// `path`, which on a dead NFS server blocks).
+fn mountinfo_source(state: &State, path: &str) -> Option<String> {
+    let mounts = state.mounter.list_mounts().ok()?;
+    mounts
+        .into_iter()
+        .rev()
+        .find(|m| m.target == path)
+        .map(|m| m.source)
+        .filter(|s| !s.is_empty())
+}
+
+/// Runs a filesystem call off the async workers, bounded by the mount
+/// timeout. A path call on a dead hard NFS mount blocks in D state; on a
+/// runtime worker that stalls every RPC once enough volumes hang, here it
+/// holds one blocking-pool thread and the caller gets `None`.
+pub(crate) async fn bounded_path_call<T: Send + 'static>(
+    state: &State,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match tokio::time::timeout(state.mounter.timeouts.mount, tokio::task::spawn_blocking(call)).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            warn!("filesystem call failed to run: {e}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "filesystem call did not return within {:?}",
+                state.mounter.timeouts.mount
+            );
+            None
+        }
+    }
+}
+
 /// Removes an unmounted mount point without descending into it: absent is
 /// fine, a directory goes only when empty, a file (a raw-block bind target)
 /// goes. Never recursive: what is under a mount point is a volume's data.
@@ -530,20 +566,43 @@ pub async fn node_unstage(
     nfs::cleanup_trunk_probes(state, staging, deadline).await;
 
     // The device, read before anything is unmounted; a block volume's staging
-    // path is a symlink to it, not a mount.
-    let device = match state.mounter.mount_source(staging, deadline).await {
-        Ok(device) if !device.is_empty() => device,
-        mounted => match std::fs::read_link(staging) {
-            Ok(target) => target.to_string_lossy().into_owned(),
-            Err(link) => {
-                debug!(
-                    "Could not get device from staging path {staging}: mount err={:?}, symlink err={link}",
-                    mounted.err()
-                );
-                String::new()
-            }
-        },
+    // path is a symlink to it, not a mount. findmnt stats the path, so on a
+    // dead server it fails; mountinfo names the source without touching the
+    // path. Only a path with nothing mounted on it is looked at directly.
+    let in_mountinfo = mountinfo_source(state, staging);
+    // A mount point is never a symlink (mount resolves one); anything else is
+    // a local path, and its lstat is still bounded.
+    let symlink = match in_mountinfo {
+        Some(_) => false,
+        None => {
+            let path = staging.to_string();
+            bounded_path_call(state, move || {
+                std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            })
+            .await
+            .unwrap_or(false)
+        }
     };
+    let mounted_source = match state.mounter.mount_source(staging, deadline).await {
+        Ok(device) if !device.is_empty() => Some(device),
+        found => {
+            if in_mountinfo.is_none() {
+                debug!("Nothing mounted on staging path {staging} (findmnt: {:?})", found.err());
+            }
+            in_mountinfo
+        }
+    };
+    let link = match (&mounted_source, symlink) {
+        (None, true) => {
+            let path = staging.to_string();
+            bounded_path_call(state, move || std::fs::read_link(path))
+                .await
+                .and_then(Result::ok)
+                .map(|target| target.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
+    let device = mounted_source.or(link).unwrap_or_default();
     // An NFS mount's source is server:/share; it holds no session.
     let nfs = is_nfs_mount_source(&device);
     // Without iSCSI only NVMe-oF and NFS are served: another device is refused
@@ -556,7 +615,6 @@ pub async fn node_unstage(
         )));
     }
 
-    let symlink = std::fs::symlink_metadata(staging).is_ok_and(|m| m.file_type().is_symlink());
     if symlink {
         if let Err(e) = std::fs::remove_file(staging)
             && e.kind() != std::io::ErrorKind::NotFound

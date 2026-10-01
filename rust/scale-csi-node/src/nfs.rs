@@ -340,11 +340,20 @@ pub async fn cleanup_trunk_probes(state: &State, staging: &str, deadline: Option
         .collect();
     probes.sort();
     for probe in probes {
-        if matches!(state.mounter.is_mounted(&probe, deadline).await, Ok(true))
-            && let Err(e) = state.mounter.unmount(&probe, deadline).await
-        {
-            warn!("Failed to clean NFS trunk probe mount {probe}: {e:#}");
-            continue;
+        match state.mounter.is_mounted(&probe, deadline).await {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = state.mounter.unmount(&probe, deadline).await {
+                    warn!("Failed to clean NFS trunk probe mount {probe}: {e:#}");
+                    continue;
+                }
+            }
+            // Unknown is not unmounted: never stat or remove a probe that may
+            // still be a (possibly dead) network mount.
+            Err(e) => {
+                warn!("Failed to check NFS trunk probe {probe}: {e:#}");
+                continue;
+            }
         }
         let removed = match std::fs::symlink_metadata(&probe) {
             Ok(meta) if meta.is_dir() => std::fs::remove_dir(&probe),

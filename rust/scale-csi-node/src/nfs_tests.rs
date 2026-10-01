@@ -782,3 +782,24 @@ async fn unstage_leaves_a_non_empty_unmounted_directory_in_place() {
     node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
     assert!(exists(&file));
 }
+
+/// findmnt failing (it stats the path, and times out on a dead server) must
+/// not turn an NFS staging mount into an unknown device: mountinfo names the
+/// share without touching the path, so unstage stays on the NFS path and runs
+/// no block-session cleanup.
+#[tokio::test]
+async fn unstage_finds_the_share_in_mountinfo_when_findmnt_fails() {
+    let n = nfs_node(NFS_ON);
+    let staging = n.path("staging/globalmount");
+    std::fs::create_dir_all(&staging).unwrap();
+    n.host.mount(&staging, SOURCE, "nfs4");
+    n.host
+        .0
+        .lock()
+        .unwrap()
+        .failing
+        .push(format!("findmnt --first-only -n -o SOURCE {staging}"));
+    node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
+    assert!(!n.host.is_mounted(&staging));
+    assert_no_session_commands(&n);
+}
