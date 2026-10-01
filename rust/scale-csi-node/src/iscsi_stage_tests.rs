@@ -978,6 +978,69 @@ async fn a_stale_block_link_never_logs_out_another_volume() {
     assert_eq!(fake(&n, |f| f.sessions.iter().filter(|s| s.iqn == other).count()), 1);
 }
 
+/// The same reboot, replayed as a stage: the link names another volume's disk
+/// now, which proves it stale. The stage logs in again and replaces the link
+/// rather than answering AlreadyExists forever; the other volume's session
+/// and disk are never touched.
+#[tokio::test]
+async fn a_stale_block_link_is_restaged_after_a_reboot() {
+    let other = "iqn.2005-10.org.freenas.ctl:pvc-9a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+    let n = iscsi_node(CONFIG);
+    let req = stage_request(&n, block());
+    node_stage(&n.state, &req, None).await.unwrap();
+    let theirs = fake(&n, |f| {
+        let i = f.sessions.iter().position(|s| s.iqn == IQN).unwrap();
+        f.sessions.remove(i);
+        f.targets.insert(other.into(), f.targets[IQN].clone());
+        f.add_session(PORTAL, other);
+        let theirs = f.device_of(PORTAL).unwrap();
+        std::fs::remove_file(&req.staging_target_path).unwrap();
+        std::os::unix::fs::symlink(&theirs, &req.staging_target_path).unwrap();
+        theirs
+    });
+    n.state.records.delete_stage(&req.staging_target_path);
+
+    node_stage(&n.state, &req, None)
+        .await
+        .expect("a stale link is re-staged");
+    let linked = std::fs::read_link(&req.staging_target_path).unwrap();
+    assert_ne!(
+        linked.to_string_lossy(),
+        theirs,
+        "the link still names the other volume's disk"
+    );
+    crate::iscsi_stage::verify_stage_source(&n.state, &linked.to_string_lossy(), &req.volume_context)
+        .await
+        .expect("the link names this volume's disk");
+    assert!(logouts(&n).is_empty(), "{:?}", logouts(&n));
+    assert_eq!(fake(&n, |f| f.sessions.iter().filter(|s| s.iqn == other).count()), 1);
+}
+
+/// A record naming another volume on the path keeps the refusal.
+#[tokio::test]
+async fn a_stale_block_link_claimed_by_another_volume_is_refused() {
+    let other = "iqn.2005-10.org.freenas.ctl:pvc-9a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+    let n = iscsi_node(CONFIG);
+    let req = stage_request(&n, block());
+    node_stage(&n.state, &req, None).await.unwrap();
+    fake(&n, |f| {
+        let i = f.sessions.iter().position(|s| s.iqn == IQN).unwrap();
+        f.sessions.remove(i);
+        f.targets.insert(other.into(), f.targets[IQN].clone());
+        f.add_session(PORTAL, other);
+        let theirs = f.device_of(PORTAL).unwrap();
+        std::fs::remove_file(&req.staging_target_path).unwrap();
+        std::os::unix::fs::symlink(&theirs, &req.staging_target_path).unwrap();
+    });
+    let mut other_req = req.clone();
+    other_req.volume_id = "pvc-9a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9".into();
+    other_req.volume_context.insert("iqn".into(), other.into());
+    n.state.records.delete_stage(&req.staging_target_path);
+    node_stage(&n.state, &other_req, None).await.unwrap();
+    let err = node_stage(&n.state, &req, None).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::AlreadyExists, "{err:?}");
+}
+
 /// A multipath filesystem is mounted from /dev/mapper/<name>: expansion
 /// rescans every path of the dm map, then has multipathd resize the map; the
 /// map only grows on that resize, as on a real host.

@@ -742,6 +742,19 @@ pub async fn verify_stage_source(state: &State, device: &str, context: &HashMap<
     Ok(())
 }
 
+/// Whether a raw-block staging link that survived a reboot is positively
+/// stale: SCSI disk names are handed out again in login order, so the link
+/// can name another volume's disk (a driver-named target that is not this
+/// volume's), or a disk with no iSCSI session at all. Unknown is not stale.
+pub async fn link_is_stale(state: &State, device: &str, context: &HashMap<String, String>) -> bool {
+    let want = context.get("iqn").map(String::as_str).unwrap_or_default();
+    match state.iscsi.info_from_device_listed(device).await {
+        Ok((_, actual)) => actual != want && is_driver_target(state, &actual),
+        Err(InfoError::NotIscsi(_)) => true,
+        Err(InfoError::Unknown(_)) => false,
+    }
+}
+
 /// That a raw-block device's target is the one named for the volume.
 pub async fn validate_raw_block_ownership(state: &State, volume_id: &str, device: &str) -> Result<(), Status> {
     let (_, iqn) = state.iscsi.info_from_device_listed(device).await.map_err(|e| {

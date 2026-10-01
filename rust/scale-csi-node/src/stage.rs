@@ -136,7 +136,16 @@ pub async fn handle_existing_stage(state: &State, want: &Wanted<'_>) -> Result<b
         .is_mounted(staging, want.deadline)
         .await
         .map_err(|e| Status::internal(format!("failed to check mount status: {e:#}")))?;
-    let symlink = std::fs::symlink_metadata(staging).is_ok_and(|m| m.file_type().is_symlink());
+    // A mount point is never a symlink; a dead network mount's lstat would
+    // block, so it is not looked at.
+    let symlink = !mounted && {
+        let path = staging.to_string();
+        bounded_path_call(state, move || {
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+        })
+        .await
+        .unwrap_or(false)
+    };
     if !mounted && !symlink {
         state.records.delete_stage(staging);
         return Ok(false);
@@ -180,8 +189,12 @@ pub async fn handle_existing_stage(state: &State, want: &Wanted<'_>) -> Result<b
             // ANOTHER volume's device. The daemon already proved it stale;
             // unless a record says the path is another volume's, re-stage (the
             // other device is never touched).
-            if is_ublk_device(&device)
-                && source.code() == Code::AlreadyExists
+            // iSCSI disk names are reassigned in login order after a reboot
+            // the same way; the session proves the link stale there.
+            let stale = (is_ublk_device(&device) && source.code() == Code::AlreadyExists)
+                || (want.share == ShareType::Iscsi
+                    && crate::iscsi_stage::link_is_stale(state, &device, want.context).await);
+            if stale
                 && state
                     .records
                     .stage(staging)
