@@ -338,7 +338,7 @@ async fn chap_passwords_reach_neither_the_log_nor_argv() {
     let staging = dir.path().join("staging/globalmount").to_string_lossy().into_owned();
     let mut agent = start_in(dir, "iscsi:\n  targetPortal: 192.0.2.1:3260\n", 0, 5, Some(&bin));
     let mut node = NodeClient::new(channel(&agent.socket).await);
-    let secret = "hunter2-Pass12";
+    let secret = "hunter2-Pass12"; // gitleaks:allow (test fixture)
     let request = csi::NodeStageVolumeRequest {
         volume_id: "pvc-chap".into(),
         staging_target_path: staging,

@@ -353,13 +353,13 @@ async fn mutual_chap() {
             ("username", USER),
             ("password", PASSWORD),
             ("mutualUsername", "target-user"),
-            ("mutualPassword", "s3cret-Mutual1"),
+            ("mutualPassword", "s3cret-Mutual1"), // gitleaks:allow (test fixture)
         ],
     );
     node_stage(&n.state, &req, None).await.unwrap();
     let record = fake(&n, |f| f.record(IQN, PORTAL).unwrap());
     assert!(
-        record.contains("node.session.auth.password_in = s3cret-Mutual1\n"),
+        record.contains("node.session.auth.password_in = s3cret-Mutual1\n"), // gitleaks:allow (test fixture)
         "{record}"
     );
     assert!(
