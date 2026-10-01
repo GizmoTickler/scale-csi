@@ -17,6 +17,8 @@ type publicationStore interface {
 	records(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error)
 	store(ctx context.Context, datasetName string, ds *truenas.Dataset, key string, record publicationRecord) error
 	remove(ctx context.Context, datasetName string, ds *truenas.Dataset, keys []string) error
+	// forget drops every record of a deleted volume's dataset.
+	forget(ctx context.Context, datasetName string) error
 }
 
 // zfsPublicationStore keeps each record as a user property on the volume's
@@ -36,6 +38,9 @@ func (s zfsPublicationStore) store(ctx context.Context, datasetName string, ds *
 func (s zfsPublicationStore) remove(ctx context.Context, datasetName string, ds *truenas.Dataset, keys []string) error {
 	return removePublicationRecords(ctx, s.client, ds, datasetName, keys)
 }
+
+// forget is a no-op: the records went with the dataset.
+func (s zfsPublicationStore) forget(context.Context, string) error { return nil }
 
 // publications is the driver's record store: the configured one, else the
 // ZFS store on the driver's TrueNAS client.

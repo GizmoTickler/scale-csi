@@ -223,3 +223,60 @@ func (s kubernetesPublicationStore) remove(ctx context.Context, datasetName stri
 	}
 	return nil
 }
+
+func (s kubernetesPublicationStore) instanceSelector() string {
+	return fmt.Sprintf("%s=%s", labelVolumePublicationInst, shortHash(s.instance))
+}
+
+// forget deletes every record of the dataset.
+func (s kubernetesPublicationStore) forget(ctx context.Context, datasetName string) error {
+	list, err := s.resource().List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s,%s=%s",
+		s.instanceSelector(), labelVolumePublicationDS, shortHash(datasetName))})
+	if err != nil {
+		return fmt.Errorf("list publication records for %s: %w", datasetName, err)
+	}
+	for i := range list.Items {
+		object := &list.Items[i]
+		if spec, err := decodeVolumePublicationSpec(object); err == nil && spec.Dataset != datasetName {
+			continue
+		}
+		if err := s.resource().Delete(ctx, object.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("remove publication record %s for %s: %w", object.GetName(), datasetName, err)
+		}
+	}
+	return nil
+}
+
+// all returns every record of this driver instance, by dataset and key, and
+// how many objects there are (unreadable ones included, for the sweep's
+// mass-absence brake). An unreadable object is reported, not skipped silently.
+func (s kubernetesPublicationStore) all(ctx context.Context) (map[string]map[string]publicationRecord, int, []error, error) {
+	list, err := s.resource().List(ctx, metav1.ListOptions{LabelSelector: s.instanceSelector()})
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("list publication records: %w", err)
+	}
+	out := make(map[string]map[string]publicationRecord)
+	var bad []error
+	for i := range list.Items {
+		object := &list.Items[i]
+		spec, err := decodeVolumePublicationSpec(object)
+		if err != nil {
+			bad = append(bad, err)
+			continue
+		}
+		record := spec.record()
+		key := publicationPropertyKey(record.Node)
+		if record.Version != publicationRecordVersion || record.Node == "" ||
+			(record.State != publicationStatePublished && record.State != publicationStateRemoving) ||
+			object.GetName() != s.objectName(spec.Dataset, key) {
+			bad = append(bad, fmt.Errorf("invalid publication record %s contents", object.GetName()))
+			continue
+		}
+		if out[spec.Dataset] == nil {
+			out[spec.Dataset] = make(map[string]publicationRecord)
+		}
+		out[spec.Dataset][key] = record
+	}
+	return out, len(list.Items), bad, nil
+}
+
