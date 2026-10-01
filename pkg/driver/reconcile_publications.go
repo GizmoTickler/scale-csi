@@ -88,10 +88,16 @@ type staleSweepCandidate struct {
 	records     map[string]publicationRecord
 }
 
-// staleSweepCandidates reads the records the sweep classifies, and the record
-// count the mass-absence brake weighs (negative: the records could not be
-// listed, so the pass does nothing).
-func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.Dataset) ([]staleSweepCandidate, int) {
+// staleSweep is what one sweep pass classifies.
+type staleSweep struct {
+	candidates []staleSweepCandidate
+	// recordCount is what the mass-absence brake weighs; negative means the
+	// records could not be listed and the pass does nothing.
+	recordCount int
+}
+
+// staleSweepCandidates reads the records the sweep classifies.
+func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.Dataset) staleSweep {
 	if store, ok := d.publications().(kubernetesPublicationStore); ok {
 		return d.kubernetesStaleSweepCandidates(ctx, store, datasets)
 	}
@@ -147,20 +153,21 @@ func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.D
 		}
 		candidates = append(candidates, staleSweepCandidate{datasetName: dataset.Name, records: records})
 	}
-	return candidates, recordCount
+	return staleSweep{candidates: candidates, recordCount: recordCount}
 }
 
 // kubernetesStaleSweepCandidates lists this instance's VolumePublications. A
 // record whose dataset is not in the listing is removed once a fresh read
 // under the volume lock shows the dataset is gone (its volume was deleted and
 // the delete's own removal did not happen); anything else about it is left.
-func (d *Driver) kubernetesStaleSweepCandidates(ctx context.Context, store kubernetesPublicationStore, datasets []*truenas.Dataset) ([]staleSweepCandidate, int) {
-	all, count, bad, err := store.all(ctx)
+func (d *Driver) kubernetesStaleSweepCandidates(ctx context.Context, store kubernetesPublicationStore, datasets []*truenas.Dataset) staleSweep {
+	listing, err := store.all(ctx)
 	if err != nil {
 		d.recordReconcileObjectFailure("stale_publication_classification", "volumepublications", err)
-		return nil, -1
+		return staleSweep{recordCount: -1}
 	}
-	for _, badErr := range bad {
+	all := listing.byDataset
+	for _, badErr := range listing.unreadable {
 		d.recordReconcileObjectFailure("stale_publication_classification", "volumepublications", badErr)
 	}
 	listed := make(map[string]struct{}, len(datasets))
@@ -182,7 +189,7 @@ func (d *Driver) kubernetesStaleSweepCandidates(ctx context.Context, store kuber
 		}
 		d.forgetPublicationsOfDeletedDataset(ctx, store, name)
 	}
-	return candidates, count
+	return staleSweep{candidates: candidates, recordCount: listing.objects}
 }
 
 func (d *Driver) forgetPublicationsOfDeletedDataset(ctx context.Context, store kubernetesPublicationStore, datasetName string) {
@@ -215,7 +222,8 @@ func (d *Driver) reconcileStalePublicationRecords(
 	if state == nil {
 		return
 	}
-	candidates, recordCount := d.staleSweepCandidates(ctx, datasets)
+	sweep := d.staleSweepCandidates(ctx, datasets)
+	candidates, recordCount := sweep.candidates, sweep.recordCount
 	if recordCount < 0 {
 		return
 	}

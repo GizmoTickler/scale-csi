@@ -247,13 +247,22 @@ func (s kubernetesPublicationStore) forget(ctx context.Context, datasetName stri
 	return nil
 }
 
-// all returns every record of this driver instance, by dataset and key, and
-// how many objects there are (unreadable ones included, for the sweep's
-// mass-absence brake). An unreadable object is reported, not skipped silently.
-func (s kubernetesPublicationStore) all(ctx context.Context) (map[string]map[string]publicationRecord, int, []error, error) {
+// publicationListing is every record of a driver instance.
+type publicationListing struct {
+	// byDataset holds the readable records, by dataset and key.
+	byDataset map[string]map[string]publicationRecord
+	// objects counts every object, unreadable ones included (the sweep's
+	// mass-absence brake weighs them).
+	objects int
+	// unreadable reports the objects that could not be read.
+	unreadable []error
+}
+
+// all lists every record of this driver instance.
+func (s kubernetesPublicationStore) all(ctx context.Context) (publicationListing, error) {
 	list, err := s.resource().List(ctx, metav1.ListOptions{LabelSelector: s.instanceSelector()})
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("list publication records: %w", err)
+		return publicationListing{}, fmt.Errorf("list publication records: %w", err)
 	}
 	out := make(map[string]map[string]publicationRecord)
 	var bad []error
@@ -277,6 +286,5 @@ func (s kubernetesPublicationStore) all(ctx context.Context) (map[string]map[str
 		}
 		out[spec.Dataset][key] = record
 	}
-	return out, len(list.Items), bad, nil
+	return publicationListing{byDataset: out, objects: len(list.Items), unreadable: bad}, nil
 }
-
