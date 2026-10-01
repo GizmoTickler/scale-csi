@@ -43,7 +43,13 @@ pub struct NfsConfig {
     /// `nconnect=<n>` on every NFS mount, 1..16; absent: the option is omitted.
     pub nconnect: Option<i64>,
     /// Storage networks whose interface addresses join this node's identity IPs.
+    /// `null` is an empty list, as in the Go plugin.
+    #[serde(deserialize_with = "null_as_empty")]
     pub node_identity_networks: Vec<String>,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// `sessionGC`: orphaned-session cleanup on the node (Go defaults).
@@ -677,6 +683,11 @@ mod tests {
         .unwrap();
         assert_eq!(c.nfs.nconnect, Some(4));
         assert_eq!(c.nfs.node_identity_networks, ["192.168.201.0/24", "fd00:201::/64"]);
+        let c = parse("nfs:\n  shareHost: x\n  nodeIdentityNetworks: null\n", env).unwrap();
+        assert!(
+            c.nfs.node_identity_networks.is_empty(),
+            "null is an empty list, as in Go"
+        );
         for bad in [
             "nfs: {nconnect: 0}",
             "nfs: {nconnect: 17}",

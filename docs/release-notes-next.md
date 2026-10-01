@@ -82,9 +82,12 @@ as NVMe-oF. An iSCSI-only install (NVMe-oF off) may run the agent.
   refused as before, and `iscsiadm` never runs.
 - A device wait also ends at the caller's deadline (the Go plugin waits out
   its full device timeout).
-- Expansion of a filesystem mounted from `/dev/mapper/<name>` resolves the name
-  to its dm device first; the Go plugin looked the map up by its link name, so
-  it could not read the map's size.
+- After a reboot, a raw-block staging link that names another volume's disk
+  (SCSI disk names are handed out again in login order) or a disk with no iSCSI
+  session is re-staged, as the agent already did for ublk; the Go plugin
+  answers AlreadyExists until the link is removed by hand. The other disk and
+  its session are never touched, and a record naming another volume on the
+  path keeps the refusal.
 
 ### Upgrade
 
@@ -150,10 +153,32 @@ export's hosts, and the NAS refused the mount (NFSv4.1/4.2 returned `ENOENT`).
   do on the node);
 - an NFS unmount that fails falls back to a lazy unmount, as before.
 
-The chart and the agent now refuse only iSCSI: `node.implementation: rust` and
-`node.rustNodes` work with NFS enabled, alone or beside NVMe-oF. One difference
-from the Go plugin: when it unstages an NFS volume, the agent does not look for
-an iSCSI session named after it, as the Go plugin does (an NFS volume has none).
+With iSCSI and NFS ported, the agent serves NVMe-oF, iSCSI and NFS in any
+combination; the chart refuses `node.implementation: rust` or
+`node.rustNodes` only when no protocol is enabled.
+
+Unstaging an NFS volume never stats its mount point on one of the agent's
+async workers: the share is found from findmnt, then from mountinfo, and any
+remaining call on the path runs on a blocking thread with the mount timeout.
+On a dead hard mount such a call blocks in the kernel, and each stuck volume
+used to hold one worker until the agent stopped answering for every protocol.
+
+### Fixed in both node plugins
+
+- **Unstage and unpublish never delete through a mount.** One `umount` lifts
+  only the top of a stack of mounts, and both plugins then removed the path
+  recursively, which on a share or filesystem still mounted underneath deletes
+  the volume's data (two plugins staging during a handover can stack mounts).
+  Both now check that nothing is mounted after the unmount (Internal
+  otherwise, so kubelet retries and the next unmount lifts the next mount) and
+  remove the mount point without recursing.
+- **iSCSI multipath expansion.** A dm-multipath map grows only when multipathd
+  resizes it, and only to its smallest path. Expansion rescanned the session of
+  one path and waited for a size that never came, so the PVC stayed in
+  `FileSystemResizePending`. Both plugins now rescan every path's session, then
+  run `multipathd resize map <name>` through a new host wrapper
+  (`/usr/local/bin/multipathd`, as for `iscsiadm`; the node's multipath-tools
+  must provide `multipathd`).
 
 ## v1.16.0 — publication records in Kubernetes
 
