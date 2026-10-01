@@ -55,14 +55,26 @@ async fn run() -> Result<()> {
         hostname().context("-node-id is required for node mode")?
     };
 
-    let discovered = discovery::discover(&node_name, &discovery::Sources::host(config.command_timeouts.nvme())).await;
+    let identity_networks =
+        discovery::parse_identity_networks(&config.nfs.node_identity_networks).map_err(anyhow::Error::msg)?;
+    let discovered = discovery::discover(
+        &node_name,
+        &discovery::Sources::host(config.command_timeouts.nvme()),
+        &identity_networks,
+    )
+    .await;
     let protocols = Protocols {
         nfs: config.nfs_enabled,
         iscsi: config.iscsi_enabled,
         nvmeof: config.nvmeof.enabled,
     };
-    let node_id = node_id::encode(&node_id::for_enabled_protocols(discovered, protocols))
-        .context("encode this node's identity")?;
+    let identity = node_id::for_enabled_protocols(discovered, protocols);
+    let node_id = node_id::encode(&identity).context("encode this node's identity")?;
+    for ip in discovery::dropped_ips(&identity, &identity_networks, &node_id) {
+        warn!(
+            "nfs.nodeIdentityNetworks address {ip} does not fit in CSI's 256-byte node_id and is left out: the controller cannot grant it, so NFS mounts from it will be refused"
+        );
+    }
     info!(
         "scale-csi-node {} driver={driver_name} node={node_name} node_id={node_id}",
         env!("CARGO_PKG_VERSION")

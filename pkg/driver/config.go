@@ -286,6 +286,15 @@ type NFSConfig struct {
 	// ShareAllowedNetworks is a list of allowed networks (CIDR notation)
 	ShareAllowedNetworks []string `yaml:"shareAllowedNetworks"`
 
+	// NodeIdentityNetworks lists the storage networks (CIDRs, or single IPs)
+	// a node plugin reaches the NFS server over. Each node adds its interface
+	// addresses inside them to the IPs of its node_id, so fencing grants the
+	// address the NAS actually sees when a node mounts over a storage fabric
+	// rather than its Kubernetes (status.hostIP) address. Empty, the default,
+	// keeps every node_id exactly as before; setting it changes the node_id of
+	// every node with an address in a listed network (kubelet re-registers it).
+	NodeIdentityNetworks []string `yaml:"nodeIdentityNetworks"`
+
 	// ShareAllowedHosts is a list of allowed hosts
 	ShareAllowedHosts []string `yaml:"shareAllowedHosts"`
 
@@ -1737,6 +1746,9 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 	if err := validateNFSExportConfig(&cfg.NFS); err != nil {
+		return err
+	}
+	if err := validateNodeIdentityNetworks(&cfg.NFS); err != nil {
 		return err
 	}
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {

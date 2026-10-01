@@ -88,6 +88,13 @@ kubectl get events --field-selector involvedObject.name=<pvc-name>
 - Verify NFS service is enabled on TrueNAS
 - Check that `nfs.server` is correct and resolvable (defaults to the TrueNAS host)
 - Verify `nfs.shareAllowedNetworks` includes your node IPs
+- With `fencing.mode` `strict` or `additive`, an NFS mount that the NAS refuses
+  (often `No such file or directory` on NFSv4.1+) from a node that reaches the
+  NAS over a storage network other than its Kubernetes address: the export's
+  hosts hold only the node's identity IPs, which are its `status.hostIP` unless
+  `nfs.nodeIdentityNetworks` lists the storage network. Set it (and cover the
+  network in `nfs.shareAllowedNetworks` if that is set), roll the node plugins,
+  and republish the volume.
 
 **For iSCSI:**
 - Verify iSCSI service is enabled on TrueNAS

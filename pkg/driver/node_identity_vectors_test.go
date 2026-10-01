@@ -61,9 +61,36 @@ type nodeIdentityParseVector struct {
 	Error    bool                        `json:"error,omitempty"`
 }
 
+// nodeIdentityIPsVector is one run of the node's identity IP discovery
+// (nodeIdentityIPs with nfs.nodeIdentityNetworks) and the node_id it yields.
+type nodeIdentityIPsVector struct {
+	Case  string                     `json:"case"`
+	Input nodeIdentityIPsVectorInput `json:"input"`
+	// Error: nfs.nodeIdentityNetworks is refused at config load.
+	Error bool `json:"error,omitempty"`
+	// InterfacesListed: discovery read the host's interface addresses at all.
+	InterfacesListed bool     `json:"interfaces_listed"`
+	IPs              []string `json:"ips"`
+	NodeID           string   `json:"node_id,omitempty"`
+	// Dropped: identity-network addresses the 256-byte limit left out.
+	Dropped []string `json:"dropped"`
+}
+
+type nodeIdentityIPsVectorInput struct {
+	// Case names the vector; the node name is always k8s-1.
+	Case       string   `json:"-"`
+	NVMeNQN    string   `json:"nvme_nqn,omitempty"`
+	ISCSIIQN   string   `json:"iscsi_iqn,omitempty"`
+	NodeIP     string   `json:"node_ip,omitempty"`
+	NodeIPs    string   `json:"node_ips,omitempty"`
+	Interfaces []string `json:"interfaces,omitempty"`
+	Networks   []string `json:"networks,omitempty"`
+}
+
 type nodeIdentityVectors struct {
-	Encode []nodeIdentityEncodeVector `json:"encode"`
-	Parse  []nodeIdentityParseVector  `json:"parse"`
+	Encode     []nodeIdentityEncodeVector `json:"encode"`
+	Parse      []nodeIdentityParseVector  `json:"parse"`
+	IdentityIP []nodeIdentityIPsVector    `json:"identity_ips"`
 }
 
 func nodeIdentityVectorEncodeCases() []struct {
@@ -147,6 +174,88 @@ func nodeIdentityVectorParseCases(t *testing.T) []struct{ name, nodeID string } 
 	}
 }
 
+func nodeIdentityIPsVectorCases() []nodeIdentityIPsVectorInput {
+	nqn := "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718"
+	iqn := "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e"
+	host := []string{"198.51.100.11", "192.168.201.21", "10.244.1.7", "127.0.0.1", "fe80::1"}
+	twoFabrics := []string{"198.51.100.11", "192.168.201.21", "192.168.202.21", "fd00:201::21", "2001:db8::5", "fe80::21", "10.244.1.7"}
+	manyFabric := make([]string, 0, 13)
+	manyFabric = append(manyFabric, "198.51.100.11")
+	for i := 1; i <= 12; i++ {
+		manyFabric = append(manyFabric, net.IPv4(192, 168, 201, byte(100+i)).String())
+	}
+	tooMany := make([]string, 0, maxNodeIdentityNetworks+1)
+	for i := 0; i <= maxNodeIdentityNetworks; i++ {
+		tooMany = append(tooMany, net.IPv4(10, byte(i), 0, 0).String()+"/16")
+	}
+	in := func(name string, nodeIP string, interfaces, networks []string) nodeIdentityIPsVectorInput {
+		return nodeIdentityIPsVectorInput{Case: name, NVMeNQN: nqn, NodeIP: nodeIP, Interfaces: interfaces, Networks: networks}
+	}
+	return []nodeIdentityIPsVectorInput{
+		// The defaults: the node_id every existing install has.
+		in("default: NODE_IP only, interfaces never read", "198.51.100.11", host, nil),
+		in("default: no NODE_IP falls back to every interface", "", host, nil),
+		{Case: "default: NODE_IPS list", NodeIP: "198.51.100.11", NodeIPs: "2001:db8::1, 198.51.100.12,bogus", Interfaces: host},
+		// nfs.nodeIdentityNetworks.
+		in("a fabric network adds the fabric address", "198.51.100.11", host, []string{"192.168.201.0/24"}),
+		in("a network that matches nothing changes nothing", "198.51.100.11", host, []string{"192.168.250.0/24"}),
+		in("two fabrics and ipv6, link-local never", "198.51.100.11", twoFabrics, []string{"192.168.201.0/24", "192.168.202.0/24", "fd00:201::/64", "fe80::/10"}),
+		in("link-local networks add nothing", "198.51.100.11", append(append([]string{}, host...), "169.254.3.3"), []string{"169.254.0.0/16", "fe80::/10"}),
+		in("a bare ip matches only itself", "198.51.100.11", []string{"192.168.201.21", "192.168.201.22"}, []string{"192.168.201.21"}),
+		in("a mapped interface address is ipv4", "198.51.100.11", []string{"::ffff:192.168.201.30"}, []string{"192.168.201.0/24"}),
+		in("an ipv6 network holds no ipv4", "198.51.100.11", host, []string{"::/0"}),
+		in("an ipv4 network holds no ipv6", "198.51.100.11", twoFabrics, []string{"0.0.0.0/0"}),
+		in("host bits and surrounding space are accepted", "198.51.100.11", host, []string{" 192.168.201.99/24 ", "10.0.0.0/08"}),
+		in("no NODE_IP with a network: every interface once", "", host, []string{"192.168.201.0/24"}),
+		in("the node ip inside the network is kept once", "192.168.201.21", host, []string{"192.168.201.0/24"}),
+		{Case: "the 256-byte limit drops fabric addresses", NVMeNQN: nqn, ISCSIIQN: iqn, NodeIP: "198.51.100.11", Interfaces: manyFabric, Networks: []string{"192.168.201.0/24"}},
+		// Refused at config load.
+		in("prefix too long", "198.51.100.11", host, []string{"192.168.201.0/33"}),
+		in("ipv6 prefix too long", "198.51.100.11", host, []string{"fd00::/129"}),
+		in("not a prefix", "198.51.100.11", host, []string{"192.168.201.0/24x"}),
+		in("a signed prefix", "198.51.100.11", host, []string{"192.168.201.0/+24"}),
+		in("an empty prefix", "198.51.100.11", host, []string{"192.168.201.0/"}),
+		in("a mapped ipv6 network", "198.51.100.11", host, []string{"::ffff:192.168.201.0/120"}),
+		in("a zone", "198.51.100.11", host, []string{"fe80::1%eth0"}),
+		in("a cidr with a zone", "198.51.100.11", host, []string{"fe80::%eth0/64"}),
+		in("a hostname", "198.51.100.11", host, []string{"nas01.example"}),
+		in("an empty entry", "198.51.100.11", host, []string{" "}),
+		in("leading zeros in an ipv4 address", "198.51.100.11", host, []string{"192.168.201.021"}),
+		in("too many networks", "198.51.100.11", host, tooMany),
+	}
+}
+
+func nodeIdentityIPsVectorFor(t *testing.T, input nodeIdentityIPsVectorInput) nodeIdentityIPsVector {
+	t.Helper()
+	out := nodeIdentityIPsVector{Case: input.Case, Input: input, IPs: []string{}, Dropped: []string{}}
+	networks, err := parseNodeIdentityNetworks(input.Networks)
+	if err != nil {
+		out.Error = true
+		return out
+	}
+	interfaces := func() []net.IP {
+		out.InterfacesListed = true
+		ips := make([]net.IP, 0, len(input.Interfaces))
+		for _, value := range input.Interfaces {
+			ip := net.ParseIP(value)
+			require.NotNil(t, ip, "case %q: bad interface ip %q", input.Case, value)
+			ips = append(ips, ip)
+		}
+		return ips
+	}
+	identity := NodeIdentity{Name: "k8s-1", NVMeNQN: input.NVMeNQN, ISCSIIQN: input.ISCSIIQN}
+	identity.IPs = nodeIdentityIPs(input.NodeIP, input.NodeIPs, interfaces, networks)
+	for _, ip := range identity.IPs {
+		out.IPs = append(out.IPs, ip.String())
+	}
+	out.NodeID, err = encodeNodeIdentity(identity)
+	require.NoError(t, err, "case %q", input.Case)
+	for _, ip := range nodeIdentityDroppedIPs(identity, networks, out.NodeID) {
+		out.Dropped = append(out.Dropped, ip.String())
+	}
+	return out
+}
+
 func vectorIdentity(identity NodeIdentity) *nodeIdentityVectorIdentity {
 	out := &nodeIdentityVectorIdentity{
 		Name: identity.Name, NVMeNQN: identity.NVMeNQN, ISCSIIQN: identity.ISCSIIQN,
@@ -180,6 +289,9 @@ func TestNodeIdentityVectors(t *testing.T) {
 			parsed = vectorIdentity(identity)
 		}
 		got.Parse = append(got.Parse, nodeIdentityParseVector{Case: c.name, NodeID: c.nodeID, Identity: parsed, Error: err != nil})
+	}
+	for _, input := range nodeIdentityIPsVectorCases() {
+		got.IdentityIP = append(got.IdentityIP, nodeIdentityIPsVectorFor(t, input))
 	}
 	encoded, err := json.MarshalIndent(got, "", "  ")
 	require.NoError(t, err)
