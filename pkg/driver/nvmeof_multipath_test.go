@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -369,4 +370,60 @@ func TestPartialPortAssociationRollsBackTheSubsystem(t *testing.T) {
 	subsystems, err = base.NVMeoFSubsystemList(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, subsystems, "the subsystem the publish made is gone, associations and all")
+}
+
+// adoptingMock models TrueNAS's nvmet.subsys.create on a name that exists:
+// the client returns the existing subsystem rather than failing.
+type adoptingMock struct {
+	*portRefusingMock
+}
+
+func (m *adoptingMock) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...truenas.NVMeoFSubsystemCreateOptions) (*truenas.NVMeoFSubsystem, error) {
+	subsystems, err := m.NVMeoFSubsystemList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, existing := range subsystems {
+		if existing.Name == name {
+			return existing, nil
+		}
+	}
+	return m.portRefusingMock.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs, opts...)
+}
+
+// A create adopts an existing subsystem of the same name (another install on
+// the NAS whose volume name collides), so its rollback after a partial port
+// association must never force-delete a subsystem that serves a namespace:
+// that would take the other install's volume and paths with it.
+func TestPartialPortAssociationNeverForcesAnAdoptedSubsystemsNamespaceAway(t *testing.T) {
+	ctx := context.Background()
+	base := newAPICallCountingClient()
+	refusing := &portRefusingMock{apiCallCountingClient: base, assocs: map[int]int{}}
+	d := newMultipathAPICallCountDriver(t, base, []string{"192.0.2.21", "192.0.2.22"})
+	d.truenasClient = &adoptingMock{refusing}
+
+	// The name this create will use, taken from a probe volume's subsystem.
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("mp-probe", "nvmeof"))
+	require.NoError(t, err)
+	probe, err := base.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	require.Len(t, probe, 1)
+	name := strings.Replace(probe[0].Name, "mp-probe", "mp-collide", 1)
+
+	// The other install's subsystem of that name, serving its volume.
+	other, err := base.NVMeoFSubsystemCreate(ctx, name, true, nil)
+	require.NoError(t, err)
+	_, err = base.NVMeoFNamespaceCreate(ctx, other.ID, "zvol/otherpool/mp-collide", "ZVOL")
+	require.NoError(t, err)
+
+	refusing.mu.Lock()
+	refusing.failAt = refusing.creates + 2
+	refusing.mu.Unlock()
+	_, err = d.CreateVolume(ctx, apiCallCountVolumeRequest("mp-collide", "nvmeof"))
+	require.Error(t, err)
+
+	namespaces, err := base.NVMeoFNamespaceListBySubsystem(ctx, other.ID)
+	require.NoError(t, err)
+	assert.Len(t, namespaces, 1, "the other install's namespace survives")
+	assert.Contains(t, base.NVMeSubsystems, other.ID, "and so does its subsystem")
 }
