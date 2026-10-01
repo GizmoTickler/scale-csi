@@ -819,7 +819,14 @@ zfs:
 
 ## Upgrade and uninstall
 
+The controller keeps publication records as `VolumePublication` objects (CRD
+in `crds/`). Helm installs `crds/` on a first install but never on an upgrade:
+apply the CRD before upgrading from a release without it, or with Flux set the
+HelmRelease's `install.crds` and `upgrade.crds` to `CreateReplace`. The
+controller refuses to start without it.
+
 ```bash
+kubectl apply -f https://raw.githubusercontent.com/GizmoTickler/scale-csi/<tag>/charts/scale-csi/crds/volumepublications.scale-csi.io.yaml
 helm upgrade scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --namespace scale-csi \
   -f values.yaml

@@ -1,4 +1,61 @@
-# Release notes — v1.15.0 (next)
+# Release notes — v1.16.0 (next)
+
+## v1.16.0 — publication records in Kubernetes
+
+A publication record says "this volume is published to this node, with this
+identity". Until now each one was a ZFS user property on the volume's dataset,
+and every write was a dataset update of 0.2-0.4 s that TrueNAS serves one at a
+time. The controller now keeps them as `VolumePublication` objects in its own
+namespace. A publish or unpublish writes no dataset property any more.
+
+- **What it buys.** On the benchmark controller, 50 concurrent strict-fencing
+  moves (unpublish from one node, publish on another) finish in 27.7 s instead
+  of 65 s on v1.14.0, a 30-volume drain in about 17 s of control plane. Per
+  operation, with fencing off, a publish is 2 TrueNAS calls instead of 3 and an
+  unpublish 1 instead of 2; a strict NVMe-oF unpublish is 7 instead of 9.
+- **The object.** `volumepublications.scale-csi.io` (v1alpha1, namespaced), one
+  per volume and node, shipped in the chart's `crds/`. The controller gets a
+  Role for them in its namespace only. `kubectl get vpub -n <namespace>` lists
+  them with dataset, node and state.
+- **Moving the existing records.** Records already on ZFS keep working. A
+  volume's first publish or unpublish after the upgrade moves its records into
+  Kubernetes and removes them from the dataset (one dataset update, once). A
+  background pass a minute after the start moves the rest, one volume every
+  half second at the lowest priority, and repeats every 10 minutes until none
+  are left. A clone's inherited records are never moved.
+- **Reads.** ListVolumes and ControllerGetVolume, which the external-attacher
+  calls every minute, read a watch-fed cache, not the API. DeleteVolume removes
+  the volume's objects.
+- **The Kubernetes client** now allows 50 requests a second (bursts of 100)
+  instead of client-go's 5 (bursts of 10), which throttled a 50-volume drain.
+- **Copies stop inheriting publications.** A replicated or `zfs recv`'d dataset
+  carried its source's records as its own. Once a volume's records have moved,
+  a copy of it carries none. A copy made before then still does until a later
+  release stops reading ZFS records.
+
+### Upgrade
+
+- **The CRD must be installed with the chart.** Helm installs `crds/` on a new
+  install but not on an upgrade. With Flux, set `install.crds` and
+  `upgrade.crds` to `CreateReplace` on the HelmRelease; with the Helm CLI, apply
+  `crds/volumepublications.scale-csi.io.yaml` before upgrading. The controller
+  refuses to start without the CRD or its Role rather than keep records where
+  the next start would not look.
+- Nothing to configure otherwise. The chart sets
+  `SCALE_CSI_PUBLICATION_STORE=kubernetes` on the controller; a controller run
+  without it (outside the chart) keeps records on ZFS.
+
+### Rolling back to v1.15.0
+
+- With fencing on, v1.15.0's startup reconcile rewrites the ZFS record of every
+  attached volume; with fencing off, the external-attacher republishes each
+  attached volume once, which writes it. Neither needs action.
+- **Delete the VolumePublications when you roll back**
+  (`kubectl delete vpub -n <namespace> --all`). An upgrade after a rollback
+  resolves each volume's records by age, so ZFS records written by v1.15.0 win;
+  but a volume v1.15.0 unpublished from every node leaves no trace on ZFS, and
+  its old VolumePublication would come back until the stale-record sweep removes
+  it.
 
 ## v1.15.0 — the Rust node agent, opt-in
 
