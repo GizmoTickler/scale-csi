@@ -1,5 +1,64 @@
 # Release notes — v1.16.0 (next)
 
+## v1.18.0 (draft) — fewer TrueNAS calls on NVMe-oF, a cheaper restart
+
+Nothing to configure. The controller makes fewer calls to TrueNAS and to the
+Kubernetes API for the same work, and uses less memory. Counts below are the
+calls the controller makes for one operation, measured against the test
+appliance; strict fencing, NVMe-oF.
+
+- **Moving a volume between nodes.** A first publish on a node is 8 calls
+  instead of 10, an unpublish 5 instead of 7, so a move is 13 instead of 17.
+  A repeated publish of an unchanged volume is 5 instead of 8 (with records
+  kept on ZFS), and no longer asks TrueNAS to create a host association that
+  already exists, a request TrueNAS rejected while queueing it behind other
+  writes.
+- **Association lookups no longer grow with the NAS.** The two lookups a
+  publish or unpublish makes for a volume's host and port associations ask
+  TrueNAS for that volume's rows only, instead of reading every association on
+  the appliance and filtering them in the controller. The controller still
+  checks every row it gets back.
+- **Creating a volume.** A new NVMe-oF volume is 9 calls instead of 13 (15
+  instead of 19 with four multipath addresses), and one of the calls saved is
+  a subsystem update that made TrueNAS reload its NVMe target. A retried
+  create of a complete volume is 3 calls instead of 5. A clone from a snapshot
+  is 12 calls instead of 20, a clone from a volume 13 instead of 21. An NFS
+  clone saves one lookup (9 and 12 calls).
+- **Restarting the controller.** The startup pass lists the cluster's
+  PersistentVolumes, VolumeAttachments, CSINodes and Nodes once, then reads
+  each attached volume's own VolumeAttachments by name; before, it listed all
+  four again for every volume. A publication record that already says what
+  the attachment says is not rewritten, so a restart with everything in place
+  writes no VolumePublication. A volume whose attachment is gone or being
+  deleted is still never granted.
+- **After the start.** A fence deferred for a node that has not reported its
+  identity yet, or a stale record removed from a volume the start had set
+  aside, re-runs that one volume instead of the whole startup pass.
+- **First contact with TrueNAS.** The two checks for the TrueNAS 26 dataset and
+  snapshot query methods now ask about the pool's top dataset only. They used
+  to ask for every dataset and every snapshot on the appliance with their
+  properties, tens of megabytes on a large NAS, decoded and thrown away.
+- **Memory and CPU.** Reading one dataset allocates about a third of what it
+  did (14 KB instead of 41 KB). A full ListVolumes walk, which the
+  external-attacher runs every minute, takes 27 MB of allocations instead of
+  48 MB at 1,000 volumes and keeps 0.1 MB alive between walks instead of
+  4.5 MB. Each controller request logs with 12 allocations instead of 49.
+
+### Upgrade
+
+- Nothing to configure. Before rolling it out, confirm on the NAS, read-only,
+  that TrueNAS answers the narrower questions the way this release expects
+  (`<id>` is any NVMe-oF subsystem with hosts, `<pool>` the pool of
+  `zfs.datasetParentName`):
+  - `midclt call nvmet.host_subsys.query '[["subsys.id","=",<id>]]'` returns
+    exactly the rows of `midclt call nvmet.host_subsys.query` whose `subsys.id`
+    is `<id>`; the same for `nvmet.port_subsys.query`. If TrueNAS rejects the
+    filter the controller falls back to the full list on its own; if it
+    answered with fewer rows, strict fencing could miss a host to remove.
+  - `midclt call zfs.resource.query '{"paths":["<pool>"],"get_children":false,"properties":["used"]}'`
+    and `midclt call zfs.resource.snapshot.query '{"paths":["<pool>"],"recursive":false,"properties":null}'`
+    both succeed.
+
 ## v1.16.0 — publication records in Kubernetes
 
 A publication record says "this volume is published to this node, with this
