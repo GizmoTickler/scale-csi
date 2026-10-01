@@ -260,3 +260,53 @@ func TestPublishedNodeIDsComeFromTheCacheWithoutAnAPICall(t *testing.T) {
 		return assert.ObjectsAreEqual([]string{testRecord("node-1", "").EncodedID}, d.publishedNodeIDs(ctx, ds))
 	}, 5*time.Second, 10*time.Millisecond, "the cache follows a removal")
 }
+
+func recordAt(node, state, at string) publicationRecord {
+	record := testRecord(node, state)
+	record.UpdatedAt = at
+	return record
+}
+
+// After a rollback and this release again, the older release's ZFS records
+// are newer than every VolumePublication of the volume: ZFS alone decides,
+// so a node that release unpublished (its record gone from ZFS) does not
+// come back from a VolumePublication it never saw, not even after a write.
+func TestImportingStoreZFSNewerThanEveryVolumePublicationDecidesAlone(t *testing.T) {
+	ctx := context.Background()
+	keyA, keyB, keyC := publicationPropertyKey("node-a"), publicationPropertyKey("node-b"), publicationPropertyKey("node-c")
+	before, rolledBack, after := "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z"
+	store, client, ds := newImportingStore(t, recordAt("node-b", publicationStatePublished, rolledBack))
+	require.NoError(t, store.kube.store(ctx, ds.Name, ds, keyA, recordAt("node-a", publicationStatePublished, before)))
+	require.NoError(t, store.kube.store(ctx, ds.Name, ds, keyB, recordAt("node-b", publicationStatePublished, before)))
+
+	got, err := store.records(ctx, ds.Name, ds)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]publicationRecord{keyB: recordAt("node-b", publicationStatePublished, rolledBack)}, got)
+
+	require.NoError(t, store.store(ctx, ds.Name, ds, keyC, recordAt("node-c", publicationStatePublished, after)))
+	got, err = store.records(ctx, ds.Name, ds)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]publicationRecord{
+		keyB: recordAt("node-b", publicationStatePublished, rolledBack),
+		keyC: recordAt("node-c", publicationStatePublished, after),
+	}, got, "node-a stays unpublished after the import")
+	assert.Empty(t, zfsRecordKeys(t, client, ds.Name))
+}
+
+// Otherwise the newer copy of each key wins, and records not yet imported
+// stay: a crash between a VolumePublication write and the ZFS removal.
+func TestImportingStoreMergesPerKeyByAge(t *testing.T) {
+	ctx := context.Background()
+	keyA, keyB := publicationPropertyKey("node-a"), publicationPropertyKey("node-b")
+	store, _, ds := newImportingStore(t,
+		recordAt("node-a", publicationStatePublished, "2026-10-01T00:00:00Z"),
+		recordAt("node-b", publicationStatePublished, "2026-10-01T00:00:00Z"))
+	require.NoError(t, store.kube.store(ctx, ds.Name, ds, keyA, recordAt("node-a", publicationStateRemoving, "2026-10-02T00:00:00Z")))
+
+	got, err := store.records(ctx, ds.Name, ds)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]publicationRecord{
+		keyA: recordAt("node-a", publicationStateRemoving, "2026-10-02T00:00:00Z"),
+		keyB: recordAt("node-b", publicationStatePublished, "2026-10-01T00:00:00Z"),
+	}, got)
+}
