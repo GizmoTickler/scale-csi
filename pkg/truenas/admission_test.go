@@ -2,25 +2,31 @@ package truenas
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// acquireAsync starts a waiter and returns a channel that receives once it is
-// admitted.
+// acquireAsync starts a waiter and returns a channel that receives its result.
+// It returns once the waiter is queued or admitted.
 func acquireAsync(t *testing.T, g *admissionGate, ctx context.Context) <-chan error {
 	t.Helper()
+	g.mu.Lock()
+	queued, held := len(g.waiting), g.inUse
+	g.mu.Unlock()
 	done := make(chan error, 1)
 	go func() { done <- g.acquire(ctx) }()
-	// Let it enqueue.
 	require.Eventually(t, func() bool {
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		return len(g.waiting) > 0 || g.inUse > 0
+		return len(g.waiting) > queued || g.inUse > held
 	}, time.Second, time.Millisecond)
 	return done
 }
@@ -126,34 +132,164 @@ func TestAdmissionGateCancellationNeverLeaksASlot(t *testing.T) {
 	g.release()
 }
 
-// With operation ages, a burst of operations that each make several calls
-// completes in arrival order: the first one is done after its own calls, not
-// after everyone's. Without them every operation would finish near the end.
-func TestAdmissionGateCompletesABurstInArrivalOrder(t *testing.T) {
-	const ops, calls = 6, 4
-	g := newAdmissionGate(1)
-	base := time.Now()
-	var mu sync.Mutex
-	var finished []int
-	var wg sync.WaitGroup
-	require.NoError(t, g.acquire(context.Background())) // hold until all are queued
-	for op := 0; op < ops; op++ {
-		wg.Add(1)
-		go func(op int) {
-			defer wg.Done()
-			ctx := WithOperationStart(context.Background(), base.Add(time.Duration(op)*time.Millisecond))
-			for c := 0; c < calls; c++ {
-				require.NoError(t, g.acquire(ctx))
-				time.Sleep(200 * time.Microsecond)
-				g.release()
-			}
-			mu.Lock()
-			finished = append(finished, op)
-			mu.Unlock()
-		}(op)
+// A slot granted at the instant its waiter gives up is never kept by the
+// waiter, whichever way its select falls.
+func TestAdmissionGateGrantRacingCancellationNeverLeaks(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		g := newAdmissionGate(1)
+		require.NoError(t, g.acquire(context.Background()))
+		ctx, cancel := context.WithCancel(context.Background())
+		done := acquireAsync(t, g, ctx)
+		// Cancel, then grant, both under the lock: the waiter wakes on the
+		// cancellation and finds itself already granted.
+		g.mu.Lock()
+		cancel()
+		g.inUse--
+		g.dispatchLocked()
+		g.mu.Unlock()
+		require.ErrorIs(t, <-done, context.Canceled)
+		require.Zero(t, g.inFlight(), "iteration %d: the granted slot was kept", i)
 	}
-	waitQueued(t, g, ops)
+}
+
+// Aging bounds how long a lower class waits: a delete that has queued for two
+// aging steps ranks with attach, and as the older operation goes first.
+func TestAdmissionGateAgesLowerClasses(t *testing.T) {
+	g := newAdmissionGate(1)
+	now := time.Unix(1000, 0)
+	g.now = func() time.Time { return now }
+	require.NoError(t, g.acquire(context.Background()))
+	admitted := make(chan string, 2)
+	go func() {
+		if g.acquire(WithPriority(context.Background(), PriorityDelete)) == nil {
+			admitted <- "delete"
+		}
+	}()
+	waitQueued(t, g, 1)
+	now = now.Add(2*agingStep + time.Millisecond)
+	go func() {
+		if g.acquire(WithPriority(context.Background(), PriorityAttach)) == nil {
+			admitted <- "attach"
+		}
+	}()
+	waitQueued(t, g, 2)
 	g.release()
-	wg.Wait()
-	assert.Equal(t, []int{0, 1, 2, 3, 4, 5}, finished)
+	assert.Equal(t, "delete", <-admitted, "aged to attach rank, and its operation is older")
+	g.release()
+	assert.Equal(t, "attach", <-admitted)
+	g.release()
+
+	// Without the wait, the attach goes first.
+	now = now.Add(time.Hour)
+	require.NoError(t, g.acquire(context.Background()))
+	go func() {
+		if g.acquire(WithPriority(context.Background(), PriorityDelete)) == nil {
+			admitted <- "delete"
+		}
+	}()
+	waitQueued(t, g, 1)
+	go func() {
+		if g.acquire(WithPriority(context.Background(), PriorityAttach)) == nil {
+			admitted <- "attach"
+		}
+	}()
+	waitQueued(t, g, 2)
+	g.release()
+	assert.Equal(t, "attach", <-admitted)
+	g.release()
+	assert.Equal(t, "delete", <-admitted)
+	g.release()
+}
+
+func TestAdmissionGateUnbalancedReleasePanics(t *testing.T) {
+	g := newAdmissionGate(2)
+	assert.Panics(t, g.release)
+}
+
+func TestAdmissionGateReportsWaitAndQueueByClass(t *testing.T) {
+	var mu sync.Mutex
+	waited := map[string]int{}
+	queued := map[string]int{}
+	g := newAdmissionGateWithMetrics(1, AdmissionMetrics{
+		Waited: func(class string, _ float64) { mu.Lock(); waited[class]++; mu.Unlock() },
+		Queued: func(class string, n int) { mu.Lock(); queued[class] = n; mu.Unlock() },
+	})
+	require.NoError(t, g.acquire(context.Background()))
+	done := acquireAsync(t, g, WithPriority(context.Background(), PriorityDelete))
+	mu.Lock()
+	assert.Equal(t, 1, queued["delete"])
+	mu.Unlock()
+	g.release()
+	require.NoError(t, <-done)
+	g.release()
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 0, queued["delete"])
+	assert.Equal(t, 1, waited["default"])
+	assert.Equal(t, 1, waited["delete"])
+}
+
+// The client admits its calls through the gate with the caller's context: with
+// one slot held, a delete-class call queued before an attach-class call reaches
+// TrueNAS after it.
+func TestClientCallsAreAdmittedByTheCallersClass(t *testing.T) {
+	mock := newMockWSServer()
+	order := make(chan string, 4)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "system.info":
+				resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-25.10.0", "hostname": "truenas-test"}
+			default:
+				// Only the two calls under test; the client's own
+				// background calls (job subscription) are not ordered here.
+				if strings.HasSuffix(req.Method, ".class.query") {
+					order <- req.Method
+				}
+				resp.Result = []interface{}{}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+
+	wsURL := strings.Replace(server.URL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host: parts[0], Port: port, Protocol: "http", APIKey: "test-api-key",
+		Timeout: 5 * time.Second, ConnectTimeout: 5 * time.Second, MaxConnections: 1, MaxConcurrentReqs: 1,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	require.NoError(t, client.semaphore.acquire(context.Background()))
+	errs := make(chan error, 2)
+	go func() {
+		_, err := client.Call(WithPriority(context.Background(), PriorityDelete), "delete.class.query")
+		errs <- err
+	}()
+	waitQueued(t, client.semaphore, 1)
+	go func() {
+		_, err := client.Call(WithPriority(context.Background(), PriorityAttach), "attach.class.query")
+		errs <- err
+	}()
+	waitQueued(t, client.semaphore, 2)
+	client.semaphore.release()
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+	assert.Equal(t, "attach.class.query", <-order)
+	assert.Equal(t, "delete.class.query", <-order)
 }

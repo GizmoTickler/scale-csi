@@ -632,6 +632,7 @@ type ClientConfig struct {
 	HeartbeatInterval    time.Duration        // Interval for WebSocket heartbeat (default: 30s)
 	MaxConnections       int                  // Maximum number of concurrent connections (default: 5)
 	MaxConcurrentReqs    int                  // Maximum number of concurrent API requests (default: 10)
+	AdmissionMetrics     AdmissionMetrics     // Optional: queueing observations of the request slots
 	LazyConnect          bool                 // Skip eager connection; connect on first API use (node-only mode)
 	MetricsRecorder      MetricsRecorder      // Optional callback for recording request metrics
 	PendingDepthRecorder PendingDepthRecorder // Optional callback for in-flight request depth
@@ -908,7 +909,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	client := &Client{
 		config:                      cfg,
 		pool:                        make([]*Connection, cfg.MaxConnections),
-		semaphore:                   newAdmissionGate(cfg.MaxConcurrentReqs),
+		semaphore:                   newAdmissionGateWithMetrics(cfg.MaxConcurrentReqs, cfg.AdmissionMetrics),
 		metricsRecorder:             cfg.MetricsRecorder,
 		pendingDepthRecorder:        cfg.PendingDepthRecorder,
 		replicationJobAbortRecorder: cfg.ReplicationJobAbortRecorder,

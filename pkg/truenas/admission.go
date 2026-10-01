@@ -53,35 +53,81 @@ func operationStartOf(ctx context.Context, fallback time.Time) time.Time {
 	return fallback
 }
 
+// agingStep is how long a waiting request takes to climb one priority class.
+// It bounds how long a lower class can be kept waiting, which matters because
+// operations hold per-volume locks across their calls: a DeleteSnapshot that
+// waits holding its source volume's lock would otherwise block that volume's
+// publish for as long as higher-class work keeps arriving.
+const agingStep = 2 * time.Second
+
 // admissionGate is a counting semaphore whose waiters are admitted by
-// (priority, operation start, arrival) instead of in whatever order the
-// runtime wakes them.
+// (aged priority, operation start, arrival) instead of first come, first
+// served.
 type admissionGate struct {
 	mu       sync.Mutex
 	capacity int
 	inUse    int
 	seq      uint64
 	waiting  []*admissionWaiter
+	now      func() time.Time
+	metrics  AdmissionMetrics
+}
+
+// AdmissionMetrics receives the gate's observations; either function may be nil.
+type AdmissionMetrics struct {
+	// Waited is called once per admitted request with how long it queued.
+	Waited func(class string, seconds float64)
+	// Queued is called with the number of requests of a class waiting, each
+	// time it changes.
+	Queued func(class string, waiting int)
+}
+
+func (g *admissionGate) reportQueuedLocked(p Priority) {
+	if g.metrics.Queued == nil {
+		return
+	}
+	n := 0
+	for _, w := range g.waiting {
+		if w.priority == p {
+			n++
+		}
+	}
+	g.metrics.Queued(p.String(), n)
 }
 
 type admissionWaiter struct {
 	priority Priority
 	start    time.Time
+	enqueued time.Time
 	seq      uint64
 	ready    chan struct{}
 	granted  bool
 }
 
 func newAdmissionGate(capacity int) *admissionGate {
+	return newAdmissionGateWithMetrics(capacity, AdmissionMetrics{})
+}
+
+func newAdmissionGateWithMetrics(capacity int, metrics AdmissionMetrics) *admissionGate {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &admissionGate{capacity: capacity}
+	return &admissionGate{capacity: capacity, now: time.Now, metrics: metrics}
 }
 
-func (w *admissionWaiter) before(other *admissionWaiter) bool {
-	if w.priority != other.priority {
-		return w.priority < other.priority
+// rank is the waiter's class after aging: one class higher per agingStep
+// waited, never above PriorityAttach.
+func (w *admissionWaiter) rank(now time.Time) int {
+	r := int(w.priority) - int(now.Sub(w.enqueued)/agingStep)
+	if r < int(PriorityAttach) {
+		return int(PriorityAttach)
+	}
+	return r
+}
+
+func (w *admissionWaiter) before(other *admissionWaiter, now time.Time) bool {
+	if a, b := w.rank(now), other.rank(now); a != b {
+		return a < b
 	}
 	if !w.start.Equal(other.start) {
 		return w.start.Before(other.start)
@@ -90,27 +136,33 @@ func (w *admissionWaiter) before(other *admissionWaiter) bool {
 }
 
 // acquire waits for a slot. It returns ctx's error if ctx ends first, holding
-// no slot.
+// no slot; a slot granted to a caller that has meanwhile given up is handed on.
 func (g *admissionGate) acquire(ctx context.Context) error {
 	// An operation that has already given up never takes a slot.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	now := time.Now()
 	g.mu.Lock()
+	now := g.now()
 	g.seq++
 	w := &admissionWaiter{
 		priority: priorityOf(ctx),
 		start:    operationStartOf(ctx, now),
+		enqueued: now,
 		seq:      g.seq,
 		ready:    make(chan struct{}),
 	}
 	g.waiting = append(g.waiting, w)
+	g.reportQueuedLocked(w.priority)
 	g.dispatchLocked()
 	g.mu.Unlock()
 
 	select {
 	case <-w.ready:
+		if err := ctx.Err(); err != nil {
+			g.release()
+			return err
+		}
 		return nil
 	case <-ctx.Done():
 		g.mu.Lock()
@@ -120,6 +172,7 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 			g.dispatchLocked()
 		} else {
 			g.removeLocked(w)
+			g.reportQueuedLocked(w.priority)
 		}
 		g.mu.Unlock()
 		return ctx.Err()
@@ -128,6 +181,10 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 
 func (g *admissionGate) release() {
 	g.mu.Lock()
+	if g.inUse <= 0 {
+		g.mu.Unlock()
+		panic("truenas: request slot released without being acquired")
+	}
 	g.inUse--
 	g.dispatchLocked()
 	g.mu.Unlock()
@@ -135,10 +192,14 @@ func (g *admissionGate) release() {
 
 // dispatchLocked grants free slots to the best waiters.
 func (g *admissionGate) dispatchLocked() {
+	if g.inUse >= g.capacity || len(g.waiting) == 0 {
+		return
+	}
+	now := g.now()
 	for g.inUse < g.capacity && len(g.waiting) > 0 {
 		best := 0
 		for i := 1; i < len(g.waiting); i++ {
-			if g.waiting[i].before(g.waiting[best]) {
+			if g.waiting[i].before(g.waiting[best], now) {
 				best = i
 			}
 		}
@@ -147,6 +208,10 @@ func (g *admissionGate) dispatchLocked() {
 		g.inUse++
 		w.granted = true
 		close(w.ready)
+		if g.metrics.Waited != nil {
+			g.metrics.Waited(w.priority.String(), now.Sub(w.enqueued).Seconds())
+		}
+		g.reportQueuedLocked(w.priority)
 	}
 }
 
@@ -169,4 +234,22 @@ func (g *admissionGate) inFlight() int {
 // PriorityOf is the priority requests made under ctx are admitted with.
 func PriorityOf(ctx context.Context) Priority {
 	return priorityOf(ctx)
+}
+
+// OperationStartOf is the operation start recorded on ctx, if any.
+func OperationStartOf(ctx context.Context) (time.Time, bool) {
+	t, ok := ctx.Value(operationStartKey{}).(time.Time)
+	return t, ok && !t.IsZero()
+}
+
+// String names the class for metrics and logs.
+func (p Priority) String() string {
+	switch p {
+	case PriorityAttach:
+		return "attach"
+	case PriorityDelete:
+		return "delete"
+	default:
+		return "default"
+	}
 }

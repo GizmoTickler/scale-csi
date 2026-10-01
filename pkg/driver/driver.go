@@ -485,6 +485,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			MaxConcurrentReqs:           cfg.Config.TrueNAS.MaxConcurrentRequests,
 			MetricsRecorder:             RecordTrueNASRequest,
 			PendingDepthRecorder:        SetTrueNASPendingCalls,
+			AdmissionMetrics:            TrueNASAdmissionMetrics(),
 			ReplicationJobAbortRecorder: RecordReplicationJobAborted,
 			CircuitBreaker:              cbConfig,
 			APIRetryMaxAttempts:         cfg.Config.Resilience.Retry.MaxAttempts,
@@ -758,7 +759,6 @@ func shutdownAuxServers(healthServer *HealthServer, debugServer *DebugServer) {
 	}
 }
 
-// logInterceptor is a gRPC interceptor for logging requests with request IDs and timing.
 // truenasAdmissionContext tells the TrueNAS client how to order this RPC's
 // requests when they queue for a request slot: attach and detach first (a pod
 // is waiting), deletes last, and within a class the oldest RPC first, so a burst
@@ -774,6 +774,7 @@ func truenasAdmissionContext(ctx context.Context, fullMethod string, start time.
 	return ctx
 }
 
+// logInterceptor is a gRPC interceptor for logging requests with request IDs and timing.
 func (d *Driver) logInterceptor(
 	ctx context.Context,
 	req interface{},

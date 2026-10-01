@@ -7,6 +7,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -28,4 +30,27 @@ func TestTruenasAdmissionClassPerRPC(t *testing.T) {
 		assert.Equal(t, want, truenas.PriorityOf(ctx), method)
 	}
 	assert.Equal(t, truenas.PriorityDefault, truenas.PriorityOf(context.Background()), "unmarked work is the default class")
+}
+
+// The interceptor hands the handler a context carrying the RPC's class and
+// start, so the TrueNAS calls the handler makes are admitted accordingly.
+func TestLogInterceptorPassesTheAdmissionContext(t *testing.T) {
+	d := &Driver{config: &Config{}}
+	for method, want := range map[string]truenas.Priority{
+		csi.Controller_ControllerPublishVolume_FullMethodName: truenas.PriorityAttach,
+		csi.Controller_DeleteVolume_FullMethodName:            truenas.PriorityDelete,
+		csi.Controller_CreateVolume_FullMethodName:            truenas.PriorityDefault,
+	} {
+		var seen context.Context
+		_, err := d.logInterceptor(context.Background(), &csi.ControllerPublishVolumeRequest{}, &grpc.UnaryServerInfo{FullMethod: method},
+			func(ctx context.Context, _ interface{}) (interface{}, error) {
+				seen = ctx
+				return nil, nil
+			})
+		require.NoError(t, err)
+		require.NotNil(t, seen)
+		assert.Equal(t, want, truenas.PriorityOf(seen), method)
+		start, ok := truenas.OperationStartOf(seen)
+		assert.True(t, ok && !start.IsZero(), "%s carries its start", method)
+	}
 }
