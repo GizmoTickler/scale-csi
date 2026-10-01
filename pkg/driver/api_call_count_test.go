@@ -1463,10 +1463,10 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 	// (c) strict + NVMe-oF single node — the live hot path P1 optimizes. The
 	// measured publish is a steady-state republish: the setup publish associates
 	// the node and warms the per-driver host-ID cache. Namespace/subsystem
-	// identity remains memoized within the request, but enforcement deliberately
-	// fresh-lists at its mutation boundary, unconditionally asserts the desired
-	// association, and fresh-lists again before removals. The unpublish uses the
-	// same enforcement-boundary freshness before revoking the association.
+	// identity remains memoized within the request. Enforcement creates only an
+	// association the classification read lacks, and always lists again after
+	// the writes before any removal; an unpublish has no classification read,
+	// so its one enforcement read is that post-write list.
 	t.Run("strict NVMe-oF publish", func(t *testing.T) {
 		client := newAPICallCountingClient()
 		d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
@@ -1481,24 +1481,30 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
 		require.NoError(t, err)
-		// Eight calls (steady-state republish; ~13 before P1, 9 while an unchanged
-		// record was rewritten):
+		// Five calls (steady-state republish; ~13 before P1, 9 while an unchanged
+		// record was rewritten, 8 while enforcement re-listed at a boundary whose
+		// result nothing read and re-created an association it had just seen):
 		// 1. DatasetGet                      — ControllerPublishVolume volume read.
 		// 2. NVMeoFNamespaceGet              — ensureShare resolves the namespace
 		//                                      (memoized for the rest of the request).
 		// 3. NVMeoFSubsystemGet              — ensureShare resolves the subsystem.
 		//    (repair-stamp write SKIPPED: the dataset already carries both IDs.)
-		// 4. NVMeoFHostFindByNQN             — validateBackend resolves the exempt
-		//                                      node NQN to a host ID.
-		// 5. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
-		//                                      for compatibility/classification.
+		// 4. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
+		//                                      for compatibility/classification. The
+		//                                      expanded host NQNs are matched
+		//                                      directly, so no host lookup.
 		//    (record write SKIPPED: the stored record already says exactly this.)
-		// 6. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
-		//                                      compatibility state is not reused.
-		// 7. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
-		//                                      of the desired association.
-		// 8. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
-		assertAPICallCount(t, "strict NVMe-oF publish", client, 8)
+		//    (association create SKIPPED: the classification read already has it.)
+		// 5. NVMeoFHostSubsysListBySubsystem — fresh post-write removal view; it
+		//                                      also re-checks that the desired
+		//                                      association is still there.
+		assertAPICallCount(t, "strict NVMe-oF publish", client, 5)
+		assertAPICallMethodMap(t, "strict NVMe-oF publish", client, map[string]int{
+			"DatasetGet":                      1,
+			"NVMeoFNamespaceGet":              1,
+			"NVMeoFSubsystemGet":              1,
+			"NVMeoFHostSubsysListBySubsystem": 2,
+		})
 	})
 	t.Run("strict NVMe-oF unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -1512,19 +1518,27 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-nvme-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Nine calls:
+		// Seven calls (nine while enforcement re-listed at a dead boundary and
+		// looked up the removed node's host ID that the list already names):
 		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
 		// 2. DatasetSetUserProperties        — flip the record to "unpublishing".
 		// 3. NVMeoFNamespaceGet              — applyNVMeFence resolves the namespace
 		//                                      (fresh memo for this request).
 		// 4. NVMeoFSubsystemGet              — applyNVMeFence resolves the subsystem.
-		// 5. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read.
-		// 6. NVMeoFHostFindByNQN             — resolve the removing NQN to a host ID.
-		// 7. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view
-		//                                      (there are no desired creates here).
-		// 8. NVMeoFHostSubsysDelete          — revoke worker-a's association.
-		// 9. DatasetRemoveUserProperties     — removePublicationRecords.
-		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 9)
+		// 5. NVMeoFHostSubsysListBySubsystem — the enforcement read; nothing is
+		//                                      created, so it is also the removal view.
+		// 6. NVMeoFHostSubsysDelete          — revoke worker-a's association.
+		// 7. DatasetRemoveUserProperties     — removePublicationRecords.
+		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 7)
+		assertAPICallMethodMap(t, "strict NVMe-oF unpublish", client, map[string]int{
+			"DatasetGet":                      1,
+			"DatasetSetUserProperties":        1,
+			"NVMeoFNamespaceGet":              1,
+			"NVMeoFSubsystemGet":              1,
+			"NVMeoFHostSubsysListBySubsystem": 1,
+			"NVMeoFHostSubsysDelete":          1,
+			"DatasetRemoveUserProperties":     1,
+		})
 	})
 
 	// (d) fencing OFF + iSCSI — the block-protocol records-only floor. The share
