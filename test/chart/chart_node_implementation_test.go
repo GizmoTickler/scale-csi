@@ -9,7 +9,7 @@ import (
 
 // node.implementation selects the node plugin binary in the one image. The
 // default render is unchanged; rust swaps the container command and is refused
-// where the Rust agent does not serve the install's protocols yet.
+// where the Rust agent does not serve the install's protocols yet (NFS).
 
 var rustNodeArgs = []string{
 	"--set", "nfs.enabled=false", "--set", "iscsi.enabled=false",
@@ -67,9 +67,8 @@ func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 		args   []string
 		reason string
 	}{
-		{"NFS on", withArgs(rustNodeArgs, "--set", "nfs.enabled=true"), "serves NVMe-oF only"},
-		{"iSCSI on", withArgs(rustNodeArgs, "--set", "iscsi.enabled=true"), "serves NVMe-oF only"},
-		{"NVMe-oF off", withArgs(rustNodeArgs, "--set", "nvmeof.enabled=false"), "nvmeof.enabled=true"},
+		{"NFS on", withArgs(rustNodeArgs, "--set", "nfs.enabled=true"), "does not serve NFS"},
+		{"NVMe-oF and iSCSI off", withArgs(rustNodeArgs, "--set", "nvmeof.enabled=false"), "nvmeof.enabled=true or iscsi.enabled=true"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -81,6 +80,42 @@ func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 	}
 	if out := helmTemplateExpectError(t, "--set", "node.implementation=python"); !strings.Contains(out, "implementation") {
 		t.Errorf("the schema must refuse an unknown implementation:\n%s", out)
+	}
+}
+
+// iSCSI is served: with NVMe-oF, alone, and on canary nodes. Only NFS is
+// still refused.
+func TestChartNodeImplementationRustServesISCSI(t *testing.T) {
+	for name, args := range map[string][]string{
+		"with NVMe-oF": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.implementation=rust"),
+		"alone": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nvmeof.enabled=false",
+			"--set", "node.implementation=rust"),
+		"on canary nodes": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.rustNodes={k8s-2}"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rendered := helmTemplate(t, args...)
+			found := false
+			for _, set := range nodeDaemonSets(t, rendered) {
+				container, _ := namedEntry(t, podSpecOf(t, set, "node DaemonSet")["containers"], "scale-csi")
+				if reflect.DeepEqual(container["command"], []any{"/usr/local/bin/scale-csi-node"}) {
+					found = true
+					mounts := renderJSON(t, container["volumeMounts"])
+					for _, path := range []string{`"/etc/iscsi"`, `"/var/lib/iscsi"`, `"/host"`} {
+						if !strings.Contains(mounts, path) {
+							t.Errorf("the agent needs %s for iSCSI: %s", path, mounts)
+						}
+					}
+				}
+			}
+			if !found {
+				t.Error("no DaemonSet runs the Rust agent")
+			}
+		})
+	}
+	out := helmTemplateExpectError(t, withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nfs.enabled=true",
+		"--set", "node.implementation=rust")...)
+	if !strings.Contains(out, "does not serve NFS") {
+		t.Errorf("NFS with iSCSI is still refused:\n%s", out)
 	}
 }
 

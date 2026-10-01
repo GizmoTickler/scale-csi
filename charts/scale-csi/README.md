@@ -587,7 +587,7 @@ Operator caveats:
 | `controller.podSecurityContext` | Controller-only pod security context, deep-merged over the shared `podSecurityContext` (controller keys win); the node DaemonSet deliberately gets no pod-level seccomp profile | `{seccompProfile: {type: RuntimeDefault}}` |
 | `controller.resources` | Controller driver resources | requests `10m` CPU, `32Mi` memory; memory limit `256Mi` |
 | `node.enabled` | Deploy the node DaemonSet | `true` |
-| `node.implementation` | Node plugin binary: `go` (scale-csi) or `rust` (scale-csi-node, the Rust node agent; NVMe-oF only so far) | `go` |
+| `node.implementation` | Node plugin binary: `go` (scale-csi) or `rust` (scale-csi-node, the Rust node agent; NVMe-oF and iSCSI so far, not NFS) | `go` |
 | `node.rustNodes` | Node names that run the Rust agent in a second DaemonSet (`<fullname>-node-rust`) while the Go DaemonSet avoids them: a canary. Not with `node.implementation: rust` or `node.affinity` | `[]` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |
 | `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
