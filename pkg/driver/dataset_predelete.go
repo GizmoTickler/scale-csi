@@ -32,6 +32,9 @@ func (d *Driver) deleteDatasetWithBusyObservation(
 // concurrently: pool.dataset.attachments (~570ms on nas01) and
 // pool.dataset.processes (~210ms) used to add up on every DeleteVolume.
 func (d *Driver) observeDatasetBusyBeforeDelete(ctx context.Context, datasetName, operation string) {
+	if !d.config.observeBusyBeforeDelete() {
+		return
+	}
 	var (
 		wg           sync.WaitGroup
 		attachments  []truenas.DatasetAttachment

@@ -160,6 +160,7 @@ type ClientInterface interface {
 	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...NVMeoFSubsystemCreateOptions) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemDelete(ctx context.Context, id int) error
+	NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemFindByName(ctx context.Context, name string) (*NVMeoFSubsystem, error)

@@ -1213,7 +1213,9 @@ func (d *Driver) deleteDetectedOrphans(
 				continue
 			}
 			klog.Infof("Orphan reconcile: deleting managed snapshot %s through guarded DeleteSnapshot", orphan.ID)
-			if _, err := d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: orphan.ID}); err != nil {
+			// Orphan reaping is a delete, admitted to TrueNAS as one (see
+			// truenasAdmissionContext), not ahead of CSI deletes.
+			if _, err := d.DeleteSnapshot(truenas.WithPriority(ctx, truenas.PriorityDelete), &csi.DeleteSnapshotRequest{SnapshotId: orphan.ID}); err != nil {
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, err.Error())
 				continue
 			}
@@ -1243,7 +1245,7 @@ func (d *Driver) deleteDetectedOrphans(
 			continue
 		}
 		klog.Infof("Orphan reconcile: deleting managed volume %s through guarded DeleteVolume", orphan.ID)
-		if _, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: orphan.ID}); err != nil {
+		if _, err := d.DeleteVolume(truenas.WithPriority(ctx, truenas.PriorityDelete), &csi.DeleteVolumeRequest{VolumeId: orphan.ID}); err != nil {
 			d.recordReconcileSkip(report, "volume", orphan.ID, err.Error())
 			continue
 		}

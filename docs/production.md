@@ -584,6 +584,12 @@ Watch these series:
   connections;
 - `scale_csi_truenas_pending_calls` for current in-flight JSON-RPC depth across
   the pool; a sustained rise indicates backend latency or stalled callers;
+- `scale_csi_truenas_requests_waiting{class}` and
+  `scale_csi_truenas_request_admission_wait_seconds{class}` for calls queued for
+  one of the client's request slots, by operation class (`attach`, `default`,
+  `delete`). Attach is admitted first; a rising `attach` wait means TrueNAS
+  cannot keep up even with publishes first, while `delete` waiting is expected
+  under load;
 - `scale_csi_iscsi_sessions_total` and `scale_csi_nvme_sessions_total` for the
   sessions observed by node session garbage collection;
 - `scale_csi_node_connect_total` and

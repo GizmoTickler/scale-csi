@@ -485,6 +485,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			MaxConcurrentReqs:           cfg.Config.TrueNAS.MaxConcurrentRequests,
 			MetricsRecorder:             RecordTrueNASRequest,
 			PendingDepthRecorder:        SetTrueNASPendingCalls,
+			AdmissionMetrics:            TrueNASAdmissionMetrics(),
 			ReplicationJobAbortRecorder: RecordReplicationJobAborted,
 			CircuitBreaker:              cbConfig,
 			APIRetryMaxAttempts:         cfg.Config.Resilience.Retry.MaxAttempts,
@@ -758,6 +759,21 @@ func shutdownAuxServers(healthServer *HealthServer, debugServer *DebugServer) {
 	}
 }
 
+// truenasAdmissionContext tells the TrueNAS client how to order this RPC's
+// requests when they queue for a request slot: attach and detach first (a pod
+// is waiting), deletes last, and within a class the oldest RPC first, so a burst
+// completes in arrival order instead of all at once at the end.
+func truenasAdmissionContext(ctx context.Context, fullMethod string, start time.Time) context.Context {
+	ctx = truenas.WithOperationStart(ctx, start)
+	switch fullMethod {
+	case csi.Controller_ControllerPublishVolume_FullMethodName, csi.Controller_ControllerUnpublishVolume_FullMethodName:
+		return truenas.WithPriority(ctx, truenas.PriorityAttach)
+	case csi.Controller_DeleteVolume_FullMethodName, csi.Controller_DeleteSnapshot_FullMethodName:
+		return truenas.WithPriority(ctx, truenas.PriorityDelete)
+	}
+	return ctx
+}
+
 // logInterceptor is a gRPC interceptor for logging requests with request IDs and timing.
 func (d *Driver) logInterceptor(
 	ctx context.Context,
@@ -816,7 +832,7 @@ func (d *Driver) logInterceptor(
 	if d.strictStartupControllerRPCBlocked(info.FullMethod) {
 		err = status.Error(codes.Unavailable, "strict fencing startup reconciliation has not converged; retry this controller operation")
 	} else {
-		resp, err = handler(ctx, req)
+		resp, err = handler(truenasAdmissionContext(ctx, info.FullMethod, startTime), req)
 	}
 
 	// Calculate duration

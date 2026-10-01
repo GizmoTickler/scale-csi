@@ -149,6 +149,28 @@ var (
 		},
 	)
 
+	// TrueNAS request admission: how long requests queue for one of the
+	// client's request slots, and how many are waiting, by CSI operation class
+	// (attach, default, delete).
+	truenasAdmissionWait = regHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "truenas_request_admission_wait_seconds",
+			Help:      "Time TrueNAS API requests waited for a request slot, by operation class",
+			Buckets:   []float64{0.001, 0.01, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60},
+		},
+		[]string{"class"},
+	)
+
+	truenasRequestsWaiting = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "truenas_requests_waiting",
+			Help:      "TrueNAS API requests waiting for a request slot, by operation class",
+		},
+		[]string{"class"},
+	)
+
 	truenasPendingCalls = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -894,6 +916,19 @@ func SetTrueNASConnectionStatus(connected bool) {
 // SetTrueNASActiveConnections sets the number of active connections
 func SetTrueNASActiveConnections(count int) {
 	truenasConnectionsActive.Set(float64(count))
+}
+
+// TrueNASAdmissionMetrics feeds the TrueNAS client's request-slot queueing
+// into truenas_request_admission_wait_seconds and truenas_requests_waiting.
+func TrueNASAdmissionMetrics() truenas.AdmissionMetrics {
+	return truenas.AdmissionMetrics{
+		Waited: func(class string, seconds float64) {
+			truenasAdmissionWait.WithLabelValues(class).Observe(seconds)
+		},
+		Queued: func(class string, waiting int) {
+			truenasRequestsWaiting.WithLabelValues(class).Set(float64(waiting))
+		},
+	}
 }
 
 // SetTrueNASPendingCalls publishes the current in-flight TrueNAS request depth.

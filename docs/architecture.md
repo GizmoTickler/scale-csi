@@ -92,10 +92,14 @@ The controller does not use a single socket. It maintains a **pool of WebSocket
 connections** — sized by `truenas.maxConnections` (default 5, valid range 1..16;
 the pool is built once at client construction) — and multiplexes requests across
 them round-robin, so concurrent RPCs are not serialized behind one connection. On
-top of that, a **10-slot semaphore** — configurable via `truenas.maxConcurrentRequests`
-(default 10) — caps how many API calls are in flight at once, protecting TrueNAS
-from overload. (The node-only DaemonSet builds no management client at all; this
-pool exists only in controller mode.)
+top of that, **10 request slots** — configurable via `truenas.maxConcurrentRequests`
+(default 10) — cap how many API calls are in flight at once, protecting TrueNAS
+from overload. Calls waiting for a slot are admitted by the class of the CSI
+operation they belong to (publish and unpublish first, deletes last), then by
+how long ago that operation started, so a burst completes in arrival order and a
+node drain's re-attaches overtake provisioning and deletes; a delete that has
+waited 2 s moves up to the default class. (The node-only DaemonSet builds no
+management client at all; this pool exists only in controller mode.)
 
 Every backend call funnels through one resilience pipeline (`callRaw`):
 

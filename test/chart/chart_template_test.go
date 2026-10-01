@@ -1190,3 +1190,20 @@ func TestChartStartupConnectTimeoutFailsAtRenderPastInt32(t *testing.T) {
 		t.Fatalf("a representable timeout must still render its derived threshold")
 	}
 }
+
+// TestChartObserveBusyBeforeDeletePlumbing: zfs.observeBusyBeforeDelete is on
+// by default and rendered only when turned off, so the default configmap stays
+// byte-identical and an older binary (which does not know the key) still
+// strict-parses it.
+func TestChartObserveBusyBeforeDeletePlumbing(t *testing.T) {
+	for _, args := range [][]string{nil, {"--set", "zfs.observeBusyBeforeDelete=true"}} {
+		out := helmTemplate(t, append([]string{"--show-only", "templates/configmap.yaml"}, args...)...)
+		if strings.Contains(out, "observeBusyBeforeDelete") {
+			t.Errorf("%v: the configmap must not emit zfs.observeBusyBeforeDelete while it is on", args)
+		}
+	}
+	out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.observeBusyBeforeDelete=false")
+	if !strings.Contains(out, "      observeBusyBeforeDelete: false\n") {
+		t.Errorf("--set zfs.observeBusyBeforeDelete=false did not reach the rendered configmap; got:\n%s", out)
+	}
+}

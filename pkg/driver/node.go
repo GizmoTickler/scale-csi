@@ -148,13 +148,21 @@ func accessTypeAtPath(path string) (nodeAccessType, error) {
 	if err != nil {
 		return "", err
 	}
-	if info.Mode().IsRegular() {
+	return accessTypeForMode(path, info.Mode())
+}
+
+// accessTypeForMode classifies a publish target. A raw-block target is the
+// regular file kubelet creates, but once published the device node is bind
+// mounted over it and stat reports a block device: both are raw block, or
+// every replay of a live raw-block publication fails.
+func accessTypeForMode(path string, mode os.FileMode) (nodeAccessType, error) {
+	switch {
+	case mode.IsRegular(), mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0:
 		return nodeAccessBlock, nil
-	}
-	if info.IsDir() {
+	case mode.IsDir():
 		return nodeAccessMount, nil
 	}
-	return "", fmt.Errorf("path %s has unsupported type %s", path, info.Mode())
+	return "", fmt.Errorf("path %s has unsupported type %s", path, mode)
 }
 
 func (d *Driver) stageRecord(target string) (nodeMountRecord, bool) {
@@ -443,6 +451,18 @@ func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, 
 		return status.Errorf(codes.Internal, "failed to inspect existing publication mount: %v", err)
 	}
 	actualSource := normalizeMountSource(mountInfo.Source)
+	if capability.AccessType == nodeAccessBlock {
+		// The mount table shows a bound device node's source as devtmpfs
+		// ("udev[/nvme0n1]"), not the device: compare device numbers.
+		same, sameErr := sameBlockDevice(req.GetTargetPath(), expectedSource)
+		if sameErr != nil {
+			return status.Errorf(codes.Internal, "failed to inspect existing raw block publication: %v", sameErr)
+		}
+		if !same {
+			return status.Errorf(codes.AlreadyExists, "target path %s is not bound to the staged device %s", req.GetTargetPath(), expectedSource)
+		}
+		actualSource = normalizeMountSource(expectedSource)
+	}
 	if mountInfo.ReadOnly != req.GetReadonly() {
 		return status.Errorf(codes.AlreadyExists, "target path %s readonly state is %t, requested %t", req.GetTargetPath(), mountInfo.ReadOnly, req.GetReadonly())
 	}
@@ -462,6 +482,21 @@ func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, 
 		Readonly:       req.GetReadonly(),
 	})
 	return nil
+}
+
+// sameBlockDevice reports whether path (a raw-block publish target, the
+// device node bound over kubelet's placeholder) is the block device device.
+func sameBlockDevice(path, device string) (bool, error) {
+	pathMode, pathRdev, err := nodeStatsStat(path)
+	if err != nil {
+		return false, err
+	}
+	deviceMode, deviceRdev, err := nodeStatsStat(device)
+	if err != nil {
+		return false, err
+	}
+	isBlock := func(mode uint32) bool { return mode&unix.S_IFMT == unix.S_IFBLK }
+	return isBlock(pathMode) && isBlock(deviceMode) && pathRdev == deviceRdev, nil
 }
 
 func allowsMultiplePublicationTargets(mode csi.VolumeCapability_AccessMode_Mode) bool {
@@ -522,7 +557,18 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 		if mount.Target == req.GetTargetPath() || mount.Target == req.GetStagingTargetPath() || d.isKnownStageTarget(mount.Target) || !likelyCSIPublicationTarget(mount.Target) {
 			continue
 		}
-		if mountSourcesEqual(mount.Source, expectedSource) {
+		sameSource := mountSourcesEqual(mount.Source, expectedSource)
+		// A raw-block publication is a bind-mounted device node: the table
+		// shows it on devtmpfs ("udev[/sda]"), never as the staged device, so
+		// it is identified by its device number. Only devtmpfs entries are
+		// stat'ed: a stat of a hung network mount would hang this publish.
+		if !sameSource && capability.AccessType == nodeAccessBlock && mount.FSType == "devtmpfs" {
+			sameSource, err = sameBlockDevice(mount.Target, expectedSource)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to verify existing publication at %s: %v", mount.Target, err)
+			}
+		}
+		if sameSource {
 			if capability.AccessMode == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 				klog.Infof("NodePublishVolume: single-writer migration for volume %s is blocked by the still-mounted target %s; kubelet may still be tearing down the prior pod", req.GetVolumeId(), mount.Target)
 			}
@@ -534,8 +580,12 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 
 func (d *Driver) rememberPublication(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) {
 	liveSource := expectedSource
-	if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
-		liveSource = normalizeMountSource(mountInfo.Source)
+	// A raw-block publication is the staged device itself (its mount source
+	// is devtmpfs); validateExistingPublication compares it the same way.
+	if capability.AccessType != nodeAccessBlock {
+		if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
+			liveSource = normalizeMountSource(mountInfo.Source)
+		}
 	}
 	d.storePublicationRecord(nodeMountRecord{
 		VolumeID:       req.GetVolumeId(),
