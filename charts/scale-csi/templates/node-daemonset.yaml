@@ -1,4 +1,14 @@
 {{- if .Values.node.enabled }}
+{{- $rustNode := eq (.Values.node.implementation | default "go") "rust" }}
+{{- if $rustNode }}
+{{- $nvmeof := .Values.nvmeof | default dict }}
+{{- if or (.Values.nfs | default dict).enabled (.Values.iscsi | default dict).enabled }}
+{{- fail "node.implementation=rust serves NVMe-oF only so far: set nfs.enabled=false and iscsi.enabled=false, or use node.implementation=go" }}
+{{- end }}
+{{- if not (and $nvmeof.enabled (eq ($nvmeof.dataPath | default "kernel") "ublk")) }}
+{{- fail "node.implementation=rust serves the userspace NVMe-oF data path only so far: it needs nvmeof.enabled=true and nvmeof.dataPath=ublk" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -60,6 +70,9 @@ spec:
         - name: scale-csi
           image: {{ include "scale-csi.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if $rustNode }}
+          command: ["/usr/local/bin/scale-csi-node"]
+          {{- end }}
           args:
             - "-endpoint=unix://{{ include "scale-csi.socketPath" . }}"
             - "-node-id=$(NODE_ID)"

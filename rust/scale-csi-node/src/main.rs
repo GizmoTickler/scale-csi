@@ -110,6 +110,8 @@ async fn run() -> Result<()> {
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await
         .context("serve CSI")?;
+    // Operations whose RPC the caller already gave up on are still running.
+    state.wait_for_operations().await;
     Ok(())
 }
 

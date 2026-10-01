@@ -851,6 +851,10 @@
         "enabled": {
           "type": "boolean"
         },
+        "implementation": {
+          "type": "string",
+          "enum": ["go", "rust"]
+        },
         "priorityClassName": {
           "type": "string"
         },

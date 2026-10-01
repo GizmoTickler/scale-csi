@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, trace};
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use crate::config::Config;
@@ -55,6 +56,8 @@ pub struct State {
     pub ublk: Arc<dyn Daemon>,
     pub events: Arc<dyn Events>,
     pub host: Host,
+    /// Shared by each running volume operation; see run_to_completion.
+    pub operations: Arc<RwLock<()>>,
 }
 
 impl State {
@@ -80,6 +83,7 @@ impl State {
             ublk,
             events: Arc::new(LogEvents),
             host: Host::default(),
+            operations: Arc::default(),
         }
     }
 }
@@ -150,13 +154,30 @@ impl RpcLog {
 /// Runs a volume operation in its own task. tonic drops an RPC whose caller's
 /// deadline passes; the operation itself still runs to the end (its commands
 /// and daemon calls are bounded by that deadline) and releases its lock then,
-/// as the Go node's handler does, so nothing is abandoned halfway.
+/// as the Go node's handler does, so nothing is abandoned halfway. Each
+/// operation holds a share of `operations` until it ends, which is how
+/// shutdown waits for them.
 async fn run_to_completion<T: Send + 'static>(
+    operations: &Arc<RwLock<()>>,
     operation: impl Future<Output = Result<T, Status>> + Send + 'static,
 ) -> Result<T, Status> {
-    tokio::spawn(operation)
-        .await
-        .map_err(|e| Status::internal(format!("operation failed: {e}")))?
+    let running = operations.clone().read_owned().await;
+    tokio::spawn(async move {
+        let result = operation.await;
+        drop(running);
+        result
+    })
+    .await
+    .map_err(|e| Status::internal(format!("operation failed: {e}")))?
+}
+
+impl State {
+    /// Waits for every volume operation still running, including those whose
+    /// RPC was dropped at the caller's deadline (the Go node's GracefulStop
+    /// waits for its handlers the same way).
+    pub async fn wait_for_operations(&self) {
+        let _all = self.operations.write().await;
+    }
 }
 
 #[derive(Clone)]
@@ -250,7 +271,10 @@ impl Node for NodeService {
             format!("volumeID={} stagingPath={}", req.volume_id, req.staging_target_path),
             &body,
         );
-        let result = run_to_completion(async move { crate::stage::node_stage(&state, &req, deadline).await }).await;
+        let result = run_to_completion(&self.0.operations, async move {
+            crate::stage::node_stage(&state, &req, deadline).await
+        })
+        .await;
         log.end(&result);
         result?;
         Ok(Response::new(csi::NodeStageVolumeResponse {}))
@@ -269,7 +293,10 @@ impl Node for NodeService {
             format!("volumeID={} targetPath={}", req.volume_id, req.target_path),
             &body,
         );
-        let result = run_to_completion(async move { crate::publish::node_publish(&state, &req, deadline).await }).await;
+        let result = run_to_completion(&self.0.operations, async move {
+            crate::publish::node_publish(&state, &req, deadline).await
+        })
+        .await;
         log.end(&result);
         result?;
         Ok(Response::new(csi::NodePublishVolumeResponse {}))
@@ -283,8 +310,10 @@ impl Node for NodeService {
         let (state, req) = (self.0.clone(), request.into_inner());
         let body = req.clone();
         let log = RpcLog::begin("NodeUnpublishVolume", format!("volumeID={}", req.volume_id), &body);
-        let result =
-            run_to_completion(async move { crate::publish::node_unpublish(&state, &req, deadline).await }).await;
+        let result = run_to_completion(&self.0.operations, async move {
+            crate::publish::node_unpublish(&state, &req, deadline).await
+        })
+        .await;
         log.end(&result);
         result?;
         Ok(Response::new(csi::NodeUnpublishVolumeResponse {}))
@@ -298,9 +327,10 @@ impl Node for NodeService {
         let (state, req) = (self.0.clone(), request.into_inner());
         let body = req.clone();
         let log = RpcLog::begin("NodeGetVolumeStats", format!("volumeID={}", req.volume_id), &body);
-        let result =
-            run_to_completion(async move { crate::capacity::node_get_volume_stats(&state, &req, deadline).await })
-                .await;
+        let result = run_to_completion(&self.0.operations, async move {
+            crate::capacity::node_get_volume_stats(&state, &req, deadline).await
+        })
+        .await;
         log.end(&result);
         Ok(Response::new(result?))
     }
@@ -314,8 +344,10 @@ impl Node for NodeService {
         let mut body = req.clone();
         body.secrets.clear();
         let log = RpcLog::begin("NodeExpandVolume", format!("volumeID={}", req.volume_id), &body);
-        let result =
-            run_to_completion(async move { crate::capacity::node_expand_volume(&state, &req, deadline).await }).await;
+        let result = run_to_completion(&self.0.operations, async move {
+            crate::capacity::node_expand_volume(&state, &req, deadline).await
+        })
+        .await;
         log.end(&result);
         Ok(Response::new(result?))
     }
@@ -328,7 +360,10 @@ impl Node for NodeService {
         let (state, req) = (self.0.clone(), request.into_inner());
         let body = req.clone();
         let log = RpcLog::begin("NodeUnstageVolume", format!("volumeID={}", req.volume_id), &body);
-        let result = run_to_completion(async move { crate::stage::node_unstage(&state, &req, deadline).await }).await;
+        let result = run_to_completion(&self.0.operations, async move {
+            crate::stage::node_unstage(&state, &req, deadline).await
+        })
+        .await;
         log.end(&result);
         result?;
         Ok(Response::new(csi::NodeUnstageVolumeResponse {}))
@@ -375,13 +410,16 @@ mod tests {
     async fn an_operation_outlives_its_dropped_rpc() {
         let finished = Arc::new(AtomicUsize::new(0));
         let flag = finished.clone();
-        let rpc = run_to_completion(async move {
+        let operations = Arc::new(RwLock::new(()));
+        let rpc = run_to_completion(&operations, async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             flag.store(1, Ordering::SeqCst);
             Ok::<(), Status>(())
         });
         assert!(tokio::time::timeout(Duration::from_millis(10), rpc).await.is_err());
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "still running");
+        // Shutdown waits for it.
+        let _all = operations.write().await;
         assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 }
