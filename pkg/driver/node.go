@@ -148,13 +148,21 @@ func accessTypeAtPath(path string) (nodeAccessType, error) {
 	if err != nil {
 		return "", err
 	}
-	if info.Mode().IsRegular() {
+	return accessTypeForMode(path, info.Mode())
+}
+
+// accessTypeForMode classifies a publish target. A raw-block target is the
+// regular file kubelet creates, but once published the device node is bind
+// mounted over it and stat reports a block device: both are raw block, or
+// every replay of a live raw-block publication fails.
+func accessTypeForMode(path string, mode os.FileMode) (nodeAccessType, error) {
+	switch {
+	case mode.IsRegular(), mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0:
 		return nodeAccessBlock, nil
-	}
-	if info.IsDir() {
+	case mode.IsDir():
 		return nodeAccessMount, nil
 	}
-	return "", fmt.Errorf("path %s has unsupported type %s", path, info.Mode())
+	return "", fmt.Errorf("path %s has unsupported type %s", path, mode)
 }
 
 func (d *Driver) stageRecord(target string) (nodeMountRecord, bool) {
