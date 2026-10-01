@@ -571,6 +571,12 @@ func (d *Driver) Run() error {
 		addr = u.Host
 	}
 
+	// Decided once, before anything serves: a controller told to keep records
+	// in Kubernetes that cannot stops here.
+	if storeErr := d.selectPublicationStore(context.Background()); storeErr != nil {
+		return storeErr
+	}
+
 	// Create listener
 	listener, err := net.Listen(u.Scheme, addr)
 	if err != nil {
