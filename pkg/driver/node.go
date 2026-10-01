@@ -451,6 +451,18 @@ func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, 
 		return status.Errorf(codes.Internal, "failed to inspect existing publication mount: %v", err)
 	}
 	actualSource := normalizeMountSource(mountInfo.Source)
+	if capability.AccessType == nodeAccessBlock {
+		// The mount table shows a bound device node's source as devtmpfs
+		// ("udev[/nvme0n1]"), not the device: compare device numbers.
+		same, sameErr := sameBlockDevice(req.GetTargetPath(), expectedSource)
+		if sameErr != nil {
+			return status.Errorf(codes.Internal, "failed to inspect existing raw block publication: %v", sameErr)
+		}
+		if !same {
+			return status.Errorf(codes.AlreadyExists, "target path %s is not bound to the staged device %s", req.GetTargetPath(), expectedSource)
+		}
+		actualSource = normalizeMountSource(expectedSource)
+	}
 	if mountInfo.ReadOnly != req.GetReadonly() {
 		return status.Errorf(codes.AlreadyExists, "target path %s readonly state is %t, requested %t", req.GetTargetPath(), mountInfo.ReadOnly, req.GetReadonly())
 	}
@@ -470,6 +482,21 @@ func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, 
 		Readonly:       req.GetReadonly(),
 	})
 	return nil
+}
+
+// sameBlockDevice reports whether path (a raw-block publish target, the
+// device node bound over kubelet's placeholder) is the block device device.
+func sameBlockDevice(path, device string) (bool, error) {
+	pathMode, pathRdev, err := nodeStatsStat(path)
+	if err != nil {
+		return false, err
+	}
+	deviceMode, deviceRdev, err := nodeStatsStat(device)
+	if err != nil {
+		return false, err
+	}
+	isBlock := func(mode uint32) bool { return mode&unix.S_IFMT == unix.S_IFBLK }
+	return isBlock(pathMode) && isBlock(deviceMode) && pathRdev == deviceRdev, nil
 }
 
 func allowsMultiplePublicationTargets(mode csi.VolumeCapability_AccessMode_Mode) bool {
@@ -542,8 +569,12 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 
 func (d *Driver) rememberPublication(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) {
 	liveSource := expectedSource
-	if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
-		liveSource = normalizeMountSource(mountInfo.Source)
+	// A raw-block publication is the staged device itself (its mount source
+	// is devtmpfs); validateExistingPublication compares it the same way.
+	if capability.AccessType != nodeAccessBlock {
+		if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
+			liveSource = normalizeMountSource(mountInfo.Source)
+		}
 	}
 	d.storePublicationRecord(nodeMountRecord{
 		VolumeID:       req.GetVolumeId(),
