@@ -136,11 +136,19 @@ async fn serves_identity_and_node_info() {
             volume_id: "v".into(),
             ..Default::default()
         })
+        .await
+        .unwrap_err();
+    assert_eq!(stats.code(), tonic::Code::InvalidArgument, "{stats:?}");
+    let health = node
+        .node_get_volume_health(csi::NodeGetVolumeHealthRequest {
+            volume_id: "v".into(),
+            ..Default::default()
+        })
         .await;
     assert_eq!(
-        stats.unwrap_err().code(),
+        health.unwrap_err().code(),
         tonic::Code::Unimplemented,
-        "volume RPCs arrive with their protocol slices"
+        "the alpha health RPCs are not served, as in the Go node"
     );
 
     let ready = reqwest_get(port, "/readyz").await;
@@ -149,7 +157,8 @@ async fn serves_identity_and_node_info() {
     for line in [
         r#"scale_csi_operations_total{code="OK",operation="/csi.v1.Node/NodeGetInfo",status="success"} 1"#,
         r#"scale_csi_operations_total{code="InvalidArgument",operation="/csi.v1.Node/NodeStageVolume",status="error"} 1"#,
-        r#"scale_csi_operations_total{code="Unimplemented",operation="/csi.v1.Node/NodeGetVolumeStats",status="error"} 1"#,
+        r#"scale_csi_operations_total{code="InvalidArgument",operation="/csi.v1.Node/NodeGetVolumeStats",status="error"} 1"#,
+        r#"scale_csi_operations_total{code="Unimplemented",operation="/csi.v1.Node/NodeGetVolumeHealth",status="error"} 1"#,
         r#"scale_csi_operations_duration_seconds_count{operation="/csi.v1.Identity/Probe"} 1"#,
     ] {
         assert!(metrics.contains(line), "missing {line}\n{metrics}");

@@ -4,6 +4,7 @@
 
 pub mod args;
 pub mod capability;
+pub mod capacity;
 pub mod config;
 pub mod csi;
 pub mod discovery;
@@ -23,6 +24,8 @@ pub mod ublk_client;
 pub mod ublk_stage;
 pub mod ublk_state;
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod publish_tests;
 #[cfg(test)]

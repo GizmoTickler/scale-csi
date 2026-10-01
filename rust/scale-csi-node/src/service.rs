@@ -220,6 +220,29 @@ impl Node for NodeService {
         Ok(Response::new(csi::NodeUnpublishVolumeResponse {}))
     }
 
+    async fn node_get_volume_stats(
+        &self,
+        request: Request<csi::NodeGetVolumeStatsRequest>,
+    ) -> Result<Response<csi::NodeGetVolumeStatsResponse>, Status> {
+        let deadline = rpc_deadline(&request);
+        let (state, req) = (self.0.clone(), request.into_inner());
+        let response =
+            run_to_completion(async move { crate::capacity::node_get_volume_stats(&state, &req, deadline).await })
+                .await?;
+        Ok(Response::new(response))
+    }
+
+    async fn node_expand_volume(
+        &self,
+        request: Request<csi::NodeExpandVolumeRequest>,
+    ) -> Result<Response<csi::NodeExpandVolumeResponse>, Status> {
+        let deadline = rpc_deadline(&request);
+        let (state, req) = (self.0.clone(), request.into_inner());
+        let response =
+            run_to_completion(async move { crate::capacity::node_expand_volume(&state, &req, deadline).await }).await?;
+        Ok(Response::new(response))
+    }
+
     async fn node_unstage_volume(
         &self,
         request: Request<csi::NodeUnstageVolumeRequest>,

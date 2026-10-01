@@ -170,6 +170,7 @@ impl Runner for FakeHost {
                 host.sync_mountinfo();
                 output(0, "")
             }
+            ("resize2fs" | "xfs_growfs" | "btrfs", _) => output(0, ""),
             _ => output(127, ""),
         })
     }

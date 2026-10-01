@@ -382,6 +382,32 @@ impl Mounter {
         Ok(())
     }
 
+    /// Grows the filesystem mounted at `mount_path` to its device (Go
+    /// ResizeFilesystem): resize2fs on the device for ext*, xfs_growfs and
+    /// btrfs on the mount.
+    pub async fn resize_filesystem(&self, mount_path: &str, deadline: Option<Instant>) -> Result<()> {
+        info!("Resizing filesystem at {mount_path}");
+        let device = self
+            .mount_source(mount_path, deadline)
+            .await
+            .map_err(|e| e.context("failed to get device from mount point"))?;
+        let fs_type = self.filesystem_type(&device, deadline).await?;
+        let (program, args): (&str, Vec<&str>) = match fs_type.as_str() {
+            "ext4" | "ext3" | "ext2" => ("resize2fs", vec![device.as_str()]),
+            "xfs" => ("xfs_growfs", vec![mount_path]),
+            "btrfs" => ("btrfs", vec!["filesystem", "resize", "max", mount_path]),
+            other => bail!("resize not supported for filesystem type: {other}"),
+        };
+        let out = self
+            .runner
+            .run(program, &args, self.limits(self.timeouts.format, deadline))
+            .await?;
+        if !out.success() {
+            return Err(failure("resize failed", &out));
+        }
+        Ok(())
+    }
+
     pub async fn format_and_mount(
         &self,
         device: &str,
