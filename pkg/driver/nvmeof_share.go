@@ -23,8 +23,8 @@ func (b nvmeoFShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset
 	return b.d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false, res)
 }
 
-func (b nvmeoFShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
-	return b.d.createNVMeoFShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, nil, finalProperties)
+func (b nvmeoFShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string, res *fenceResolution) error {
+	return b.d.createNVMeoFShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, res, finalProperties)
 }
 
 func (b nvmeoFShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
@@ -35,20 +35,30 @@ func (b nvmeoFShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset,
 	return b.d.applyNVMeFence(ctx, ds, datasetName, enforceable, removing, ownedNVMeNQNs, uniqueSortedStrings(protectedNVMeNQNs), res)
 }
 
-func (b nvmeoFShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {
-	return b.d.nvmeofVolumeContext(ctx, ds, datasetName, volumeContext)
+func (b nvmeoFShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, res *fenceResolution) error {
+	return b.d.nvmeofVolumeContext(ctx, ds, datasetName, volumeContext, res)
 }
 
 // nvmeofVolumeContext resolves the NVMe-oF namespace/subsystem and populates
-// the publish context keys.
-func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {
-	namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
-	if err != nil {
-		return status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", err)
-	}
-	subsys, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
-	if err != nil || subsys == nil {
-		return status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem for %s: %v", datasetName, err)
+// the publish context keys. When res already holds a consistent pair (this
+// request created or resolved them) they are used as they are; anything less
+// is resolved from the backend exactly as before.
+func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, res *fenceResolution) error {
+	var namespace *truenas.NVMeoFNamespace
+	var subsys *truenas.NVMeoFSubsystem
+	if res != nil && res.nvmeNSLoaded && res.nvmeNamespace != nil && res.nvmeSubsystem != nil &&
+		res.nvmeNamespace.SubsystemID == res.nvmeSubsystem.ID {
+		namespace, subsys = res.nvmeNamespace, res.nvmeSubsystem
+	} else {
+		var err error
+		namespace, err = d.resolveNVMeNamespace(ctx, ds, datasetName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", err)
+		}
+		subsys, err = d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		if err != nil || subsys == nil {
+			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem for %s: %v", datasetName, err)
+		}
 	}
 	if namespace == nil || namespace.SubsystemID != subsys.ID {
 		return status.Errorf(codes.Internal, "NVMe-oF namespace for %s is missing or references a different subsystem", datasetName)
@@ -331,13 +341,22 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, ds *truenas.Dataset, dat
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
 	}
-	if err = d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
-		if !subsysWasExisting {
-			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-				klog.Warningf("Failed to cleanup NVMe-oF subsystem after host reconciliation failure: %v", delErr)
+	// A subsystem nvmet.subsys.create really made starts with exactly the
+	// allow_any_host value and host associations it was created with (strict:
+	// closed, none; otherwise the configured static hosts, which the create
+	// associated before returning), so reconciling it would rewrite
+	// allow_any_host to the value it has and list associations it cannot have
+	// yet. One that already existed, found above or adopted by name by the
+	// create, may carry anything and is reconciled.
+	if subsysWasExisting || subsys.Adopted {
+		if err = d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
+			if !subsysWasExisting {
+				if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+					klog.Warningf("Failed to cleanup NVMe-oF subsystem after host reconciliation failure: %v", delErr)
+				}
 			}
+			return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 		}
-		return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 	}
 
 	// Get or create the NVMe-oF TCP port(s) BEFORE creating namespace.

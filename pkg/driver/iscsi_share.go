@@ -25,7 +25,7 @@ func (b iscsiShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset,
 	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false, nil)
 }
 
-func (b iscsiShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
+func (b iscsiShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string, _ *fenceResolution) error {
 	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties)
 }
 
@@ -37,7 +37,7 @@ func (b iscsiShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, 
 	return b.d.applyISCSIFence(ctx, ds, datasetName, enforceable, hasDeferredActiveISCSI, res)
 }
 
-func (b iscsiShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {
+func (b iscsiShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, _ *fenceResolution) error {
 	return b.d.iscsiVolumeContext(ctx, ds, datasetName, volumeContext)
 }
 

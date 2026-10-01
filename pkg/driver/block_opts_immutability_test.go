@@ -415,7 +415,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 			"a source with no block history costs the one history read, whatever the class says")
 
 		nfs, nfsMethods := measure(t, "restore-nfs", "nfs", nil, nil)
-		assert.Equal(t, 10, nfs, "the NFS clone golden is untouched by any of this")
+		assert.Equal(t, 9, nfs, "the NFS clone golden is untouched by any of this")
 		assert.Zero(t, nfsMethods["ISCSIExtentFindByDisk"])
 	})
 }

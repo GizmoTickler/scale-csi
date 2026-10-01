@@ -1050,7 +1050,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
 	// result and the clone readiness path do not need another zvol poll.
-	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady, volumeProperties); shareErr != nil {
+	//
+	// A clone or copy reaching this point was made by this call:
+	// handleVolumeContentSource returns Aborted when the destination already
+	// existed. No share object can be named after it yet, so for NFS and
+	// NVMe-oF it is as fresh as a DatasetCreate result; there, freshlyCreated
+	// only skips the guaranteed-miss lookups, which on a clone first chase the
+	// share IDs it inherited from its SOURCE. iSCSI is excluded on purpose: it
+	// also reads freshlyCreated as "the zvol holds no data" when choosing the
+	// extent geometry, and a clone's data contradicts that.
+	shareFresh := freshlyCreated || (contentSource != nil && shareType != ShareTypeISCSI)
+	// One memo for this request: the share create records the objects it made
+	// and the volume context below reuses them instead of reading them back.
+	createRes := &fenceResolution{}
+	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, shareFresh, zvolReady, volumeProperties, createRes); shareErr != nil {
 		// (C12) Cleanup on failure. deleteShare MUST run before DatasetDelete,
 		// exactly like the property-write failure arm below: not every
 		// createShareWithOptions failure exit rolls back its own partial share
@@ -1108,7 +1121,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Get volume context for response
-	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
+	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType, createRes)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", err)
 	}
@@ -1578,7 +1591,10 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
 	// This handles the case where a previous CreateVolume created the dataset but failed
 	// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
-	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, nil); shareErr != nil {
+	// The ensure resolves (or rebuilds) the share objects once; the volume
+	// context below reuses them through this request's memo.
+	existingRes := &fenceResolution{}
+	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, existingRes); shareErr != nil {
 		return nil, shareErr
 	}
 
@@ -1588,7 +1604,7 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// than duplicating it.
 	d.ensureSnapshotTask(ctx, existingDS, datasetName, volumeID, vp.snapshotTask, req)
 
-	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
+	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType, existingRes)
 	if ctxErr != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 	}
@@ -4699,7 +4715,9 @@ func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds
 	return nil
 }
 
-func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) (map[string]string, error) {
+// res, when non-nil, carries the share objects this request already resolved
+// or created, so the context is built without reading them again.
+func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, res *fenceResolution) (map[string]string, error) {
 	volumeContext := map[string]string{
 		"node_attach_driver": shareType.String(),
 	}
@@ -4713,7 +4731,7 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 	}
 
 	if backend := backendForShareType(d, shareType); backend != nil {
-		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext); err != nil {
+		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext, res); err != nil {
 			return nil, err
 		}
 	}

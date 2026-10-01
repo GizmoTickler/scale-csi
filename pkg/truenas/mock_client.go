@@ -26,21 +26,21 @@ type MockClient struct {
 	setUserPropertiesCalls int
 
 	// Mock data
-	Datasets                map[string]*Dataset
-	Snapshots               map[string]*Snapshot
-	NFSShares               map[int]*NFSShare
-	ISCSITargets            map[int]*ISCSITarget
-	ISCSIExtents            map[int]*ISCSIExtent
-	TargetExtents           map[int]*ISCSITargetExtent
-	NVMeHosts               map[string]*NVMeoFHost
-	NVMeHostSubsystems      map[int]*NVMeoFHostSubsys
-	NVMeSubsystems          map[int]*NVMeoFSubsystem
-	NVMeNamespaces          map[int]*NVMeoFNamespace
+	Datasets           map[string]*Dataset
+	Snapshots          map[string]*Snapshot
+	NFSShares          map[int]*NFSShare
+	ISCSITargets       map[int]*ISCSITarget
+	ISCSIExtents       map[int]*ISCSIExtent
+	TargetExtents      map[int]*ISCSITargetExtent
+	NVMeHosts          map[string]*NVMeoFHost
+	NVMeHostSubsystems map[int]*NVMeoFHostSubsys
+	NVMeSubsystems     map[int]*NVMeoFSubsystem
+	NVMeNamespaces     map[int]*NVMeoFNamespace
 	// NVMePorts and NVMePortSubsystems make ports and port associations
 	// stateful: one port per transport address, and associations that a
 	// later listing returns, so a test sees a re-created association.
-	NVMePorts          map[string]*NVMeoFPort
-	NVMePortSubsystems map[int]*NVMeoFPortSubsys
+	NVMePorts               map[string]*NVMeoFPort
+	NVMePortSubsystems      map[int]*NVMeoFPortSubsys
 	ISCSIPortals            map[int]*ISCSIPortal
 	ISCSIInitiators         map[int]*ISCSIInitiator
 	ISCSIAuths              map[int]*ISCSIAuth

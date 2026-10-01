@@ -534,7 +534,7 @@ func TestGeometryAndWitnessAreFoldedIntoTheCallersMap(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, iscsiShareBackend{d}.CreateShare(
-		ctx, nil, "pool/parent/pvc-fatal-fold", "pvc-fatal-fold", true, true, finalProperties))
+		ctx, nil, "pool/parent/pvc-fatal-fold", "pvc-fatal-fold", true, true, finalProperties, nil))
 
 	assert.Equal(t, "512", finalProperties[PropBlockISCSIBlocksize],
 		"the geometry the extent really came out at must ride in the caller's fatal update")

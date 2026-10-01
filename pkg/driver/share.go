@@ -636,14 +636,14 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 // same map instead of a separate warning-only write; iSCSI folds its extent
 // witness and geometry into it and keeps its warning-only write too, which lands
 // before the debounced target reload. CreateVolume writes the map fatally.
-func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
+func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool, finalProperties map[string]string, res *fenceResolution) error {
 	klog.Infof("Creating %s share for dataset: %s (freshlyCreated=%v, zvolReady=%v)", shareType, datasetName, freshlyCreated, zvolReady)
 
 	backend := backendForShareType(d, shareType)
 	if backend == nil {
 		return status.Errorf(codes.InvalidArgument, "unsupported share type: %s", shareType)
 	}
-	return backend.CreateShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties)
+	return backend.CreateShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties, res)
 }
 
 // deleteShare deletes the share for a dataset.

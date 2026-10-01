@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -57,7 +59,9 @@ func newMultipathAPICallCountDriver(t *testing.T, client *apiCallCountingClient,
 // distinct storage addresses. Nothing else changes.
 func TestNVMeoFMultipathAPICallGolden(t *testing.T) {
 	const (
-		singlePathCalls = 11
+		// 11 until the volume context reused the namespace and subsystem the
+		// create had just made instead of reading both back.
+		singlePathCalls = 9
 		addressCount    = 4
 	)
 	// 4 addresses => 3 extra ports beyond the single-path baseline, each costing
@@ -126,7 +130,7 @@ func TestMultipathConvergesExistingVolumes(t *testing.T) {
 
 	// The publish context advertises exactly the addresses that were associated.
 	volumeContext := map[string]string{}
-	require.NoError(t, d.nvmeofVolumeContext(ctx, nil, "pool/parent/mp-existing", volumeContext))
+	require.NoError(t, d.nvmeofVolumeContext(ctx, nil, "pool/parent/mp-existing", volumeContext, nil))
 	var advertised []string
 	require.NoError(t, json.Unmarshal([]byte(volumeContext["addresses"]), &advertised))
 	assert.Equal(t, []string{"192.0.2.20", "192.0.2.21", "192.0.2.22", "192.0.2.23"}, advertised)
@@ -264,7 +268,7 @@ func TestMultipathDisabledAddsNoCallsOnEnsure(t *testing.T) {
 
 	// And no addresses key is advertised at all.
 	volumeContext := map[string]string{}
-	require.NoError(t, d.nvmeofVolumeContext(ctx, nil, "pool/parent/mp-off", volumeContext))
+	require.NoError(t, d.nvmeofVolumeContext(ctx, nil, "pool/parent/mp-off", volumeContext, nil))
 	_, hasAddresses := volumeContext["addresses"]
 	assert.False(t, hasAddresses, "the default publish context must carry no multipath addresses key")
 }
@@ -429,4 +433,60 @@ func TestPartialPortAssociationNeverForcesAnAdoptedSubsystemsNamespaceAway(t *te
 	require.NoError(t, err)
 	assert.Len(t, namespaces, 1, "the other install's namespace survives")
 	assert.Contains(t, base.NVMeSubsystems, other.ID, "and so does its subsystem")
+}
+
+// A clone this call made skips the share lookups, which would otherwise chase
+// the share IDs it inherited from its source. It must still get, and report,
+// a subsystem of its own.
+func TestNVMeoFCloneGetsItsOwnSubsystem(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
+	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	source, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("own-subsys-src", "nvmeof"))
+	require.NoError(t, err)
+	req := apiCallCountVolumeRequest("own-subsys-clone", "nvmeof")
+	req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+		Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "own-subsys-src"},
+	}}
+	clone, err := d.CreateVolume(ctx, req)
+	require.NoError(t, err)
+
+	cloneSubsystem, err := client.MockClient.NVMeoFSubsystemFindByName(ctx, d.nvmeSubsystemName("pool/parent/own-subsys-clone"))
+	require.NoError(t, err)
+	require.NotNil(t, cloneSubsystem)
+	assert.Equal(t, cloneSubsystem.NQN, clone.GetVolume().GetVolumeContext()["nqn"])
+	assert.NotEqual(t, source.GetVolume().GetVolumeContext()["nqn"], clone.GetVolume().GetVolumeContext()["nqn"])
+	ds, err := client.MockClient.DatasetGet(ctx, "pool/parent/own-subsys-clone")
+	require.NoError(t, err)
+	assert.Equal(t, strconv.Itoa(cloneSubsystem.ID), datasetUserProperty(ds, PropNVMeoFSubsystemID))
+	namespace, err := client.MockClient.NVMeoFNamespaceFindByDevicePath(ctx, "zvol/pool/parent/own-subsys-clone")
+	require.NoError(t, err)
+	require.NotNil(t, namespace)
+	assert.Equal(t, cloneSubsystem.ID, namespace.SubsystemID)
+}
+
+// The volume context uses a memoized pair only when it is consistent. A
+// namespace whose subsystem link the backend did not report is resolved again.
+func TestNVMeoFVolumeContextResolvesWhenMemoIsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeOff)
+	d.config.NVMeoF.SubsystemAllowAnyHost = true
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("memo-incomplete", "nvmeof"))
+	require.NoError(t, err)
+	ds, err := client.MockClient.DatasetGet(ctx, "pool/parent/memo-incomplete")
+	require.NoError(t, err)
+	subsystem, err := client.MockClient.NVMeoFSubsystemFindByName(ctx, d.nvmeSubsystemName("pool/parent/memo-incomplete"))
+	require.NoError(t, err)
+	res := &fenceResolution{}
+	res.storeNVMeObjects(&truenas.NVMeoFNamespace{ID: 99}, subsystem)
+	client.resetCalls()
+
+	volumeContext := map[string]string{}
+	require.NoError(t, d.nvmeofVolumeContext(ctx, ds, "pool/parent/memo-incomplete", volumeContext, res))
+	assert.Equal(t, subsystem.NQN, volumeContext["nqn"])
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["NVMeoFNamespaceGet"], "the incomplete memo is not trusted")
 }

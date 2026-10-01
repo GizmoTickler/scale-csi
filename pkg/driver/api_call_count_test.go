@@ -1207,13 +1207,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// keys, AND the ownership stamp into a single atomic pool.dataset.update (one
 		// ZFS txg — this removes the old content-source-vs-ownership crash window by
 		// making the two durable simultaneously rather than weakening it); marker
-		// retirement after that durable write; NFS share resolution + create; and a
+		// retirement after that durable write; the NFS share create; and a
 		// single post-share update that folds the share-ID stamp together with the
 		// managed/provision/name stamps. The remaining writes are separated by crash
-		// boundaries or are the protected marker mechanism, so 10 is the safe floor
+		// boundaries or are the protected marker mechanism, so 9 is the safe floor
 		// without weakening crash consistency. (Zvol clones still pay one bounded
-		// readiness get to confirm volsize; this NFS golden does not.)
-		{name: "CreateVolume clone from snapshot", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// readiness get to confirm volsize; this NFS golden does not.) Was 10 while
+		// the share create first looked up a share for a clone this call had just
+		// made; CreateVolume now treats such a clone as fresh, as it does a new
+		// dataset.
+		{name: "CreateVolume clone from snapshot", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
@@ -1241,14 +1244,15 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// the total is unchanged); a filesystem refquota update (ensureCloneCapacity);
 		// ONE content-source write that folds the content-source keys, the
 		// origin-snapshot key, AND the ownership stamp into a single atomic
-		// pool.dataset.update (L2a); marker retirement; NFS share resolution + create;
+		// pool.dataset.update (L2a); marker retirement; the NFS share create (12 since
+		// a clone this call made counts as fresh, so no share lookup precedes it);
 		// and the post-share managed/provision/name fold. The Sprint 3 fix made this
 		// fold response-verifying (ownership must be durable before the marker is
 		// retired) WITHOUT adding a call: verification reads the update RESPONSE, and
 		// the one-time post-connect paranoia re-read is already consumed by the marker
-		// write above, so the count stays 13 (the write simply moves from
+		// write above, so the count stayed 13 (the write simply moves from
 		// DatasetSetUserProperties to DatasetUpdate, both one high-level call).
-		{name: "CreateVolume clone from volume", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "CreateVolume clone from volume", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
@@ -2103,9 +2107,9 @@ func TestControllerSnapshotLookupGoldenAPICallCounts(t *testing.T) {
 	// with the delete pins above: a qualified content-source handle resolves the
 	// clone point via ONE targeted SnapshotList (SnapshotFindByName == 0), a
 	// legacy short handle keeps its ONE SnapshotFindByName scan (SnapshotList ==
-	// 0), and everything else about the ten-call restore is byte-identical (see
+	// 0), and everything else about the nine-call restore is byte-identical (see
 	// the "CreateVolume clone from snapshot" golden above for the per-call
-	// rationale of the shared ten). A regression looks like the two rows below
+	// rationale of the shared nine). A regression looks like the two rows below
 	// converging — either the scan leaking back into the qualified path or the
 	// targeted read being (uselessly) attempted for a datasetless handle.
 	t.Run("CreateVolume from snapshot", func(t *testing.T) {
@@ -2138,16 +2142,161 @@ func TestControllerSnapshotLookupGoldenAPICallCounts(t *testing.T) {
 					"DatasetUpdate":               2, // in-flight marker write; the merged refquota/content-source/ownership fold
 					"SnapshotClone":               1,
 					"DatasetRemoveUserProperties": 1, // marker retirement after the durable fold
-					"NFSShareFindByPath":          1, // share resolution
-					"NFSShareCreate":              1,
+					"NFSShareCreate":              1, // no lookup first: the clone is new
 					"DatasetSetUserProperties":    1, // post-share managed/provision/name + share-ID stamp
 				}
 				for method, count := range tc.resolution {
 					want[method] = count
 				}
-				assertAPICallCount(t, tc.name, client, 10)
+				assertAPICallCount(t, tc.name, client, 9)
 				assertAPICallMethodMap(t, tc.name, client, want)
 			})
 		}
 	})
+}
+
+// TestNVMeoFCreateAndCloneGoldenAPICallCounts pins strict NVMe-oF create and
+// clone, single path and multipath (four addresses). Before this golden the
+// counts were: create 13 (multipath 19), retry 5 (8), clone from snapshot 20
+// (26), clone from volume 21 (27). The calls that went:
+//   - NVMeoFSubsystemUpdateAllowAnyHost + NVMeoFHostSubsysListBySubsystem: the
+//     host reconcile of a subsystem the create had just made closed and empty.
+//     An ADOPTED subsystem (the name already existed) is still reconciled.
+//   - NVMeoFNamespaceGet + NVMeoFSubsystemGet: the volume context read back the
+//     objects the create had just made (on a retry: the ones the ensure had
+//     just resolved). It now reuses them from the request's memo.
+//   - On a clone, NVMeoFNamespaceGet + NamespaceFindByDevicePath +
+//     NVMeoFSubsystemGet + SubsystemFindByName: lookups that chased the share
+//     IDs the clone inherited from its source. A clone this call made counts as
+//     fresh, as a new dataset does.
+func TestNVMeoFCreateAndCloneGoldenAPICallCounts(t *testing.T) {
+	const addresses = 4
+	ports := func(multipath bool) int {
+		if multipath {
+			return addresses
+		}
+		return 1
+	}
+	// The shared tail of every create: the port(s), their associations, the
+	// subsystem, the namespace, and the one fatal property write that carries
+	// the share IDs with the managed/ownership stamps.
+	shareCreate := func(multipath bool) map[string]int {
+		return map[string]int{
+			"NVMeoFSubsystemCreate":    1,
+			"NVMeoFGetOrCreatePort":    ports(multipath),
+			"NVMeoFPortSubsysCreate":   ports(multipath),
+			"NVMeoFNamespaceCreate":    1,
+			"DatasetSetUserProperties": 1,
+		}
+	}
+	with := func(base map[string]int, extra map[string]int) map[string]int {
+		out := make(map[string]int, len(base)+len(extra))
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] += v
+		}
+		return out
+	}
+	total := func(m map[string]int) int {
+		n := 0
+		for _, v := range m {
+			n += v
+		}
+		return n
+	}
+	for _, multipath := range []bool{false, true} {
+		for _, tc := range []struct {
+			name string
+			want map[string]int
+			req  func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest
+		}{
+			{
+				// existence read; DatasetCreate; the ownership stamp and the
+				// one-time verifying re-read; the share; nothing read back.
+				name: "create",
+				want: with(shareCreate(multipath), map[string]int{"DatasetGet": 2, "DatasetCreate": 1, "DatasetUpdate": 1}),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					return apiCallCountVolumeRequest("golden-nvme-new", "nvmeof")
+				},
+			},
+			{
+				// A retry of a complete volume: the dataset, the namespace and
+				// subsystem the ensure resolves (reused for the context), and with
+				// multipath one port-association listing that finds them all.
+				name: "retry",
+				want: func() map[string]int {
+					m := map[string]int{"DatasetGet": 1, "NVMeoFNamespaceGet": 1, "NVMeoFSubsystemGet": 1}
+					if multipath {
+						m["NVMeoFGetOrCreatePort"] = addresses
+						m["NVMeoFPortSubsysListBySubsystem"] = 1
+					}
+					return m
+				}(),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					return apiCallCountVolumeRequest("golden-nvme-src", "nvmeof")
+				},
+			},
+			{
+				// existence read; the targeted snapshot read; the in-flight marker
+				// and the merged content-source/ownership write (DatasetUpdate x2);
+				// the clone; the bounded zvol readiness read; marker retirement.
+				name: "clone from snapshot",
+				want: with(shareCreate(multipath), map[string]int{
+					"DatasetGet": 2, "SnapshotList": 1, "DatasetUpdate": 2, "SnapshotClone": 1, "DatasetRemoveUserProperties": 1,
+				}),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					_, err := client.MockClient.SnapshotCreate(context.Background(), "pool/parent/golden-nvme-src", "clone-point", nil)
+					require.NoError(t, err)
+					req := apiCallCountVolumeRequest("golden-nvme-restored", "nvmeof")
+					req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+						Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "pool/parent/golden-nvme-src@clone-point"},
+					}}
+					return req
+				},
+			},
+			{
+				// as above, with the source-volume read and the temporary source
+				// snapshot instead of the snapshot lookup.
+				name: "clone from volume",
+				want: with(shareCreate(multipath), map[string]int{
+					"DatasetGet": 3, "SnapshotCreate": 1, "DatasetUpdate": 2, "SnapshotClone": 1, "DatasetRemoveUserProperties": 1,
+				}),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					req := apiCallCountVolumeRequest("golden-nvme-copied", "nvmeof")
+					req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+						Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "golden-nvme-src"},
+					}}
+					return req
+				},
+			},
+		} {
+			name := tc.name
+			if multipath {
+				name += " multipath"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				client := newAPICallCountingClient()
+				d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
+				if multipath {
+					d.config.NVMeoF.Multipath = true
+					d.config.NVMeoF.Addresses = []string{"192.0.2.21", "192.0.2.22", "192.0.2.23"}
+				}
+				_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+				require.NoError(t, err)
+				if tc.name != "create" {
+					_, err = d.CreateVolume(ctx, apiCallCountVolumeRequest("golden-nvme-src", "nvmeof"))
+					require.NoError(t, err)
+				}
+				req := tc.req(t, client)
+				client.resetCalls()
+				_, err = d.CreateVolume(ctx, req)
+				require.NoError(t, err)
+				assertAPICallCount(t, name, client, total(tc.want))
+				assertAPICallMethodMap(t, name, client, tc.want)
+			})
+		}
+	}
 }
