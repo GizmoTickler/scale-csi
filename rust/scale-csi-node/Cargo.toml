@@ -1,0 +1,35 @@
+[package]
+name = "scale-csi-node"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "scale-csi node agent: the CSI node service in Rust"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = "1.3"
+sha2 = "0.11"
+http = "1"
+prometheus = { version = "0.14", default-features = false }
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "process", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tower = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[build-dependencies]
+protox = "0.9"
+tonic-prost-build = "0.14"

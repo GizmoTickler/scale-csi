@@ -1,8 +1,39 @@
 {{- if .Values.node.enabled }}
+{{- $implementation := .Values.node.implementation | default "go" }}
+{{- $rustNodes := .Values.node.rustNodes | default list }}
+{{- if and $rustNodes (eq $implementation "rust") }}
+{{- fail "node.rustNodes canaries the Rust agent on some nodes of a Go cluster: leave it empty with node.implementation=rust" }}
+{{- end }}
+{{- if and $rustNodes .Values.node.affinity }}
+{{- fail "node.rustNodes sets the node plugins' node affinity: leave node.affinity empty with it" }}
+{{- end }}
+{{- if or (eq $implementation "rust") $rustNodes }}
+{{- $nvmeof := .Values.nvmeof | default dict }}
+{{- if or (.Values.nfs | default dict).enabled (.Values.iscsi | default dict).enabled }}
+{{- fail "the Rust node agent (node.implementation=rust or node.rustNodes) serves NVMe-oF only so far: set nfs.enabled=false and iscsi.enabled=false" }}
+{{- end }}
+{{- if not $nvmeof.enabled }}
+{{- fail "the Rust node agent (node.implementation=rust or node.rustNodes) serves NVMe-oF only so far: it needs nvmeof.enabled=true" }}
+{{- end }}
+{{- end }}
+{{- /* The DaemonSet of node.implementation, and with node.rustNodes a second
+     one running the Rust agent on just those nodes (the first then avoids
+     them). Both keep component=node, so the metrics Service and monitor see
+     every node plugin; the Rust one selects its own pods by one more label. */}}
+{{- $flavors := list (dict "rust" (eq $implementation "rust") "suffix" "" "canary" false) }}
+{{- if $rustNodes }}
+{{- $flavors = append $flavors (dict "rust" true "suffix" "-rust" "canary" true) }}
+{{- end }}
+{{- range $index, $flavor := $flavors }}
+{{- $rustNode := $flavor.rust }}
+{{- with $ }}
+{{- if $index }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "scale-csi.fullname" . }}-node
+  name: {{ include "scale-csi.fullname" . }}-node{{ $flavor.suffix }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "scale-csi.labels" . | nindent 4 }}
@@ -19,10 +50,16 @@ spec:
   selector:
     matchLabels:
       {{- include "scale-csi.nodeSelectorLabels" . | nindent 6 }}
+      {{- if $flavor.canary }}
+      scale-csi.io/node-implementation: rust
+      {{- end }}
   template:
     metadata:
       labels:
         {{- include "scale-csi.nodeSelectorLabels" . | nindent 8 }}
+        {{- if $flavor.canary }}
+        scale-csi.io/node-implementation: rust
+        {{- end }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
@@ -51,15 +88,30 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if $rustNodes }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: {{ ternary "In" "NotIn" $flavor.canary }}
+                    values:
+                      {{- toYaml $rustNodes | nindent 22 }}
+      {{- else }}
       {{- with .Values.node.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- end }}
       containers:
         # CSI Driver
         - name: scale-csi
           image: {{ include "scale-csi.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if $rustNode }}
+          command: ["/usr/local/bin/scale-csi-node"]
+          {{- end }}
           args:
             - "-endpoint=unix://{{ include "scale-csi.socketPath" . }}"
             - "-node-id=$(NODE_ID)"
@@ -257,4 +309,6 @@ spec:
         {{- with .Values.node.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

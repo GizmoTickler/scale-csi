@@ -25,3 +25,7 @@ contrib/
 # Build artifacts
 *.tar.gz
 *.zip
+
+# Cargo build output
+rust/*/target/
+experimental/nvmeublk/target/
