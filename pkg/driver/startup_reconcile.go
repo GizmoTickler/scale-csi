@@ -306,7 +306,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	if err != nil {
 		return fmt.Errorf("read attached volume %s: %w", volume.volumeID, err)
 	}
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := d.publications().records(ctx, datasetName, dataset)
 	if err != nil {
 		return fmt.Errorf("read publication records for attached volume %s: %w", volume.volumeID, err)
 	}
@@ -400,7 +400,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	}
 	for key := range desired {
 		record := desired[key]
-		if err := storePublicationRecord(ctx, d.truenasClient, dataset, datasetName, key, record); err != nil {
+		if err := d.publications().store(ctx, datasetName, dataset, key, record); err != nil {
 			return fmt.Errorf("persist startup attachment for volume %s: %w", volume.volumeID, err)
 		}
 		d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, key))

@@ -1014,7 +1014,7 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 	if err != nil {
 		return ds, records, status.Errorf(codes.Internal, "re-read dataset after stale publication takeover: %v", err)
 	}
-	freshRecords, err := publicationRecordsFromDataset(freshDS)
+	freshRecords, err := d.publications().records(ctx, datasetName, freshDS)
 	if err != nil {
 		return ds, records, status.Errorf(codes.Internal, "re-read publication records after stale publication takeover: %v", err)
 	}
@@ -1049,7 +1049,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 			return err
 		}
 	}
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := d.publications().records(ctx, datasetName, ds)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to read durable publication records: %v", err)
 	}
@@ -1111,7 +1111,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 		// stale-record sweep is watching is rewritten as before, so a revoke that
 		// detected it sees a new generation and backs off.
 		record = previous
-	} else if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {
+	} else if err := d.publications().store(ctx, datasetName, ds, key, record); err != nil {
 		return status.Errorf(codes.Internal, "failed to store publication identity: %v", err)
 	}
 	d.stalePublicationRecordsSeen.Delete(observationKey)
@@ -1132,7 +1132,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 }
 
 func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, nodeID string, res *fenceResolution) error {
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := d.publications().records(ctx, datasetName, ds)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to read durable publication records: %v", err)
 	}
@@ -1165,7 +1165,7 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 		record := records[key]
 		record.State = publicationStateRemoving
 		record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {
+		if err := d.publications().store(ctx, datasetName, ds, key, record); err != nil {
 			return status.Errorf(codes.Internal, "failed to store unpublish tombstone: %v", err)
 		}
 		records[key] = record
@@ -1177,7 +1177,7 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 			return status.Errorf(codes.Internal, "failed to remove backend publication fence: %v", err)
 		}
 	}
-	if err := removePublicationRecords(ctx, d.truenasClient, ds, datasetName, keys); err != nil {
+	if err := d.publications().remove(ctx, datasetName, ds, keys); err != nil {
 		return status.Errorf(codes.Internal, "failed to remove durable publication records: %v", err)
 	}
 	return nil

@@ -157,7 +157,7 @@ func (d *Driver) reconcileStalePublicationRecords(
 			}
 			recordSource = sourceBearingDataset
 		}
-		records, parseErr := publicationRecordsFromDataset(recordSource)
+		records, parseErr := d.publications().records(ctx, recordSource.Name, recordSource)
 		if parseErr != nil {
 			d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name, parseErr)
 			continue
@@ -242,7 +242,7 @@ func (d *Driver) revokeStalePublicationRecord(
 	if err != nil {
 		return false, fmt.Errorf("fresh dataset read: %w", err)
 	}
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := d.publications().records(ctx, datasetName, dataset)
 	if err != nil {
 		return false, fmt.Errorf("fresh publication record read: %w", err)
 	}

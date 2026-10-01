@@ -310,7 +310,9 @@ type Driver struct {
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
 	stalePublicationRecordsSeen sync.Map
-	fencingDeferredLogs         sync.Map
+	// publicationStore holds publication records; nil means the ZFS store.
+	publicationStore    publicationStore
+	fencingDeferredLogs sync.Map
 
 	// Track when orphaned sessions were first seen (for grace period). The
 	// protocol maps must remain independent: a cleanup pass may only retire
