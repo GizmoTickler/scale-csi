@@ -528,6 +528,11 @@ func (c *apiCallCountingClient) NVMeoFSubsystemDelete(ctx context.Context, id in
 	return c.MockClient.NVMeoFSubsystemDelete(ctx, id)
 }
 
+func (c *apiCallCountingClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	c.record("NVMeoFSubsystemDeleteCascade")
+	return c.MockClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
 func (c *apiCallCountingClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*truenas.NVMeoFSubsystem, error) {
 	c.record("NVMeoFSubsystemGet")
 	return c.MockClient.NVMeoFSubsystemGet(ctx, id)

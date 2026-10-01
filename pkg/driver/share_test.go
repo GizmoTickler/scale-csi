@@ -98,6 +98,14 @@ func (m *shareVerificationErrorMock) NVMeoFNamespaceGet(context.Context, int) (*
 	return nil, m.err
 }
 
+func (m *ErrorInjectingMockClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	m.CleanupCalls = append(m.CleanupCalls, fmt.Sprintf("NVMeoFSubsystemDeleteCascade(%d)", id))
+	if m.InjectNVMeoFSubsystemDeleteError != nil {
+		return m.InjectNVMeoFSubsystemDeleteError
+	}
+	return m.MockClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
 type nvmeReconcileFailureMock struct {
 	*truenas.MockClient
 	deletedSubsystemIDs []int
@@ -557,6 +565,9 @@ func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mockClient.DatasetSetUserProperty(context.Background(), datasetName, PropNVMeoFSubsystemID, "1"))
 	mockClient.NVMeSubsystems[1] = &truenas.NVMeoFSubsystem{ID: 1, Name: "test-nvme-assoc-cache"}
+	// The subsystem also serves another namespace, so the delete takes the
+	// per-object path this test measures instead of the forced cascade.
+	mockClient.NVMeNamespaces[99] = &truenas.NVMeoFNamespace{ID: 99, SubsystemID: 1, DevicePath: "zvol/tank/k8s/volumes/another"}
 
 	err = d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName)
 	require.Error(t, err)

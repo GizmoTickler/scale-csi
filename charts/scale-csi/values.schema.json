@@ -1020,6 +1020,10 @@
         "destroyForeignSnapshotsOnDelete": {
           "type": "boolean"
         },
+        "observeBusyBeforeDelete": {
+          "type": "boolean",
+          "default": true
+        },
         "holdCsiSnapshots": {
           "type": "boolean",
           "default": false

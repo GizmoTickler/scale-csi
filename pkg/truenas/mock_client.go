@@ -2854,6 +2854,23 @@ func (m *MockClient) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 	}
 	return nil
 }
+func (m *MockClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.NVMeSubsystems, id)
+	for namespaceID, namespace := range m.NVMeNamespaces {
+		if namespace.SubsystemID == id {
+			delete(m.NVMeNamespaces, namespaceID)
+		}
+	}
+	for associationID, association := range m.NVMeHostSubsystems {
+		if association.SubsysID == id {
+			delete(m.NVMeHostSubsystems, associationID)
+		}
+	}
+	return nil
+}
 func (m *MockClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

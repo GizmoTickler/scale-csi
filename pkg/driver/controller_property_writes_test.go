@@ -269,3 +269,99 @@ func TestNVMeoFCreateRollsBackTheShareWhenTheFinalWriteFails(t *testing.T) {
 	_, err = client.DatasetGet(ctx, "pool/parent/rolled-back")
 	assert.Error(t, err, "the dataset is deleted too")
 }
+
+// deleteCountingClient counts the NVMe-oF delete calls of a share delete.
+type deleteCountingClient struct {
+	*truenas.MockClient
+	calls map[string]int
+}
+
+func (c *deleteCountingClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	c.calls["subsys.delete(force)"]++
+	return c.MockClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
+func (c *deleteCountingClient) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
+	c.calls["subsys.delete"]++
+	return c.MockClient.NVMeoFSubsystemDelete(ctx, id)
+}
+
+func (c *deleteCountingClient) NVMeoFNamespaceDelete(ctx context.Context, id int) error {
+	c.calls["namespace.delete"]++
+	return c.MockClient.NVMeoFNamespaceDelete(ctx, id)
+}
+
+func (c *deleteCountingClient) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
+	c.calls["port_subsys.delete"]++
+	return c.MockClient.NVMeoFPortSubsysDelete(ctx, id)
+}
+
+// A volume's NVMe-oF share is deleted with one forced subsystem delete (TrueNAS
+// removes the namespace and the port and host associations with it), unless the
+// subsystem also serves another namespace: then nothing is forced and the other
+// namespace survives.
+func TestNVMeoFShareDeleteIsOneForcedSubsystemDeleteWhenTheSubsystemIsTheVolumes(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Driver, *deleteCountingClient, string) {
+		t.Helper()
+		client := &deleteCountingClient{MockClient: truenas.NewMockClient(), calls: map[string]int{}}
+		d := newMultipathAPICallCountDriver(t, newAPICallCountingClient(), []string{"192.0.2.21", "192.0.2.22", "192.0.2.23"})
+		d.truenasClient = client
+		mustCreateParentDataset(t, client.MockClient)
+		resp, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("deleted", "nvmeof"))
+		require.NoError(t, err)
+		return d, client, "pool/parent/" + resp.GetVolume().GetVolumeId()
+	}
+
+	t.Run("the volume's own subsystem", func(t *testing.T) {
+		d, client, datasetName := setup(t)
+		require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
+		assert.Equal(t, map[string]int{"subsys.delete(force)": 1}, client.calls)
+		subsystems, namespaces, _ := nvmeObjectCounts(t, client.MockClient)
+		assert.Zero(t, subsystems)
+		assert.Zero(t, namespaces)
+	})
+
+	t.Run("a subsystem that also serves another namespace", func(t *testing.T) {
+		d, client, datasetName := setup(t)
+		subsystems, err := client.NVMeoFSubsystemList(ctx)
+		require.NoError(t, err)
+		require.Len(t, subsystems, 1)
+		other, err := client.NVMeoFNamespaceCreate(ctx, subsystems[0].ID, "zvol/pool/parent/another", "ZVOL")
+		require.NoError(t, err)
+		_ = d.deleteNVMeoFShareForDataset(ctx, nil, datasetName)
+		assert.Zero(t, client.calls["subsys.delete(force)"], "never forced")
+		assert.Equal(t, 1, client.calls["namespace.delete"], "only this volume's namespace")
+		_, err = client.NVMeoFNamespaceGet(ctx, other.ID)
+		assert.NoError(t, err, "the other namespace survives")
+	})
+}
+
+// zfs.observeBusyBeforeDelete=false skips the two observation-only scans that
+// otherwise precede every dataset delete; absent, they run.
+func TestBusyObservationBeforeDeleteCanBeTurnedOff(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		setting *bool
+		want    int
+	}{
+		{"default", nil, 1},
+		{"on", ptrTo(true), 1},
+		{"off", ptrTo(false), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newAPICallCountingClient()
+			d := newMultipathAPICallCountDriver(t, client, nil)
+			d.config.ZFS.ObserveBusyBeforeDelete = tc.setting
+			resp, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("observed", "nvmeof"))
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: resp.GetVolume().GetVolumeId()})
+			require.NoError(t, err)
+			_, methods := client.callSnapshot()
+			assert.Equal(t, tc.want, methods["DatasetAttachments"])
+			assert.Equal(t, tc.want, methods["DatasetProcesses"])
+		})
+	}
+}

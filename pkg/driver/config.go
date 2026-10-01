@@ -215,6 +215,13 @@ type ZFSConfig struct {
 	// snapshots that were not created by the CSI driver (default: false)
 	DestroyForeignSnapshotsOnDelete bool `yaml:"destroyForeignSnapshotsOnDelete"`
 
+	// ObserveBusyBeforeDelete runs the observation-only pool.dataset.attachments
+	// and pool.dataset.processes scans before every dataset delete (default:
+	// true). They never block the delete, which is forced, so they are the only
+	// record that something still used the dataset; false saves their TrueNAS
+	// middleware time (together about 0.7 s) on every delete.
+	ObserveBusyBeforeDelete *bool `yaml:"observeBusyBeforeDelete"`
+
 	// HoldCSISnapshots places a deletion-proof ZFS hold (the fixed `truenas` tag)
 	// on every CSI VolumeSnapshot at create so foreign actors — a box-wide
 	// periodic-snapshot task's pruning, an admin, replication retention — cannot
@@ -1028,6 +1035,12 @@ func (c NVMeoFConfig) ublkAvailable() bool {
 // node, whatever its protocol or data path, so it errs towards fewer volumes.
 // An install that only lets classes opt in advertises nothing: most of its
 // volumes do not count against the daemon.
+// observeBusyBeforeDelete reports whether dataset deletes first run the busy
+// observation scans (zfs.observeBusyBeforeDelete, default true).
+func (c *Config) observeBusyBeforeDelete() bool {
+	return c == nil || c.ZFS.ObserveBusyBeforeDelete == nil || *c.ZFS.ObserveBusyBeforeDelete
+}
+
 func (c *Config) nodeVolumeLimit() int64 {
 	if c.Node.MaxVolumesPerNode > 0 {
 		return c.Node.MaxVolumesPerNode

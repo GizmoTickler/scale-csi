@@ -443,6 +443,39 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	if err != nil {
 		return err
 	}
+	// One volume, one subsystem: when the subsystem holds no namespace but this
+	// volume's, a single forced delete removes it with its namespace and its port
+	// and host associations (one nvmet change instead of one per object, each
+	// of which TrueNAS applies serially). A subsystem that also serves another
+	// namespace is never force-deleted; it takes the per-object path below, as
+	// before.
+	if subsystem != nil {
+		held, listErr := d.truenasClient.NVMeoFNamespaceListBySubsystem(ctx, subsystem.ID)
+		if listErr != nil {
+			return fmt.Errorf("failed to list NVMe-oF namespaces of subsystem %d: %w", subsystem.ID, listErr)
+		}
+		onlyThisVolume := true
+		for _, other := range held {
+			if namespace == nil || other.ID != namespace.ID {
+				onlyThisVolume = false
+				break
+			}
+		}
+		if onlyThisVolume {
+			if deleteErr := d.truenasClient.NVMeoFSubsystemDeleteCascade(ctx, subsystem.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+				return fmt.Errorf("NVMe-oF cleanup errors for %s: subsystem %d: %w", datasetName, subsystem.ID, deleteErr)
+			}
+			// A namespace resolved to another subsystem is not covered by the cascade.
+			if namespace != nil && namespace.SubsystemID != 0 && namespace.SubsystemID != subsystem.ID {
+				if deleteErr := d.truenasClient.NVMeoFNamespaceDelete(ctx, namespace.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+					return fmt.Errorf("NVMe-oF cleanup errors for %s: namespace %d: %w", datasetName, namespace.ID, deleteErr)
+				}
+			}
+			klog.Infof("Deleted NVMe-oF resources for %s", datasetName)
+			return nil
+		}
+	}
+
 	var portAssociations []*truenas.NVMeoFPortSubsys
 	if subsystem != nil {
 		allAssociations, listErr := d.truenasClient.NVMeoFPortSubsysList(ctx)
