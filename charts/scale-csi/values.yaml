@@ -217,6 +217,12 @@ node:
   # rust together with NFS or iSCSI.
   implementation: go
 
+  # A canary of the Rust agent in a Go cluster: node names (kubernetes.io/
+  # hostname) that run it in a second DaemonSet, <fullname>-node-rust, while
+  # the Go DaemonSet avoids them. The same NVMe-oF-only rule applies. Leave
+  # node.affinity empty with it. Empty: one DaemonSet on every node.
+  rustNodes: []
+
   # Priority class for node pods
   priorityClassName: system-node-critical
 

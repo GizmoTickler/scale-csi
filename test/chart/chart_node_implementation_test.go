@@ -1,6 +1,7 @@
 package chart
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -81,4 +82,80 @@ func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 	if out := helmTemplateExpectError(t, "--set", "node.implementation=python"); !strings.Contains(out, "implementation") {
 		t.Errorf("the schema must refuse an unknown implementation:\n%s", out)
 	}
+}
+
+// nodeDaemonSets returns the rendered node plugin DaemonSets by name.
+func nodeDaemonSets(t *testing.T, rendered string) map[string]manifest {
+	t.Helper()
+	out := map[string]manifest{}
+	for _, m := range decodeManifests(t, rendered) {
+		meta, _ := asManifest(m["metadata"])
+		name, _ := meta["name"].(string)
+		if m["kind"] == "DaemonSet" && (strings.HasSuffix(name, "-node") || strings.HasSuffix(name, "-node-rust")) {
+			out[name] = m
+		}
+	}
+	return out
+}
+
+// node.rustNodes canaries the Rust agent: a second DaemonSet on just those
+// nodes, which the Go DaemonSet avoids; the two never select each other's
+// pods' scheduling, and nvmeublkd keeps running everywhere.
+func TestChartNodeRustNodesCanariesTheAgent(t *testing.T) {
+	rendered := helmTemplate(t, withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}")...)
+	sets := nodeDaemonSets(t, rendered)
+	goSet, rustSet := sets["scale-csi-node"], sets["scale-csi-node-rust"]
+	if goSet == nil || rustSet == nil || len(sets) != 2 {
+		t.Fatalf("want the Go and the Rust node DaemonSets, got %v", reflect.ValueOf(sets).MapKeys())
+	}
+	affinity := func(m manifest) string {
+		spec := podSpecOf(t, m, "node DaemonSet")
+		node, _ := asManifest(spec["affinity"])
+		return renderJSON(t, node)
+	}
+	if got := affinity(goSet); !strings.Contains(got, `"NotIn"`) || !strings.Contains(got, `"k8s-2"`) {
+		t.Errorf("the Go DaemonSet must avoid the canary node: %s", got)
+	}
+	if got := affinity(rustSet); !strings.Contains(got, `"In"`) || !strings.Contains(got, `"k8s-2"`) {
+		t.Errorf("the Rust DaemonSet must run only on the canary node: %s", got)
+	}
+	rustContainer, _ := namedEntry(t, podSpecOf(t, rustSet, "rust node DaemonSet")["containers"], "scale-csi")
+	if got, want := rustContainer["command"], []any{"/usr/local/bin/scale-csi-node"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("rust command = %v, want %v", got, want)
+	}
+	goContainer, _ := namedEntry(t, podSpecOf(t, goSet, "node DaemonSet")["containers"], "scale-csi")
+	if _, set := goContainer["command"]; set {
+		t.Error("the Go DaemonSet keeps the image's entrypoint")
+	}
+	if !strings.Contains(renderJSON(t, rustSet["spec"]), `"scale-csi.io/node-implementation":"rust"`) {
+		t.Error("the Rust DaemonSet selects its pods by the implementation label")
+	}
+	if strings.Contains(renderJSON(t, goSet["spec"]), "node-implementation") {
+		t.Error("the Go DaemonSet's selector is unchanged (it is immutable)")
+	}
+	for _, m := range decodeManifests(t, rendered) {
+		meta, _ := asManifest(m["metadata"])
+		if name, _ := meta["name"].(string); m["kind"] == "DaemonSet" && strings.HasSuffix(name, "-nvmeublkd") {
+			if _, set := podSpecOf(t, m, "nvmeublkd")["affinity"]; set {
+				t.Error("nvmeublkd keeps running on every node, the canary node included")
+			}
+		}
+	}
+
+	for name, args := range map[string][]string{
+		"with node.implementation=rust": withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.implementation=rust"),
+		"with node.affinity":            withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.affinity.podAntiAffinity.x=y"),
+		"with NFS":                      withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "nfs.enabled=true"),
+	} {
+		t.Run("refused "+name, func(t *testing.T) { helmTemplateExpectError(t, args...) })
+	}
+}
+
+func renderJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
