@@ -28,6 +28,17 @@ func (d *Driver) startPublicationImport() {
 	if !ok {
 		return
 	}
+	// The pass is a background writer, so it needs the single controller that
+	// fencing guarantees (one replica, Recreate). With fencing off the chart
+	// allows two replicas and rolling updates, and a second process's pass,
+	// working from a dataset read before another process unpublished a node,
+	// would bring that node's record back. There, records move on each
+	// volume's next publish or unpublish, which only the attacher's leader
+	// receives.
+	if d.config == nil || d.config.Fencing.Mode == FencingModeOff || d.config.Fencing.Mode == "" {
+		klog.Info("Publication records: no background import with fencing off; records move on each volume's next write")
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	// Stop() takes the same lock and sets the terminal flag first, so a Stop()
 	// that wins the race keeps the loop from ever starting (the C7 pattern of

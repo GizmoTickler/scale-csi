@@ -114,28 +114,35 @@ func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.D
 	}
 }
 
-// mergeStaleSweeps overlays current's records on legacy's, per dataset and
-// key. The brake weighs both counts: a record caught in both stores by a crash
-// counts twice, which only makes the brake engage sooner.
+// mergeStaleSweeps resolves each dataset's ZFS and Kubernetes records as every
+// read does (resolvePublicationRecords), so the record a revoke re-reads under
+// the lock is the one the sweep classified. The brake weighs both counts: a
+// record caught in both stores by a crash counts twice, which only makes the
+// brake engage sooner.
 func mergeStaleSweeps(legacy, current staleSweep) staleSweep {
-	byName := make(map[string]map[string]publicationRecord, len(legacy.candidates)+len(current.candidates))
+	legacyBy := make(map[string]map[string]publicationRecord, len(legacy.candidates))
+	currentBy := make(map[string]map[string]publicationRecord, len(current.candidates))
 	order := make([]string, 0, len(legacy.candidates)+len(current.candidates))
-	for _, sweep := range []staleSweep{legacy, current} {
+	for _, sweep := range []struct {
+		candidates []staleSweepCandidate
+		into       map[string]map[string]publicationRecord
+	}{{legacy.candidates, legacyBy}, {current.candidates, currentBy}} {
 		for _, candidate := range sweep.candidates {
-			records, seen := byName[candidate.datasetName]
-			if !seen {
-				records = make(map[string]publicationRecord, len(candidate.records))
-				byName[candidate.datasetName] = records
-				order = append(order, candidate.datasetName)
+			if _, seen := legacyBy[candidate.datasetName]; !seen {
+				if _, seen := currentBy[candidate.datasetName]; !seen {
+					order = append(order, candidate.datasetName)
+				}
 			}
-			for key := range candidate.records {
-				records[key] = candidate.records[key]
-			}
+			sweep.into[candidate.datasetName] = candidate.records
 		}
 	}
 	merged := staleSweep{candidates: make([]staleSweepCandidate, 0, len(order)), recordCount: legacy.recordCount + current.recordCount}
 	for _, name := range order {
-		merged.candidates = append(merged.candidates, staleSweepCandidate{datasetName: name, records: byName[name]})
+		records := resolvePublicationRecords(legacyBy[name], currentBy[name])
+		if records == nil {
+			records = map[string]publicationRecord{}
+		}
+		merged.candidates = append(merged.candidates, staleSweepCandidate{datasetName: name, records: records})
 	}
 	return merged
 }
@@ -223,12 +230,26 @@ func (d *Driver) kubernetesStaleSweepCandidates(ctx context.Context, store kuber
 	}
 	sort.Strings(names)
 	candidates := make([]staleSweepCandidate, 0, len(names))
+	missing := make([]string, 0)
 	for _, name := range names {
 		if _, ok := listed[name]; ok {
 			candidates = append(candidates, staleSweepCandidate{datasetName: name, records: all[name]})
 			continue
 		}
-		d.forgetPublicationsOfDeletedDataset(ctx, store, name)
+		missing = append(missing, name)
+	}
+	// DeleteVolume removes a volume's records itself, so a dataset missing
+	// here is a leak of one interrupted delete. Many at once, or an empty
+	// listing, is the shape of a pool not yet imported (each dataset then
+	// reads NotFound too), not of deletes: leave them for a later pass.
+	if len(missing) > 0 && (len(listed) == 0 || len(missing) > max(staleRecordMassAbsenceThreshold, len(listed)/10)) {
+		RecordFencingStaleDeferred()
+		klog.Warningf("Stale fencing record reconcile: %d datasets with publication records are missing from a listing of %d; not forgetting them this pass",
+			len(missing), len(listed))
+	} else {
+		for _, name := range missing {
+			d.forgetPublicationsOfDeletedDataset(ctx, store, name)
+		}
 	}
 	return staleSweep{candidates: candidates, recordCount: listing.objects}
 }

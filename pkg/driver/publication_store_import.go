@@ -63,9 +63,10 @@ func (s importingPublicationStore) records(ctx context.Context, datasetName stri
 //
 //   - When the newest ZFS record is newer than every VolumePublication, a
 //     release that keeps records on ZFS has run since this one last wrote the
-//     volume (a rollback, then this release again): ZFS alone is the record.
-//     That release removed from ZFS whatever it unpublished, so a
-//     VolumePublication it never saw must not survive.
+//     volume (a rollback, then this release again): ZFS decides. That release
+//     removed from ZFS whatever it unpublished, so a published
+//     VolumePublication it never saw must not survive; an "unpublishing" one
+//     for a node ZFS does not name is kept, since it can only revoke.
 //   - Otherwise the two merge per key, the newer copy winning and Kubernetes
 //     on a tie: ZFS records not yet imported, and after a crash between a
 //     Kubernetes write and the ZFS removal, the Kubernetes copy.
@@ -73,8 +74,23 @@ func resolvePublicationRecords(legacy, current map[string]publicationRecord) map
 	if len(legacy) == 0 {
 		return current
 	}
-	if len(current) == 0 || newestPublicationRecord(legacy).After(newestPublicationRecord(current)) {
+	if len(current) == 0 {
 		return legacy
+	}
+	if newestPublicationRecord(legacy).After(newestPublicationRecord(current)) {
+		// A tombstone this release wrote is kept unless ZFS names the node:
+		// it can only lead to a revoke, and it holds the identity a pending
+		// revoke needs.
+		out := make(map[string]publicationRecord, len(legacy))
+		for key := range legacy {
+			out[key] = legacy[key]
+		}
+		for key := range current {
+			if _, named := out[key]; !named && current[key].State == publicationStateRemoving {
+				out[key] = current[key]
+			}
+		}
+		return out
 	}
 	out := make(map[string]publicationRecord, len(legacy)+len(current))
 	for key := range legacy {

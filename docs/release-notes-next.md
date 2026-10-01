@@ -19,10 +19,14 @@ namespace. A publish or unpublish writes no dataset property any more.
   them with dataset, node and state.
 - **Moving the existing records.** Records already on ZFS keep working. A
   volume's first publish or unpublish after the upgrade moves its records into
-  Kubernetes and removes them from the dataset (one dataset update, once). A
-  background pass a minute after the start moves the rest, one volume every
-  half second at the lowest priority, and repeats every 10 minutes until none
-  are left. A clone's inherited records are never moved.
+  Kubernetes and removes them from the dataset (one dataset update, once). With
+  fencing on, where the controller is a single replica, a background pass a
+  minute after the start moves the rest, one volume every half second at the
+  lowest priority, and repeats every 10 minutes until none are left. With
+  fencing off, where two replicas may run, there is no background pass: two
+  processes could otherwise undo each other's removals. Records move on each
+  volume's next publish or unpublish instead, and until then are read from ZFS
+  as before. A clone's inherited records are never moved.
 - **Reads.** ListVolumes and ControllerGetVolume, which the external-attacher
   calls every minute, read a watch-fed cache, not the API. DeleteVolume removes
   the volume's objects.
@@ -54,8 +58,8 @@ namespace. A publish or unpublish writes no dataset property any more.
   (`kubectl delete vpub -n <namespace> --all`). An upgrade after a rollback
   resolves each volume's records by age, so ZFS records written by v1.15.0 win;
   but a volume v1.15.0 unpublished from every node leaves no trace on ZFS, and
-  its old VolumePublication would come back until the stale-record sweep removes
-  it.
+  its old VolumePublication would come back. With fencing on, the stale-record
+  sweep removes it after its grace period; with fencing off nothing does.
 
 ## v1.15.0 — the Rust node agent, opt-in
 
