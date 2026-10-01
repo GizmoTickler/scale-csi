@@ -1,0 +1,90 @@
+# A publication record: volume dataset D is published to node N with this
+# identity. The controller writes one per (dataset, node) in its own
+# namespace, before granting the node access and until access is revoked.
+# Helm installs crds/ but never upgrades it: with Flux, set
+# install.crds and upgrade.crds to CreateReplace (see the chart README).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: volumepublications.scale-csi.io
+spec:
+  group: scale-csi.io
+  scope: Namespaced
+  names:
+    kind: VolumePublication
+    listKind: VolumePublicationList
+    plural: volumepublications
+    singular: volumepublication
+    shortNames: ["vpub"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Dataset
+          type: string
+          jsonPath: .spec.dataset
+        - name: Node
+          type: string
+          jsonPath: .spec.node
+        - name: State
+          type: string
+          jsonPath: .spec.state
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: ["version", "dataset", "node", "state"]
+              properties:
+                version:
+                  type: integer
+                  description: Record format version.
+                dataset:
+                  type: string
+                  minLength: 1
+                  description: The volume's dataset, which the fence acts on.
+                node:
+                  type: string
+                  minLength: 1
+                  description: The node's name.
+                nodeID:
+                  type: string
+                  description: The node id the container orchestrator reported.
+                nvmeNQN:
+                  type: string
+                iscsiIQN:
+                  type: string
+                ips:
+                  type: array
+                  items:
+                    type: string
+                state:
+                  type: string
+                  enum: ["published", "unpublishing"]
+                accessMode:
+                  type: integer
+                  format: int32
+                readonly:
+                  type: boolean
+                updatedAt:
+                  type: string
+                csiAddedNFSHosts:
+                  type: array
+                  items:
+                    type: string
+                csiAddedNVMeNQNs:
+                  type: array
+                  items:
+                    type: string
