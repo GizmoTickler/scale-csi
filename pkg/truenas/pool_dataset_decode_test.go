@@ -74,6 +74,20 @@ func TestPoolDatasetRowMatchesParseDataset(t *testing.T) {
 	}
 }
 
+// A decoded dataset keeps only itself alive: the wrapper's raw user-property
+// map and resource-query property block are dropped once copied.
+func TestTypedDatasetDropsRawWrapperFields(t *testing.T) {
+	var raw []*rawDataset
+	require.NoError(t, json.Unmarshal(readTypedFixture(t, "dataset-resource-26.0.json"), &raw))
+	datasets := rawDatasetsToDatasets(raw, true)
+	require.NotEmpty(t, datasets)
+	for _, wrapper := range raw {
+		assert.Nil(t, wrapper.RawUserProperties)
+		assert.Nil(t, wrapper.Properties)
+	}
+	assert.NotEmpty(t, datasets[0].UserProperties)
+}
+
 // DatasetGet, DatasetGetByNames and DatasetUpdate no longer build an
 // interface{} tree per reply: a one-row read was about 640 allocations.
 func TestDatasetReadsUseTheTypedDecoder(t *testing.T) {

@@ -267,6 +267,13 @@ func (dataset *rawDataset) toDataset(resourceQuery bool) *Dataset {
 		}
 	}
 	result.LegacyCSIProperties = normalizeCSIUserProperties(result.UserProperties)
+	// result points into this wrapper, so drop what only the decode needed:
+	// the raw user-property map (copied into UserProperties above) and the
+	// resource-query property block. A Dataset held in a cache or a request
+	// then keeps only itself alive, not a second copy of its properties.
+	dataset.RawUserProperties = nil
+	dataset.Properties = nil
+	dataset.Path = ""
 	return result
 }
 

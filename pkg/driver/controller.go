@@ -2358,7 +2358,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		requestedLimit = 100
 	}
 
-	page, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
+	names, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
@@ -2369,10 +2369,6 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	// materialization that made the old filtered listing O(system size), and
 	// unlike the zfs.resource.query listing it carries the encryption fields
 	// (P-11) and user-property sources the entries below are built from.
-	names := make([]string, 0, len(page))
-	for _, ds := range page {
-		names = append(names, ds.Name)
-	}
 	hydrated := make(map[string]*truenas.Dataset, len(names))
 	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
 		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
@@ -2386,9 +2382,9 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		}
 	}
 
-	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(page))
-	for _, listed := range page {
-		ds, ok := hydrated[listed.Name]
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(names))
+	for _, name := range names {
+		ds, ok := hydrated[name]
 		if !ok {
 			// Deleted between the walk's frozen listing and this page's
 			// hydration: skip the entry rather than report a gone volume.
@@ -2424,7 +2420,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	// hydration misses above do not affect page math.
 	nextToken := ""
 	if hasMore {
-		nextToken = strconv.Itoa(offset + len(page))
+		nextToken = strconv.Itoa(offset + len(names))
 	}
 
 	return &csi.ListVolumesResponse{
@@ -2441,8 +2437,10 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 // always refetches regardless of TTL.
 const volumeListPageCacheTTL = 30 * time.Second
 
-// managedDatasetsForListPage returns one page of the parent's managed datasets
-// for ListVolumes, plus whether more pages remain in the frozen view. A fresh
+// managedDatasetsForListPage returns the names of one page of the parent's
+// managed datasets for ListVolumes, plus whether more pages remain in the
+// frozen view. The page is hydrated by name, so the frozen view keeps only the
+// sorted names, not the listing's decoded datasets, for its TTL. A fresh
 // walk (empty starting token) fetches the full managed set once via
 // listAllManagedDatasets (path-scoped zfs.resource.query, paged
 // pool.dataset.query fallback — both filtered to PropManagedResource=="true"),
@@ -2453,13 +2451,13 @@ const volumeListPageCacheTTL = 30 * time.Second
 // any walk populated the cache, e.g. across a controller restart) refetches —
 // offset tokens remain valid against the refreshed set exactly as they were
 // against the old per-page reads.
-func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) ([]*truenas.Dataset, bool, error) {
+func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []string, hasMore bool, err error) {
 	if !freshWalk {
 		d.volumePageCacheMu.Lock()
 		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
 			cached := d.volumePageCache
 			d.volumePageCacheMu.Unlock()
-			page, hasMore := sliceVolumeListPage(cached, limit, offset)
+			page, hasMore = sliceVolumeListPage(cached, limit, offset)
 			return page, hasMore, nil
 		}
 		d.volumePageCacheMu.Unlock()
@@ -2470,30 +2468,34 @@ func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool,
 	}
 	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
 	// pool.dataset.query fallback guarantees one.
-	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+	names := make([]string, len(all))
+	for i, dataset := range all {
+		names[i] = dataset.Name
+	}
+	sort.Strings(names)
 	d.volumePageCacheMu.Lock()
-	d.volumePageCache = all
+	d.volumePageCache = names
 	d.volumePageCacheTime = time.Now()
 	d.volumePageCacheMu.Unlock()
-	page, hasMore := sliceVolumeListPage(all, limit, offset)
+	page, hasMore = sliceVolumeListPage(names, limit, offset)
 	return page, hasMore, nil
 }
 
 // sliceVolumeListPage slices one offset/limit page out of the frozen listing.
 // Because the full set length is known, hasMore is exact — no lookahead row and
 // no trailing empty page, matching the old fetchLimit=limit+1 token semantics.
-func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page []*truenas.Dataset, hasMore bool) {
+func sliceVolumeListPage(names []string, limit, offset int) (page []string, hasMore bool) {
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= len(datasets) {
+	if offset >= len(names) {
 		return nil, false
 	}
-	end := len(datasets)
+	end := len(names)
 	if limit > 0 && offset+limit < end {
 		end = offset + limit
 	}
-	return datasets[offset:end], end < len(datasets)
+	return names[offset:end], end < len(names)
 }
 
 // publishedNodeIDs derives a ListVolumes entry's PublishedNodeIds

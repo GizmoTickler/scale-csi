@@ -153,7 +153,7 @@ type Driver struct {
 	// starting token always refetches, and no delete/authorization decision
 	// ever reads it.
 	volumePageCacheMu   sync.Mutex
-	volumePageCache     []*truenas.Dataset
+	volumePageCache     []string // sorted dataset names of the walk's frozen listing
 	volumePageCacheTime time.Time
 
 	// Ready flag (atomic for safe concurrent access)
@@ -846,7 +846,10 @@ func (d *Driver) logInterceptor(
 
 	// Log a cloned request with any CSI secrets structurally removed. The
 	// original request is left untouched for the RPC handler.
-	klog.V(5).Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
+	// Guarded: the clone is built only when V(5) is on, not on every RPC.
+	if requestLog := klog.V(5); requestLog.Enabled() {
+		requestLog.Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
+	}
 
 	// Kubernetes Pod readiness does not stop CSI sidecars in the same Pod from
 	// using the Unix socket. During strict startup convergence, enforce the gate
