@@ -359,15 +359,16 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, ds *truenas.Dataset, dat
 	portSubsysIDs, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, addresses, false)
 	if assocErr != nil {
 		// Cleanup subsystem on port/association failure - the volume would be
-		// unusable without a port. Deleting the subsystem also reaps every
-		// association already created for it, which is why no explicit
-		// association rollback runs here: a partial loop leaves associations
-		// only when the subsystem PRE-EXISTED, and in that case some of the
-		// collected IDs may be associations this call merely adopted (the
-		// create is already-exists-tolerant), so deleting them would tear down
-		// working paths. The loop is idempotent, so a retry converges.
+		// unusable without a port. A partial loop leaves the associations it
+		// made, and TrueNAS refuses a plain delete of a subsystem still
+		// visible on a port, so a subsystem this call created is deleted with
+		// force, which reaps them with it. No explicit association rollback
+		// runs for a subsystem that PRE-EXISTED: some of the collected IDs may
+		// be associations this call merely adopted (the create is
+		// already-exists-tolerant), so deleting them would tear down working
+		// paths. The loop is idempotent, so a retry converges.
 		if !subsysWasExisting {
-			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+			if delErr := d.truenasClient.NVMeoFSubsystemDeleteCascade(ctx, subsys.ID); delErr != nil {
 				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
 			}
 		}
