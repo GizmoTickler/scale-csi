@@ -15,6 +15,7 @@ pub mod locks;
 pub mod metrics;
 pub mod mount;
 pub mod node_id;
+pub mod nvme;
 pub mod nvme_addresses;
 pub mod publish;
 pub mod records;

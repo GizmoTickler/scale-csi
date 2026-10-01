@@ -34,6 +34,17 @@ impl Runner for HostRunner {
     }
 }
 
+/// Runs host commands with `LC_ALL=C`, for tools whose output text is matched
+/// (nvme, iscsiadm).
+pub struct CLocaleRunner;
+
+#[tonic::async_trait]
+impl Runner for CLocaleRunner {
+    async fn run(&self, program: &str, args: &[&str], limits: Limits) -> std::io::Result<Output> {
+        exec::run(program, args, limits, true).await
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub mount: Duration,
