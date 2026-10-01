@@ -90,13 +90,14 @@ pub fn event_namespace(object: &ObjectRef) -> &str {
 }
 
 /// client-go's GenerateEventName: the object's name and the time in hex
-/// nanoseconds; where that is longer than a name may be, client-go takes a
-/// UUID, the node a hash of it (64 hex digits).
+/// nanoseconds; where that is not a valid object name (too long, or the
+/// object's name has characters a name may not, like a static PV's volume
+/// handle), client-go takes a UUID, the node a hash of it (64 hex digits).
 pub fn event_name(object: &ObjectRef, at: SystemTime) -> String {
     use sha2::{Digest, Sha256};
     let nanos = at.duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
     let name = format!("{}.{:x}", object.name(), nanos);
-    if name.len() <= MAX_NAME_LENGTH {
+    if name.len() <= MAX_NAME_LENGTH && crate::kube_api::is_dns1123_subdomain(&name) {
         return name;
     }
     Sha256::digest(name.as_bytes())

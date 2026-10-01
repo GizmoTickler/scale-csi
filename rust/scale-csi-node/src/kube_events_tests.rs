@@ -592,8 +592,26 @@ async fn serve(tls: &TestTls) -> (u16, Arc<Mutex<Vec<Seen>>>) {
                     }
                     let body = String::from_utf8(buf[end..end + length].to_vec()).unwrap();
                     buf.drain(..end + length);
-                    let gone = head.lines().next().unwrap().contains("/gone ");
+                    let line = head.lines().next().unwrap().to_string();
+                    let gone = line.contains("/gone ");
                     kept.lock().unwrap().push(Seen { connection, head, body });
+                    if line.contains("/namespaces/huge/") {
+                        // A broken server: an error whose chunked body never ends.
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n")
+                            .await;
+                        let mut chunk = b"10000\r\n".to_vec();
+                        chunk.extend(std::iter::repeat_n(b'x', 0x10000));
+                        chunk.extend_from_slice(b"\r\n");
+                        while stream.write_all(&chunk).await.is_ok() {}
+                        return;
+                    }
+                    if line.contains("/namespaces/exists/") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+                            .await;
+                        continue;
+                    }
                     let answer: &[u8] = if gone {
                         b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
                     } else {
@@ -721,4 +739,92 @@ fn the_correlator_remembers_a_bounded_number_of_events() {
     assert!(matches!(correlator.plan(&newest).unwrap().op, Op::Patch { .. }));
     let oldest = event(0, later);
     assert!(matches!(correlator.plan(&oldest).unwrap().op, Op::Create(_)));
+}
+
+/// A response body past the bound ends the request at once and drops the
+/// connection, instead of buffering until the timeout (a broken server or
+/// proxy could otherwise grow the agent past its memory limit).
+#[tokio::test]
+async fn a_response_body_past_the_bound_is_not_buffered() {
+    let tls = TestTls::new();
+    let (port, seen) = serve(&tls).await;
+    let dir = sa_dir(true, Some(&tls.ca_pem));
+    let client = Client::new(
+        InCluster::from_env(dir.path(), Some("127.0.0.1".into()), Some(port.to_string()))
+            .unwrap()
+            .unwrap(),
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(client.create("huge", b"{}".to_vec()).await, Err(ApiError::Status(500)));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    client.create("apps", b"{}".to_vec()).await.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_ne!(
+        seen[0].connection, seen[1].connection,
+        "a failed answer's connection is not reused"
+    );
+}
+
+/// AlreadyExists on a create is done: an earlier attempt was committed.
+#[tokio::test]
+async fn a_create_that_already_exists_is_done() {
+    let tls = TestTls::new();
+    let (port, _) = serve(&tls).await;
+    let dir = sa_dir(true, Some(&tls.ca_pem));
+    let client = Client::new(
+        InCluster::from_env(dir.path(), Some("127.0.0.1".into()), Some(port.to_string()))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(client.create("exists", b"{}".to_vec()).await, Ok(()));
+}
+
+/// A namespace or name that is not a valid object name is never spliced into
+/// a request path.
+#[tokio::test]
+async fn invalid_path_segments_are_not_sent() {
+    let tls = TestTls::new();
+    let (port, seen) = serve(&tls).await;
+    let dir = sa_dir(true, Some(&tls.ca_pem));
+    let client = Client::new(
+        InCluster::from_env(dir.path(), Some("127.0.0.1".into()), Some(port.to_string()))
+            .unwrap()
+            .unwrap(),
+    );
+    for namespace in ["../../apis/foo", "Apps", "a/b", ""] {
+        assert!(
+            matches!(
+                client.create(namespace, b"{}".to_vec()).await,
+                Err(ApiError::Invalid(_))
+            ),
+            "{namespace}"
+        );
+    }
+    for name in ["x?dryRun=All", "../y", "a#frag", "Upper.1"] {
+        assert!(
+            matches!(
+                client.patch("default", name, b"{}".to_vec()).await,
+                Err(ApiError::Invalid(_))
+            ),
+            "{name}"
+        );
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// An event on an object whose name is not a valid object name (a static PV
+/// whose volume handle is a dataset path) gets a valid hashed name.
+#[test]
+fn an_event_on_an_oddly_named_object_gets_a_valid_name() {
+    for object in [pv("Pool/ds/x"), pv("PVC_Upper")] {
+        let name = kube_events::event_name(&object, at(1_700_000_000, 5));
+        assert!(crate::kube_api::is_dns1123_subdomain(&name), "{name}");
+        assert_eq!(name.len(), 64, "{name}");
+    }
+    let plain = kube_events::event_name(&pv("pvc-1"), at(1_700_000_000, 5));
+    assert!(plain.starts_with("pvc-1."), "{plain}");
 }

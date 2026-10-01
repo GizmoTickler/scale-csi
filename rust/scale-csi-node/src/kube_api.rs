@@ -27,6 +27,11 @@ pub const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceacc
 /// How long one API request may take, connect included.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most of a response body the client reads. An Event write's answer is a
+/// few KiB; anything larger (a broken server or proxy streaming without end)
+/// ends the request instead of growing the agent's memory.
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Why an API write failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
@@ -36,6 +41,9 @@ pub enum ApiError {
     Status(u16),
     /// No answer: connect, TLS, timeout, or a broken connection.
     Transport(String),
+    /// Not sent: a namespace or name that is not a valid object name, which
+    /// the API would refuse and must not be spliced into a request path.
+    Invalid(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -44,6 +52,7 @@ impl std::fmt::Display for ApiError {
             ApiError::NotFound => write!(f, "not found"),
             ApiError::Status(code) => write!(f, "HTTP {code}"),
             ApiError::Transport(e) => write!(f, "{e}"),
+            ApiError::Invalid(e) => write!(f, "{e}"),
         }
     }
 }
@@ -213,10 +222,16 @@ impl Client {
                 Err(e) => return Err(e),
             };
             let status = response.status();
-            // Read the body to the end so the connection can be reused.
-            let read = response.into_body().collect().await;
+            // Read a bounded body to the end so the connection can be reused;
+            // a body over the bound, or a failed read, drops the connection.
+            let read = http_body_util::Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
+                .collect()
+                .await;
             if read.is_ok() {
                 *conn = Some(sender);
+            }
+            if let (Err(e), true) = (&read, status.is_success()) {
+                return Err(ApiError::Transport(format!("response body: {e}")));
             }
             return match status.as_u16() {
                 200..=299 => Ok(()),
@@ -229,16 +244,29 @@ impl Client {
 
 impl EventApi for Client {
     async fn create(&self, namespace: &str, event: Vec<u8>) -> Result<(), ApiError> {
+        check_namespace(namespace)?;
         let path = format!("/api/v1/namespaces/{namespace}/events");
-        tokio::time::timeout(
+        let created = tokio::time::timeout(
             REQUEST_TIMEOUT,
             self.request(http::Method::POST, &path, "application/json", event),
         )
         .await
-        .unwrap_or_else(|_| Err(ApiError::Transport("timed out".into())))
+        .unwrap_or_else(|_| Err(ApiError::Transport("timed out".into())));
+        match created {
+            // AlreadyExists: an earlier attempt on a connection that then
+            // failed was committed, as client-go treats it.
+            Err(ApiError::Status(409)) => Ok(()),
+            other => other,
+        }
     }
 
     async fn patch(&self, namespace: &str, name: &str, patch: Vec<u8>) -> Result<(), ApiError> {
+        check_namespace(namespace)?;
+        if !is_dns1123_subdomain(name) {
+            return Err(ApiError::Invalid(format!(
+                "event name {name:?} is not a valid object name"
+            )));
+        }
         let path = format!("/api/v1/namespaces/{namespace}/events/{name}");
         tokio::time::timeout(
             REQUEST_TIMEOUT,
@@ -252,4 +280,43 @@ impl EventApi for Client {
         .await
         .unwrap_or_else(|_| Err(ApiError::Transport("timed out".into())))
     }
+}
+
+fn check_namespace(namespace: &str) -> Result<(), ApiError> {
+    if is_dns1123_label(namespace) {
+        Ok(())
+    } else {
+        Err(ApiError::Invalid(format!(
+            "namespace {namespace:?} is not a valid namespace name"
+        )))
+    }
+}
+
+/// Kubernetes' DNS-1123 label: at most 63 lower-case alphanumerics or '-',
+/// starting and ending alphanumeric.
+pub fn is_dns1123_label(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[0].is_ascii_alphanumeric()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+}
+
+/// Kubernetes' DNS-1123 subdomain (an object name, IsDNS1123Subdomain): at
+/// most 253 characters, dot-separated parts of lower-case alphanumerics or
+/// '-', each starting and ending alphanumeric. Unlike a label, a part has no
+/// length limit of its own.
+pub fn is_dns1123_subdomain(s: &str) -> bool {
+    s.len() <= 253
+        && !s.is_empty()
+        && s.split('.').all(|part| {
+            let b = part.as_bytes();
+            !b.is_empty()
+                && b.iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+                && b[0].is_ascii_alphanumeric()
+                && b[b.len() - 1].is_ascii_alphanumeric()
+        })
 }
