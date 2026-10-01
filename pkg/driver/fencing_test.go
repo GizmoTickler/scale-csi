@@ -167,7 +167,7 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.Empty(t, associations)
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, retained := ds.UserProperties[publicationPropertyKey("worker-a")]
+	_, retained := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-a")]
 	assert.False(t, retained)
 
 	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
@@ -189,7 +189,7 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.Contains(t, err.Error(), hostA.HostNQN)
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, retained = ds.UserProperties[publicationPropertyKey("worker-b")]
+	_, retained = mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-b")]
 	assert.False(t, retained, "backend conflict must be detected before persisting a new publication")
 }
 
@@ -429,7 +429,7 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	require.NoError(t, err)
 	dataset, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasRecord := dataset.UserProperties[publicationPropertyKey("worker-a")]
+	_, hasRecord := mustStoredRecords(t, d, dataset)[publicationPropertyKey("worker-a")]
 	assert.True(t, hasRecord, "off mode must still write a durable publication record")
 
 	// Same-node republish is idempotent.
@@ -443,7 +443,7 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	assert.Contains(t, err.Error(), "worker-a")
 	dataset, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasB := dataset.UserProperties[publicationPropertyKey("worker-b")]
+	_, hasB := mustStoredRecords(t, d, dataset)[publicationPropertyKey("worker-b")]
 	assert.False(t, hasB, "a rejected publish must not persist a record")
 
 	// No backend allowlist mutation may happen in off mode.
@@ -454,7 +454,7 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	require.NoError(t, err)
 	dataset, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	assert.Empty(t, records, "unpublish-all must clear the durable records in off mode")
 	assert.Zero(t, client.allowlistCalls(), "off mode unpublish must not mutate any backend transport allowlist")
@@ -529,7 +529,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 	require.NoError(t, err)
 	ds, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasRecord := ds.UserProperties[publicationPropertyKey("worker-a")]
+	_, hasRecord := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-a")]
 	assert.True(t, hasRecord, "off mode must still write a durable publication record for NVMe-oF")
 	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF publish must not touch nvmet host_subsys/allowlist")
 
@@ -545,7 +545,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 	assert.Contains(t, err.Error(), "worker-a")
 	ds, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasB := ds.UserProperties[publicationPropertyKey("worker-b")]
+	_, hasB := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-b")]
 	assert.False(t, hasB, "a rejected publish must not persist a record")
 	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF rejected publish must not touch nvmet host_subsys/allowlist")
 
@@ -554,7 +554,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 	require.NoError(t, err)
 	ds, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	assert.Empty(t, records, "unpublish-all must clear the durable records in off mode")
 	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF unpublish must not touch nvmet host_subsys/allowlist")
@@ -670,7 +670,7 @@ func TestControllerUnpublishVolumeEmptyNodeIDRevokesAllPublications(t *testing.T
 	require.NoError(t, err, "CSI v1.12 requires an empty node_id to unpublish from every node")
 	dataset, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	assert.Empty(t, records)
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -726,7 +726,7 @@ func TestAdditivePublishDefersMissingAndOutOfCIDRIdentityWhilePreservingNFSNetwo
 
 	dataset, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 3, "deferred publishes retain durable ownership while enforceable peers converge")
 
@@ -764,7 +764,7 @@ func TestAdditiveSingleNodeDeferredOwnershipRejectsSecondLegacyNode(t *testing.T
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	dataset, err = client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("legacy-a"))
@@ -806,7 +806,7 @@ func TestAdditiveDeferredAndValidNFSPublishesPreserveBroadAllowAll(t *testing.T)
 	assert.Empty(t, share.Networks, "additive must not narrow a legacy allow-all share")
 	dataset, err = client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	assert.Len(t, records, 2)
 }
@@ -866,7 +866,7 @@ func TestAdditiveNFSUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 			require.NoError(t, err)
 			fresh, err := client.DatasetGet(ctx, dataset.Name)
 			require.NoError(t, err)
-			records, err := publicationRecordsFromDataset(fresh)
+			records, err := storedPublicationRecords(d, fresh)
 			require.NoError(t, err)
 			require.Len(t, records, 1)
 			assert.Equal(t, test.wantOwned, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -982,7 +982,7 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 		// backend-live provenance entry survives for future revocation.
 		fresh, err := client.DatasetGet(ctx, "pool/parent/nfs-provenance-overflow")
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(d, fresh)
 		require.NoError(t, err)
 		assert.Equal(t, liveHosts, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts,
 			"backend-live provenance must be fully preserved by a refused publish")
@@ -1034,7 +1034,7 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 		require.NoError(t, publish(d, "nfs-provenance-compacts"))
 		fresh, err := client.DatasetGet(ctx, "pool/parent/nfs-provenance-compacts")
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(d, fresh)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"192.0.2.1"},
 			records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -1083,7 +1083,7 @@ func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.12"},
 		records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -1318,7 +1318,7 @@ func TestClonedVolumeInheritsNoPublicationRecordsAndPublishesCleanly(t *testing.
 	inherited, ok := clone.UserProperties[publicationPropertyKey("worker-a")]
 	require.True(t, ok, "precondition: the clone inherited the source's publication property")
 	require.NotEqual(t, "local", inherited.Source, "precondition: inheritance is reported with an origin-name source")
-	records, err := publicationRecordsFromDataset(clone)
+	records, err := storedPublicationRecords(d, clone)
 	require.NoError(t, err)
 	assert.Empty(t, records, "a freshly cloned volume must own zero publication records")
 
@@ -1341,7 +1341,7 @@ func TestClonedVolumeInheritsNoPublicationRecordsAndPublishesCleanly(t *testing.
 	require.NoError(t, err)
 	fresh, err := client.DatasetGet(ctx, clone.Name)
 	require.NoError(t, err)
-	cloneRecords, err := publicationRecordsFromDataset(fresh)
+	cloneRecords, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Len(t, cloneRecords, 1)
 	_, published := cloneRecords[publicationPropertyKey("worker-b")]
@@ -1402,7 +1402,7 @@ func TestAdditiveNVMeUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 			require.NoError(t, err)
 			fresh, err := client.DatasetGet(ctx, dataset.Name)
 			require.NoError(t, err)
-			records, err := publicationRecordsFromDataset(fresh)
+			records, err := storedPublicationRecords(d, fresh)
 			require.NoError(t, err)
 			require.Len(t, records, 1)
 			assert.Equal(t, test.wantOwned, records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs)
@@ -1458,7 +1458,7 @@ func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T)
 	assert.Equal(t, newNQN, associations[0].HostNQN)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Equal(t, []string{newNQN},
 		records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs)
@@ -1585,7 +1585,7 @@ func TestStartupReconcileBackfillsAttachedNFSNodeAndEnforcesFence(t *testing.T) 
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Equal(t, "worker-a", records[publicationPropertyKey("worker-a")].Node)
@@ -1645,7 +1645,7 @@ func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "the under-lock VA refresh must veto a stale startup grant")
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -1698,7 +1698,7 @@ func TestStartupReconcileMixedDeferredAndKnownSingleNodeFailsBeforeMutation(t *t
 	require.Error(t, d.reconcilePublishedAttachments(ctx))
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "all compatibility checks must pass before startup persists either owner")
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -1754,7 +1754,7 @@ func TestStartupReconcileAdditiveConvergesKnownPeerWhileLegacyPeerDefers(t *test
 	assert.ErrorIs(t, reconcileErr, errFenceDeferred)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Len(t, records, 2)
 	assert.Equal(t, []string{"192.0.2.11"},
@@ -1842,7 +1842,7 @@ func TestStartupReconcileAdditivePreservesNFSGrantDuringIdentityGapThenRotates(t
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.11", "192.0.2.12"},
 		records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -1931,7 +1931,7 @@ func TestStartupReconcileAdditivePreservesNVMeGrantDuringIdentityGapThenRotates(
 	assert.Equal(t, newNQN, associations[0].HostNQN)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	// oldNQN is still associated on the subsystem when the rotation publish reads
 	// the backend, so both are retained; provenance now preserves first-seen order
@@ -1980,7 +1980,7 @@ func TestStartupReconcileRejectsUnknownBackendSingleNodeGrant(t *testing.T) {
 	assert.Contains(t, err.Error(), "published elsewhere")
 	fresh, getErr := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, getErr)
-	records, recordErr := publicationRecordsFromDataset(fresh)
+	records, recordErr := storedPublicationRecords(d, fresh)
 	require.NoError(t, recordErr)
 	assert.Empty(t, records)
 }
@@ -2054,7 +2054,7 @@ func TestStartupReconcileStrictRejectsConflictingSingleNodeAttachmentsBeforeMuta
 	assert.Contains(t, err.Error(), "already published")
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	assert.Empty(t, records, "strict conflict preflight must run before the first backend write")
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -2070,7 +2070,7 @@ func TestStartupReconcileStrictRejectsConflictingSingleNodeAttachmentsBeforeMuta
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err = publicationRecordsFromDataset(ds)
+	records, err = storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-a"))
@@ -2486,7 +2486,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 
 	fresh, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "a hard-rejected sentinel-reporting node must persist NO publication record")
 }
@@ -2579,7 +2579,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 
 	fresh, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "an enriched sentinel-reporting node must persist NO publication record")
 }
@@ -2651,7 +2651,7 @@ func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T
 
 	fresh, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "off-mode sentinel-reporting node must persist NO publication record")
 }
@@ -2799,7 +2799,7 @@ func TestStartupReconcileAdditiveDefersLegacyNodeWithoutStrippingStaticNVMeHost(
 	assert.Equal(t, host.ID, associations[0].HostID)
 	ds, err = client.DatasetGet(ctx, ds.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	require.Len(t, records, 1, "additive mode must retain ownership while waiting for node identity")
 	assert.Equal(t, "legacy-worker", records[publicationPropertyKey("legacy-worker")].Node)
@@ -3156,7 +3156,7 @@ func TestStartupReconcileIsolatesPerVolumeFailures(t *testing.T) {
 	assert.Contains(t, err.Error(), "missing")
 	goodDataset, err = client.DatasetGet(ctx, goodDataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(goodDataset)
+	records, err := storedPublicationRecords(d, goodDataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1, "one broken volume must not prevent another worker from converging")
 }
@@ -3240,7 +3240,7 @@ func TestBackgroundStartupAdditiveWaitsForDeferredTrigger(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "new attachments are reconciled only after a real deferral signals work")
 
@@ -3251,7 +3251,7 @@ func TestBackgroundStartupAdditiveWaitsForDeferredTrigger(t *testing.T) {
 		if getErr != nil {
 			return false
 		}
-		records, recordErr := publicationRecordsFromDataset(fresh)
+		records, recordErr := storedPublicationRecords(d, fresh)
 		return recordErr == nil && len(records) == 1
 	}, time.Second, 10*time.Millisecond,
 		"a deferred publish must trigger additive startup convergence without polling")
@@ -3331,7 +3331,7 @@ func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testin
 	require.NoError(t, err)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Equal(t, []string{nqn}, records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs,
@@ -3397,7 +3397,7 @@ func TestControllerPublishSameNodeRepublishIsIdempotent(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts)
 	dataset, err = client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-a"))
@@ -3517,7 +3517,7 @@ func TestControllerPublishTakesOverStaleSingleNodeRecord(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts, "worker-a's allowlist entry must be revoked and worker-b granted")
 	dataset, err := client.DatasetGet(ctx, "pool/parent/takeover-stale")
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-b"))
@@ -3549,7 +3549,7 @@ func TestControllerPublishKeepsConflictWhenBlockingNodeStillAttached(t *testing.
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts, "a live blocking attachment must not be revoked")
 	dataset, getErr := client.DatasetGet(ctx, "pool/parent/takeover-live")
 	require.NoError(t, getErr)
-	records, recErr := publicationRecordsFromDataset(dataset)
+	records, recErr := storedPublicationRecords(d, dataset)
 	require.NoError(t, recErr)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-a"))

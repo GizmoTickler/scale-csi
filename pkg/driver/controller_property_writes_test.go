@@ -76,6 +76,7 @@ func TestCreateVolumeFoldsNVMeoFResourceIDsIntoTheFinalWrite(t *testing.T) {
 // unless the stale-record sweep is watching that record: then it is rewritten
 // with a new UpdatedAt, so a revoke that detected the old generation backs off.
 func TestRepublishOfAnUnchangedRecordWritesNothing(t *testing.T) {
+	skipWithRecordsInKubernetes(t, "counts dataset property writes")
 	ctx := context.Background()
 	h := newFencingTestHarness(t, FencingModeOff, ShareTypeNVMeoF, withNVMeAllowAnyHost())
 	recorder := &propertyWriteRecorder{MockClient: h.client}
@@ -99,7 +100,7 @@ func TestRepublishOfAnUnchangedRecordWritesNothing(t *testing.T) {
 		t.Helper()
 		fresh, err := h.client.DatasetGet(ctx, datasetName)
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(h.d, fresh)
 		require.NoError(t, err)
 		return records[publicationPropertyKey("worker-a")]
 	}
@@ -132,6 +133,7 @@ func TestRepublishOfAnUnchangedRecordWritesNothing(t *testing.T) {
 // the record without first writing an "unpublishing" tombstone. With fencing
 // on, the tombstone still precedes the revocation.
 func TestUnpublishWritesATombstoneOnlyWhenFencingRemovesAccess(t *testing.T) {
+	skipWithRecordsInKubernetes(t, "counts dataset property writes")
 	for _, tc := range []struct {
 		mode          FencingMode
 		wantTombstone bool
@@ -168,7 +170,7 @@ func TestUnpublishWritesATombstoneOnlyWhenFencingRemovesAccess(t *testing.T) {
 			assert.Equal(t, tc.wantTombstone, tombstones == 1, "tombstone writes: %d", tombstones)
 			fresh, err := h.client.DatasetGet(ctx, datasetName)
 			require.NoError(t, err)
-			_, retained := fresh.UserProperties[publicationPropertyKey("worker-a")]
+			_, retained := mustStoredRecords(t, h.d, fresh)[publicationPropertyKey("worker-a")]
 			assert.False(t, retained, "the record is gone either way")
 		})
 	}

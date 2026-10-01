@@ -121,7 +121,7 @@ func TestListVolumesReportsTheCONodeIDForAPublication(t *testing.T) {
 		ctx := context.Background()
 		ds, err := client.DatasetGet(ctx, datasetName)
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(ds)
+		records, err := storedPublicationRecords(d, ds)
 		require.NoError(t, err)
 		stored, ok := records[publicationPropertyKey("worker-a")]
 		require.True(t, ok)
@@ -130,7 +130,7 @@ func TestListVolumesReportsTheCONodeIDForAPublication(t *testing.T) {
 		require.NoError(t, d.unpublishFencedVolume(ctx, ds, datasetName, ShareTypeNVMeoF, stored.EncodedID, nil))
 		ds, err = client.DatasetGet(ctx, datasetName)
 		require.NoError(t, err)
-		_, retained := ds.UserProperties[publicationPropertyKey("worker-a")]
+		_, retained := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-a")]
 		assert.False(t, retained, "revoking by the stored id removes the record")
 		assert.Empty(t, fencedHosts(t, client))
 	}

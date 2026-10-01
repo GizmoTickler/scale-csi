@@ -44,9 +44,16 @@ func (s zfsPublicationStore) forget(context.Context, string) error { return nil 
 
 // publications is the driver's record store: the configured one, else the
 // ZFS store on the driver's TrueNAS client.
+// testPublicationStore is nil outside tests. The test suite sets it to run
+// the record tests against VolumePublications as well as ZFS.
+var testPublicationStore func(*Driver) publicationStore
+
 func (d *Driver) publications() publicationStore {
 	if d.publicationStore != nil {
 		return d.publicationStore
+	}
+	if testPublicationStore != nil {
+		return testPublicationStore(d)
 	}
 	return zfsPublicationStore{client: d.truenasClient}
 }

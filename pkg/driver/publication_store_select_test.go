@@ -18,10 +18,11 @@ import (
 
 func selectingDriver(t *testing.T, setting string, listErr ...error) (*Driver, *int) {
 	t.Helper()
-	origSetting, origNamespace, origInterval := publicationStoreSetting, podNamespace, publicationStoreProbeInterval
+	origSetting, origNamespace, origInterval, origTestStore := publicationStoreSetting, podNamespace, publicationStoreProbeInterval, testPublicationStore
 	t.Cleanup(func() {
-		publicationStoreSetting, podNamespace, publicationStoreProbeInterval = origSetting, origNamespace, origInterval
+		publicationStoreSetting, podNamespace, publicationStoreProbeInterval, testPublicationStore = origSetting, origNamespace, origInterval, origTestStore
 	})
+	testPublicationStore = nil // this test is about the store a driver picks
 	publicationStoreSetting = func() string { return setting }
 	podNamespace = func() (string, error) { return "scale-csi", nil }
 	publicationStoreProbeInterval = time.Millisecond
