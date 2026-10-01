@@ -310,3 +310,31 @@ func TestImportingStoreMergesPerKeyByAge(t *testing.T) {
 		keyB: recordAt("node-b", publicationStatePublished, "2026-10-01T00:00:00Z"),
 	}, got)
 }
+
+// DeleteVolume removes the volume's VolumePublications, which did not go with
+// its dataset; a retry after the dataset is gone removes them too.
+func TestDeleteVolumeForgetsItsVolumePublications(t *testing.T) {
+	ctx := context.Background()
+	d, client, store := importTestDriver(t)
+	ds := addReconcileDataset(client, "pvc-gone", time.Now().Add(-time.Hour), true, 0)
+	require.NoError(t, store.kube.store(ctx, ds.Name, ds, publicationPropertyKey("node-1"), testRecord("node-1", publicationStatePublished)))
+	other := addReconcileDataset(client, "pvc-kept", time.Now().Add(-time.Hour), true, 0)
+	require.NoError(t, store.kube.store(ctx, other.Name, other, publicationPropertyKey("node-1"), testRecord("node-1", publicationStatePublished)))
+
+	_, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "pvc-gone"})
+	require.NoError(t, err)
+	got, err := store.kube.records(ctx, ds.Name, nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	kept, err := store.kube.records(ctx, other.Name, nil)
+	require.NoError(t, err)
+	assert.Len(t, kept, 1, "another volume's records stay")
+
+	// The dataset already gone: a leftover record is removed as well.
+	require.NoError(t, store.kube.store(ctx, ds.Name, nil, publicationPropertyKey("node-2"), testRecord("node-2", publicationStatePublished)))
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "pvc-gone"})
+	require.NoError(t, err)
+	got, err = store.kube.records(ctx, ds.Name, nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}

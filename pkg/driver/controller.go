@@ -1761,6 +1761,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			} else {
 				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
 			}
+			// A retry after a failed forget below lands here: best effort too.
+			if forgetErr := d.publications().forget(ctx, datasetName); forgetErr != nil {
+				klog.Warningf("Failed to remove the publication records of deleted volume %s: %v", volumeID, forgetErr)
+			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
 		return nil, status.Errorf(codes.Internal, "failed to verify volume %s: %v", volumeID, err)
@@ -2035,6 +2039,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			klog.Errorf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete clone origin snapshot %s: %v", originSnapshotID, err)
 		}
+	}
+
+	// Records kept outside the dataset (VolumePublications) did not go with
+	// it. A failure fails this attempt; its retry finds the dataset gone and
+	// tries again above.
+	if err := d.publications().forget(ctx, datasetName); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to remove the publication records of volume %s: %v", volumeID, err)
 	}
 
 	// Drop the volume's per-volume usage series so a deleted volume cannot leave
