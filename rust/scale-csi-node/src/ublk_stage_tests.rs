@@ -6,55 +6,14 @@ use std::os::unix::fs::MetadataExt;
 
 use tonic::Code;
 
-use crate::csi::{self, volume_capability};
+use crate::csi;
 use crate::events::{self, ObjectRef};
 use crate::stage::{node_stage, node_unstage};
-use crate::testing::{HOST_ID, HOST_NQN, Node, assert_no_nvme_cli, exists, node};
+use crate::testing::{
+    HOST_ID, HOST_NQN, NQN, Node, UBLK_ON, VOLUME, assert_no_nvme_cli, block, context, exists, filesystem, node,
+};
 use crate::ublk_client::{AttachRequest, Daemon, Error};
 use crate::ublk_stage::{TRANSPORT_LABEL, validate_attached_device};
-
-const VOLUME: &str = "pvc-ublk-1";
-const NQN: &str = "nqn.2011-06.com.example:pvc-ublk-1";
-const UBLK_ON: &str = "nvmeof:\n  ublk:\n    enabled: true\n";
-
-fn context(extra: &[(&str, &str)]) -> HashMap<String, String> {
-    let mut c: HashMap<String, String> = [
-        ("node_attach_driver", "nvmeof"),
-        ("nqn", NQN),
-        ("transport", "tcp"),
-        ("address", "192.0.2.20"),
-        ("port", "4420"),
-        ("nvmeof/dataPath", "ublk"),
-    ]
-    .iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
-    for (k, v) in extra {
-        c.insert(k.to_string(), v.to_string());
-    }
-    c
-}
-
-fn block() -> csi::VolumeCapability {
-    csi::VolumeCapability {
-        access_type: Some(volume_capability::AccessType::Block(Default::default())),
-        access_mode: Some(volume_capability::AccessMode {
-            mode: volume_capability::access_mode::Mode::SingleNodeWriter as i32,
-        }),
-    }
-}
-
-fn filesystem() -> csi::VolumeCapability {
-    csi::VolumeCapability {
-        access_type: Some(volume_capability::AccessType::Mount(volume_capability::MountVolume {
-            fs_type: "ext4".into(),
-            ..Default::default()
-        })),
-        access_mode: Some(volume_capability::AccessMode {
-            mode: volume_capability::access_mode::Mode::SingleNodeWriter as i32,
-        }),
-    }
-}
 
 fn stage_request(
     staging: &str,

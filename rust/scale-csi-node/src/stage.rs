@@ -361,7 +361,7 @@ pub async fn node_stage(
 }
 
 /// `os.RemoveAll`: absent is fine, a directory goes with its contents.
-fn remove_all(path: &str) -> std::io::Result<()> {
+pub(crate) fn remove_all(path: &str) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),

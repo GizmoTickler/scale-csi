@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::config;
+use crate::csi::{self, volume_capability};
 use crate::events::Recorded;
 use crate::exec::{Limits, Output};
 use crate::metrics::Metrics;
@@ -23,6 +24,8 @@ pub struct HostState {
     pub mounts: BTreeMap<String, (String, String, String)>,
     /// Kept in step with `mounts` as /proc/self/mountinfo would be.
     pub mountinfo: Option<PathBuf>,
+    /// Commands (by prefix of "program args") that fail with exit 32.
+    pub failing: Vec<String>,
     /// device -> filesystem
     pub filesystems: HashMap<String, String>,
     pub calls: Vec<String>,
@@ -85,7 +88,17 @@ impl FakeHost {
 impl Runner for FakeHost {
     async fn run(&self, program: &str, args: &[&str], _: Limits) -> std::io::Result<Output> {
         let mut host = self.0.lock().unwrap();
-        host.calls.push(format!("{program} {}", args.join(" ")));
+        let call = format!("{program} {}", args.join(" "));
+        host.calls.push(call.clone());
+        if host.failing.iter().any(|prefix| call.starts_with(prefix.as_str())) {
+            return Ok(Output {
+                code: Some(32),
+                stdout: Vec::new(),
+                stderr: b"mount: permission denied".to_vec(),
+                wedged: false,
+                timed_out: false,
+            });
+        }
         let last = args.last().copied().unwrap_or_default();
         Ok(match (program, args) {
             ("findmnt", ["--mountpoint", target, "--noheadings"]) => match host.mounts.get(*target) {
@@ -386,4 +399,47 @@ pub fn assert_no_nvme_cli(host: &FakeHost) {
 
 pub fn exists(path: &str) -> bool {
     Path::new(path).symlink_metadata().is_ok()
+}
+
+pub const VOLUME: &str = "pvc-ublk-1";
+pub const NQN: &str = "nqn.2011-06.com.example:pvc-ublk-1";
+pub const UBLK_ON: &str = "nvmeof:\n  ublk:\n    enabled: true\n";
+
+pub fn context(extra: &[(&str, &str)]) -> HashMap<String, String> {
+    let mut c: HashMap<String, String> = [
+        ("node_attach_driver", "nvmeof"),
+        ("nqn", NQN),
+        ("transport", "tcp"),
+        ("address", "192.0.2.20"),
+        ("port", "4420"),
+        ("nvmeof/dataPath", "ublk"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    for (k, v) in extra {
+        c.insert(k.to_string(), v.to_string());
+    }
+    c
+}
+
+pub fn block() -> csi::VolumeCapability {
+    csi::VolumeCapability {
+        access_type: Some(volume_capability::AccessType::Block(Default::default())),
+        access_mode: Some(volume_capability::AccessMode {
+            mode: volume_capability::access_mode::Mode::SingleNodeWriter as i32,
+        }),
+    }
+}
+
+pub fn filesystem() -> csi::VolumeCapability {
+    csi::VolumeCapability {
+        access_type: Some(volume_capability::AccessType::Mount(volume_capability::MountVolume {
+            fs_type: "ext4".into(),
+            ..Default::default()
+        })),
+        access_mode: Some(volume_capability::AccessMode {
+            mode: volume_capability::access_mode::Mode::SingleNodeWriter as i32,
+        }),
+    }
 }

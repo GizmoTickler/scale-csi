@@ -200,6 +200,26 @@ impl Node for NodeService {
         Ok(Response::new(csi::NodeStageVolumeResponse {}))
     }
 
+    async fn node_publish_volume(
+        &self,
+        request: Request<csi::NodePublishVolumeRequest>,
+    ) -> Result<Response<csi::NodePublishVolumeResponse>, Status> {
+        let deadline = rpc_deadline(&request);
+        let (state, req) = (self.0.clone(), request.into_inner());
+        run_to_completion(async move { crate::publish::node_publish(&state, &req, deadline).await }).await?;
+        Ok(Response::new(csi::NodePublishVolumeResponse {}))
+    }
+
+    async fn node_unpublish_volume(
+        &self,
+        request: Request<csi::NodeUnpublishVolumeRequest>,
+    ) -> Result<Response<csi::NodeUnpublishVolumeResponse>, Status> {
+        let deadline = rpc_deadline(&request);
+        let (state, req) = (self.0.clone(), request.into_inner());
+        run_to_completion(async move { crate::publish::node_unpublish(&state, &req, deadline).await }).await?;
+        Ok(Response::new(csi::NodeUnpublishVolumeResponse {}))
+    }
+
     async fn node_unstage_volume(
         &self,
         request: Request<csi::NodeUnstageVolumeRequest>,
