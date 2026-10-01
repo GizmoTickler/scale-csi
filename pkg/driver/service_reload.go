@@ -36,13 +36,18 @@ type ServiceReloadDebouncer struct {
 // serviceReloadState tracks the debounce state for a single service
 type serviceReloadState struct {
 	timer    *time.Timer
-	pending  []chan error // channels waiting for reload result
+	pending  []reloadWaiter // callers waiting for the reload's result
 	lastCall time.Time
 	count    int // number of coalesced requests
-	// The most urgent class and the oldest operation among the batch's
-	// callers: the reload is admitted to TrueNAS as theirs, so it is not
-	// queued behind their own later calls (or, for a publish waiting on it,
-	// behind provisioning).
+}
+
+// reloadWaiter is one caller of a batch, with the admission class and the
+// operation start of the work it belongs to: the reload is admitted to
+// TrueNAS as the work of the callers still waiting when it fires, so it is
+// not queued behind their own later calls (or, for a publish waiting on it,
+// behind provisioning).
+type reloadWaiter struct {
+	result   chan error
 	priority truenas.Priority
 	start    time.Time
 }
@@ -71,9 +76,7 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 
 	state, exists := d.services[service]
 	if !exists {
-		state = &serviceReloadState{
-			pending: make([]chan error, 0),
-		}
+		state = &serviceReloadState{}
 		d.services[service] = state
 	}
 
@@ -83,17 +86,7 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 	if !stamped {
 		start = now
 	}
-	if state.timer == nil {
-		state.priority, state.start = priority, start
-	} else {
-		if priority < state.priority {
-			state.priority = priority
-		}
-		if start.Before(state.start) {
-			state.start = start
-		}
-	}
-	state.pending = append(state.pending, resultCh)
+	state.pending = append(state.pending, reloadWaiter{result: resultCh, priority: priority, start: start})
 	state.count++
 	state.lastCall = now
 
@@ -123,8 +116,8 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 		// Remove ourselves from pending list
 		d.mu.Lock()
 		if st, ok := d.services[service]; ok {
-			for i, ch := range st.pending {
-				if ch == resultCh {
+			for i, waiter := range st.pending {
+				if waiter.result == resultCh {
 					st.pending = append(st.pending[:i], st.pending[i+1:]...)
 					break
 				}
@@ -155,8 +148,16 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 	// Capture pending channels and reset state
 	pendingChannels := state.pending
 	coalescedCount := state.count
-	priority, start := state.priority, state.start
-	state.pending = make([]chan error, 0)
+	priority, start := pendingChannels[0].priority, pendingChannels[0].start
+	for _, waiter := range pendingChannels[1:] {
+		if waiter.priority < priority {
+			priority = waiter.priority
+		}
+		if waiter.start.Before(start) {
+			start = waiter.start
+		}
+	}
+	state.pending = nil
 	state.count = 0
 	state.timer = nil
 
@@ -184,9 +185,9 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 	}
 
 	// Notify all pending callers
-	for _, ch := range pendingChannels {
+	for _, waiter := range pendingChannels {
 		select {
-		case ch <- err:
+		case waiter.result <- err:
 		default:
 			// Channel was already closed or full (context canceled)
 		}
@@ -203,9 +204,9 @@ func (d *ServiceReloadDebouncer) Stop() {
 			state.timer.Stop()
 		}
 		// Notify pending callers that we're shutting down
-		for _, ch := range state.pending {
+		for _, waiter := range state.pending {
 			select {
-			case ch <- context.Canceled:
+			case waiter.result <- context.Canceled:
 			default:
 			}
 		}

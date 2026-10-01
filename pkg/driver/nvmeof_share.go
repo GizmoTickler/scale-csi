@@ -361,16 +361,13 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, ds *truenas.Dataset, dat
 		// Cleanup subsystem on port/association failure - the volume would be
 		// unusable without a port. A partial loop leaves the associations it
 		// made, and TrueNAS refuses a plain delete of a subsystem still
-		// visible on a port, so a subsystem this call created is deleted with
-		// force, which reaps them with it. No explicit association rollback
-		// runs for a subsystem that PRE-EXISTED: some of the collected IDs may
-		// be associations this call merely adopted (the create is
+		// visible on a port. No explicit association rollback runs for a
+		// subsystem that PRE-EXISTED: some of the collected IDs may be
+		// associations this call merely adopted (the create is
 		// already-exists-tolerant), so deleting them would tear down working
 		// paths. The loop is idempotent, so a retry converges.
 		if !subsysWasExisting {
-			if delErr := d.truenasClient.NVMeoFSubsystemDeleteCascade(ctx, subsys.ID); delErr != nil {
-				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
-			}
+			d.rollBackNewNVMeoFSubsystem(ctx, subsys.ID)
 		}
 		return status.Errorf(codes.Internal, "%v", assocErr)
 	}
@@ -523,4 +520,27 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 
 	klog.Infof("Deleted NVMe-oF resources for %s", datasetName)
 	return nil
+}
+
+// rollBackNewNVMeoFSubsystem deletes a subsystem this create made, after a
+// partial port association. "Made" is a belief, not a proof: the create adopts
+// an existing subsystem of the same name (another install on the NAS with a
+// colliding name), and a forced delete would take that install's namespace
+// and paths with it. So the delete is forced, reaping the associations made
+// here, only while the subsystem serves no namespace, as one this call created
+// still does; otherwise it is the plain delete, which TrueNAS refuses while
+// the subsystem is on a port, and the subsystem is left for the delete path.
+func (d *Driver) rollBackNewNVMeoFSubsystem(ctx context.Context, subsysID int) {
+	namespaces, err := d.truenasClient.NVMeoFNamespaceListBySubsystem(ctx, subsysID)
+	if err == nil && len(namespaces) == 0 {
+		err = d.truenasClient.NVMeoFSubsystemDeleteCascade(ctx, subsysID)
+	} else {
+		if err != nil {
+			klog.Warningf("NVMe-oF subsystem %d rollback: cannot list its namespaces (%v); not forcing the delete", subsysID, err)
+		}
+		err = d.truenasClient.NVMeoFSubsystemDelete(ctx, subsysID)
+	}
+	if err != nil {
+		klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", err)
+	}
 }

@@ -215,7 +215,7 @@ so a NAS outage or slow reconnect does not cause a kubelet restart loop. Monitor
 
 ### Verify release signatures
 
-Tag builds keyless-sign the multi-architecture image, keyless-sign the OCI Helm
+Tag builds keyless-sign the image (linux/amd64), keyless-sign the OCI Helm
 chart, and attach an SLSA provenance attestation to the chart. Substitute the
 release being installed:
 

@@ -57,3 +57,43 @@ func TestRawBlockPublishReplayComparesDeviceNumbers(t *testing.T) {
 	d.rememberPublication(req, capability, "/dev/sda")
 	require.NoError(t, d.validateExistingPublication(req, capability, "/dev/sda"))
 }
+
+// Without its in-memory record (after a plugin restart), a single-writer
+// raw-block volume still published at another target is found in the mount
+// table by device number: its source there is devtmpfs, never the device.
+func TestSingleWriterRawBlockScanFindsTheDeviceBoundElsewhere(t *testing.T) {
+	capability, err := nodeCapabilityForRequest(&csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+	})
+	require.NoError(t, err)
+	const (
+		publishDir = "/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/publish/pvc-1/"
+		other      = publishDir + "pod-a"
+		nfs        = "/var/lib/kubelet/pods/pod-c/volumes/kubernetes.io~csi/pvc-9/mount"
+	)
+	req := &csi.NodePublishVolumeRequest{VolumeId: "pvc-1", TargetPath: publishDir + "pod-b"}
+
+	origList, origStat := nodeListMountInfo, nodeStatsStat
+	t.Cleanup(func() { nodeListMountInfo, nodeStatsStat = origList, origStat })
+	nodeListMountInfo = func() ([]util.MountInfo, error) {
+		return []util.MountInfo{
+			{Source: "nas:/export", Target: nfs, FSType: "nfs4"},
+			{Source: "udev[/sda]", Target: other, FSType: "devtmpfs"},
+		}, nil
+	}
+	devices := map[string]uint64{other: 7, "/dev/sda": 7, "/dev/sdb": 9}
+	nodeStatsStat = func(path string) (uint32, uint64, error) {
+		require.NotEqual(t, nfs, path, "a network mount is never stat'ed")
+		rdev, ok := devices[path]
+		if !ok {
+			return 0, 0, os.ErrNotExist
+		}
+		return unix.S_IFBLK | 0o660, rdev, nil
+	}
+
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	err = d.ensurePublicationTargetAllowed(req, capability, "/dev/sda")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err), "the device is still bound at %s: %v", other, err)
+	assert.NoError(t, d.ensurePublicationTargetAllowed(req, capability, "/dev/sdb"), "another device's binding does not block")
+}

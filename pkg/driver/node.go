@@ -557,7 +557,18 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 		if mount.Target == req.GetTargetPath() || mount.Target == req.GetStagingTargetPath() || d.isKnownStageTarget(mount.Target) || !likelyCSIPublicationTarget(mount.Target) {
 			continue
 		}
-		if mountSourcesEqual(mount.Source, expectedSource) {
+		sameSource := mountSourcesEqual(mount.Source, expectedSource)
+		// A raw-block publication is a bind-mounted device node: the table
+		// shows it on devtmpfs ("udev[/sda]"), never as the staged device, so
+		// it is identified by its device number. Only devtmpfs entries are
+		// stat'ed: a stat of a hung network mount would hang this publish.
+		if !sameSource && capability.AccessType == nodeAccessBlock && mount.FSType == "devtmpfs" {
+			sameSource, err = sameBlockDevice(mount.Target, expectedSource)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to verify existing publication at %s: %v", mount.Target, err)
+			}
+		}
+		if sameSource {
 			if capability.AccessMode == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 				klog.Infof("NodePublishVolume: single-writer migration for volume %s is blocked by the still-mounted target %s; kubelet may still be tearing down the prior pod", req.GetVolumeId(), mount.Target)
 			}

@@ -851,6 +851,18 @@
         "enabled": {
           "type": "boolean"
         },
+        "implementation": {
+          "type": "string",
+          "enum": ["go", "rust"]
+        },
+        "rustNodes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
         "priorityClassName": {
           "type": "string"
         },

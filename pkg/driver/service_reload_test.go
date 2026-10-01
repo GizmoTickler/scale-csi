@@ -271,8 +271,8 @@ func TestServiceReloadIsAdmittedAsItsCallers(t *testing.T) {
 		stamped     bool
 		hasDeadline bool
 	}
-	got := make(chan seen, 1)
-	d := NewServiceReloadDebouncer(50*time.Millisecond, func(ctx context.Context, _ string) error {
+	got := make(chan seen, 3) // never blocks a reload, however the callers batch
+	d := NewServiceReloadDebouncer(200*time.Millisecond, func(ctx context.Context, _ string) error {
 		start, stamped := truenas.OperationStartOf(ctx)
 		_, hasDeadline := ctx.Deadline()
 		got <- seen{truenas.PriorityOf(ctx), start, stamped, hasDeadline}
@@ -300,4 +300,28 @@ func TestServiceReloadIsAdmittedAsItsCallers(t *testing.T) {
 	assert.True(t, s.stamped)
 	assert.True(t, s.start.Equal(base), "the oldest caller's operation start")
 	assert.False(t, s.hasDeadline, "no budget that counts the wait for a slot")
+}
+
+// A caller that gives up no longer lends the reload its class: the reload is
+// admitted as the work of the callers still waiting when it fires.
+func TestServiceReloadClassComesFromTheCallersStillWaiting(t *testing.T) {
+	got := make(chan truenas.Priority, 2)
+	d := NewServiceReloadDebouncer(150*time.Millisecond, func(ctx context.Context, _ string) error {
+		got <- truenas.PriorityOf(ctx)
+		return nil
+	})
+	defer d.Stop()
+
+	attachCtx, cancelAttach := context.WithCancel(truenas.WithPriority(context.Background(), truenas.PriorityAttach))
+	attachDone := make(chan error, 1)
+	go func() { attachDone <- d.RequestReload(attachCtx, "iscsitarget") }()
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- d.RequestReload(truenas.WithPriority(context.Background(), truenas.PriorityDelete), "iscsitarget")
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancelAttach()
+	assert.ErrorIs(t, <-attachDone, context.Canceled)
+	assert.NoError(t, <-deleteDone)
+	assert.Equal(t, truenas.PriorityDelete, <-got, "the attach caller left before the reload fired")
 }
