@@ -118,8 +118,11 @@ func TestMultipathConvergesExistingVolumes(t *testing.T) {
 	_, counts := client.callSnapshot()
 	assert.Equal(t, 4, counts["NVMeoFGetOrCreatePort"],
 		"an existing volume must get a port association per advertised address, not zero")
-	assert.Equal(t, 4, counts["NVMeoFPortSubsysCreate"],
-		"an existing volume must get a port_subsys association per advertised address")
+	assert.Equal(t, 3, counts["NVMeoFPortSubsysCreate"],
+		"an existing volume must get a port_subsys association per advertised address it lacks")
+	associations, err := client.MockClient.NVMeoFPortSubsysList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, associations, 4, "one association per advertised address")
 
 	// The publish context advertises exactly the addresses that were associated.
 	volumeContext := map[string]string{}

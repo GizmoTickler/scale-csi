@@ -130,7 +130,7 @@ func (m *iscsiTargetCreateFailMock) ISCSITargetCreate(ctx context.Context, name,
 }
 
 func (m *nvmePortAssociationFailMock) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...truenas.NVMeoFPortCreateOptions) (*truenas.NVMeoFPort, error) {
-	if m.cachedPort != nil {
+	if m.cachedPort != nil && m.cachedPort.Address == address {
 		return m.cachedPort, nil
 	}
 	m.portFindCalls++

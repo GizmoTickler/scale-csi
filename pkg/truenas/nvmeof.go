@@ -32,6 +32,12 @@ type NVMeoFSubsystem struct {
 	// must not collapse into an explicit false when a replay is deciding whether
 	// a requested pi_enable is already in effect.
 	PiEnable *bool `json:"pi_enable,omitempty"`
+	// Adopted is set only on NVMeoFSubsystemCreate's result, when the create
+	// found a subsystem of that name already present and returned it instead
+	// of creating one. A subsystem the call really created starts with exactly
+	// the allow_any_host and host associations it was created with; an adopted
+	// one may carry anything and must be reconciled.
+	Adopted bool `json:"-"`
 }
 
 // NVMeoFHost represents an NVMe-oF initiator host from the TrueNAS API.
@@ -119,6 +125,7 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 			existing, findErr := c.NVMeoFSubsystemFindByName(ctx, name)
 			if findErr == nil && existing != nil {
 				klog.V(4).Infof("NVMeoFSubsystemCreate: subsystem %q already exists (ID %d), returning existing", name, existing.ID)
+				existing.Adopted = true
 				return existing, nil
 			}
 			// If we got "Invalid params" but the subsystem doesn't exist, it's a genuine parameter error

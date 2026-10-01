@@ -37,11 +37,13 @@ func TestControllerPublishVolumeNVMeoFMultipathAddresses(t *testing.T) {
 			wantSubsystemCreates: 1,
 		},
 		{
-			name:                 "already-existing share",
-			volumeID:             "gf51-existing-share",
-			addresses:            []string{"192.0.2.21", "192.0.2.22"},
-			wantAddresses:        wantAddresses,
-			wantAssociationCalls: 3,
+			name:          "already-existing share",
+			volumeID:      "gf51-existing-share",
+			addresses:     []string{"192.0.2.21", "192.0.2.22"},
+			wantAddresses: wantAddresses,
+			// CreateVolume already associated all three addresses; the
+			// publish lists them and creates none.
+			wantAssociationCalls: 0,
 		},
 		{
 			name:     "multipath disabled",
