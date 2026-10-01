@@ -15,5 +15,6 @@ pub mod mount;
 pub mod node_id;
 pub mod nvme_addresses;
 pub mod service;
+pub mod stage;
 pub mod ublk_client;
 pub mod ublk_state;
