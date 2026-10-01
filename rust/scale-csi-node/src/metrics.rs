@@ -19,6 +19,7 @@ pub struct Metrics {
     nvme_sessions_total: IntGauge,
     gc_sessions_disconnected_total: IntCounterVec,
     nvme_controller_tunable_corrections_total: IntCounterVec,
+    events_dropped_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -93,6 +94,15 @@ impl Metrics {
             &["tunable", "result"],
         )
         .expect("valid metric");
+        let events_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "events_dropped_total",
+                "Kubernetes Events the node agent did not write, by reason (queue_full, rate_limited, api_error, closed)",
+            )
+            .namespace(NAMESPACE),
+            &["reason"],
+        )
+        .expect("valid metric");
         for collector in [
             Box::new(operations_total.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(nvme_sessions_total.clone()),
@@ -103,6 +113,7 @@ impl Metrics {
             Box::new(nvme_path_connect_total.clone()),
             Box::new(connection_status),
             Box::new(connections_active),
+            Box::new(events_dropped_total.clone()),
         ] {
             registry.register(collector).expect("unique metric");
         }
@@ -115,7 +126,16 @@ impl Metrics {
             nvme_sessions_total,
             gc_sessions_disconnected_total,
             nvme_controller_tunable_corrections_total,
+            events_dropped_total,
         }
+    }
+
+    pub fn record_event_dropped(&self, reason: &str) {
+        self.events_dropped_total.with_label_values(&[reason]).inc();
+    }
+
+    pub fn events_dropped(&self, reason: &str) -> u64 {
+        self.events_dropped_total.with_label_values(&[reason]).get()
     }
 
     pub fn set_nvme_sessions(&self, count: usize) {

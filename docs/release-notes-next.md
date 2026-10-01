@@ -1,4 +1,34 @@
-# Release notes — v1.16.0 (next)
+# Release notes — v1.17.0 (next)
+
+## v1.17.0 — Kubernetes Events from the Rust node agent
+
+### The Rust node agent records Kubernetes Events
+
+The Rust node agent (`node.implementation: rust` or `node.rustNodes`) wrote
+its events to its log only. It now records them as Kubernetes Events, the same
+ones the Go node plugin records, so `kubectl describe`, dashboards and alerts
+that read Events see no difference between the two:
+
+- **Which events.** `MountFailed`, `NVMeConnectFailed`, `NVMePathDegraded` and
+  `NVMeMultipathUnaggregated`, all of type Warning, on the pod using the
+  volume, else its PVC, else its PV, else the node, with the driver name as
+  the source component and the node's host name as the source host. Events on
+  a PV or node go to the `default` namespace, as the Go node's do.
+- **Repeats.** An identical event (same object, reason and message) within 10
+  minutes of the last one raises the existing Event's count instead of
+  creating another. Each object gets at most 25 events at once, then one more
+  every 5 minutes, like the Go node's client-go recorder.
+- **Never in the way.** An event is queued (up to 256) and written by a
+  background task; a CSI call never waits for the API. An event that does not
+  fit on the queue, is rate limited, or that the API refuses is dropped and
+  counted in the new `scale_csi_events_dropped_total{reason}` metric
+  (`queue_full`, `rate_limited`, `api_error`, `closed`), and logged.
+- **Outside a cluster** (no service account token or no
+  `KUBERNETES_SERVICE_HOST`/`PORT`), or if the service account CA cannot be
+  read, events go to the log as before.
+
+No chart change: the node ClusterRole already allows creating and patching
+Events.
 
 ## v1.16.0 — publication records in Kubernetes
 

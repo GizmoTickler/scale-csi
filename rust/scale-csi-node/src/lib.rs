@@ -11,6 +11,8 @@ pub mod discovery;
 pub mod events;
 pub mod exec;
 pub mod health;
+pub mod kube_api;
+pub mod kube_events;
 pub mod locks;
 pub mod metrics;
 pub mod mount;
@@ -30,6 +32,8 @@ pub mod ublk_state;
 
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod kube_events_tests;
 #[cfg(test)]
 mod nvme_kernel_tests;
 #[cfg(test)]

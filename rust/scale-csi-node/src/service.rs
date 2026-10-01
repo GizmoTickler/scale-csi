@@ -85,7 +85,7 @@ pub struct State {
 
 impl State {
     /// A node on this host: host commands, the configured daemon socket,
-    /// events to the log.
+    /// events to the log (main sends them to the API in a cluster).
     pub fn new(config: Config, driver_name: String, node_name: String, node_id: String, metrics: Arc<Metrics>) -> Self {
         let ublk = Arc::new(ublk_client::Client::new(Path::new(&config.nvmeof.ublk.socket_path)));
         let timeouts = Timeouts {
