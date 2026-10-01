@@ -23,30 +23,22 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-w -s -X main.Version=${VERSION} -X main.GitCommit=${COMMIT}" \
     -o scale-csi ./cmd/scale-csi
 
-# Rust node agent (scale-csi-node). Built on the build platform and linked
-# with rust-lld into a static musl binary for the target architecture, so the
-# arm64 image is not compiled under emulation (the agent has no C dependencies).
+# Rust node agent (scale-csi-node), a static musl binary (the image is
+# linux/amd64 only).
 # renovate: datasource=docker depName=rust
 # The exact multi-architecture manifest digest for this tag is pinned here;
 # Renovate should update the tag and digest together, and the tag must match
 # rust/scale-csi-node/rust-toolchain.toml.
-FROM --platform=$BUILDPLATFORM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS rust-builder
+FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS rust-builder
 
-ARG TARGETARCH
+RUN apk add --no-cache musl-dev
 # The image's own toolchain, without the components rust-toolchain.toml lists
 # for development (clippy, rustfmt).
 ENV RUSTUP_TOOLCHAIN=1.98.1
 WORKDIR /build
 COPY rust/scale-csi-node ./
-RUN case "${TARGETARCH}" in \
-      amd64) target=x86_64-unknown-linux-musl ;; \
-      arm64) target=aarch64-unknown-linux-musl ;; \
-      *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
-    esac \
- && rustup target add "${target}" \
- && linker_var="CARGO_TARGET_$(echo "${target}" | tr 'a-z-' 'A-Z_')_LINKER" \
- && env "${linker_var}=rust-lld" cargo build --release --locked --target "${target}" \
- && cp "target/${target}/release/scale-csi-node" /scale-csi-node
+RUN cargo build --release --locked \
+ && cp target/release/scale-csi-node /scale-csi-node
 
 ######################
 # Runtime image
