@@ -918,9 +918,6 @@ func SetTrueNASActiveConnections(count int) {
 	truenasConnectionsActive.Set(float64(count))
 }
 
-// SetTrueNASPendingCalls publishes the current in-flight TrueNAS request depth.
-// The client invokes this through ClientConfig.PendingDepthRecorder, keeping the
-// package dependency direction one-way (truenas -> callback -> driver metric).
 // TrueNASAdmissionMetrics feeds the TrueNAS client's request-slot queueing
 // into truenas_request_admission_wait_seconds and truenas_requests_waiting.
 func TrueNASAdmissionMetrics() truenas.AdmissionMetrics {
@@ -934,6 +931,9 @@ func TrueNASAdmissionMetrics() truenas.AdmissionMetrics {
 	}
 }
 
+// SetTrueNASPendingCalls publishes the current in-flight TrueNAS request depth.
+// The client invokes this through ClientConfig.PendingDepthRecorder, keeping the
+// package dependency direction one-way (truenas -> callback -> driver metric).
 func SetTrueNASPendingCalls(count int) {
 	truenasPendingCalls.Set(float64(count))
 }
