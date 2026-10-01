@@ -1,5 +1,70 @@
 # Release notes — v1.16.0 (next)
 
+## v1.18.0 (draft)
+
+### The Rust node agent serves iSCSI
+
+`scale-csi-node`, the opt-in Rust node plugin, now serves iSCSI volumes as well
+as NVMe-oF. Only NFS is still Go-only: the chart refuses `node.implementation:
+rust` and `node.rustNodes` while `nfs.enabled` is true, and the agent refuses to
+start with NFS in its configuration. An iSCSI-only install (NVMe-oF off) may now
+run the agent.
+
+- **Same commands, same host access.** The agent runs `iscsiadm` through the
+  image's wrapper (nsenter into the host), as the Go plugin does, with the same
+  arguments: a static node record (`-o new`), CHAP on the record, `--login`,
+  and a SendTargets discovery (cached and serialized per portal) only when the
+  target is not found. Logins per portal are limited by
+  `resilience.rateLimiting.maxConcurrentLogins`; `commandTimeouts.iscsi`,
+  `iscsi.deviceWaitTimeout`, `iscsi.nameSuffix` and
+  `node.sessionCleanupDelay` mean what they mean for the Go plugin.
+- **CHAP.** The volume's `chap` mode and the node-stage secret are validated as
+  the Go plugin validates them, before any login. The method and user names go
+  to `iscsiadm`; the passwords are written straight into the node record files
+  (0600) and never appear on any command line or in the log. A rejected secret
+  is `Unauthenticated` and is not retried; a record that cannot be written fails
+  the stage (`ISCSICHAPFailed`).
+- **Multipath.** With a `portals` hint of two or more IP portals and
+  dm-multipath on the node, the agent logs in through every portal, drops a
+  path that reaches another LUN, and stages the dm map of the LUN's WWID (or,
+  when no map appears within 5 s, the primary path alone). Without multipathd it
+  stays on the primary portal and says so (`ISCSIMultipathUnavailable`). A
+  replay tops up the paths of a staged map.
+- **Unstage and session GC.** Unstage logs out every session of the volume's
+  target, found through the mounted device or by the target name derived from
+  the volume ID (never through a raw-block link's device name, which can be
+  stale after a reboot); a session that will not log out fails the unstage so
+  kubelet retries. Session GC logs out a session only when it goes through the
+  configured portal, its target is one the driver names for a volume, and no
+  staged volume has used it for the grace period; an in-use disk whose identity
+  cannot be read skips the pass.
+- **Interchangeable with the Go plugin.** The staging layout (a link to the
+  disk or dm map for raw block, a mount for a filesystem) and the node records
+  are the same, and iSCSI keeps no other state on the node, so a volume staged
+  by one plugin is published, expanded and unstaged by the other.
+- **Events and metrics** keep the Go plugin's names: `ISCSILoginFailed`,
+  `ISCSIPathDegraded`, `ISCSIMultipathUnavailable`, `ISCSICHAPFailed`,
+  `MountFailed`; `scale_csi_iscsi_sessions_total`,
+  `scale_csi_iscsi_path_connect_total` and the `iscsi` transport of
+  `scale_csi_node_connect_total` and `scale_csi_gc_sessions_disconnected_total`.
+
+### Differences from the Go plugin
+
+- The agent stages, unstages and expands iSCSI volumes only where the
+  configuration enables iSCSI; on an install without it an iSCSI volume is
+  refused as before, and `iscsiadm` never runs.
+- A device wait also ends at the caller's deadline (the Go plugin waits out
+  its full device timeout).
+- Expansion of a filesystem mounted from `/dev/mapper/<name>` resolves the name
+  to its dm device first; the Go plugin looked the map up by its link name, so
+  it could not read the map's size.
+
+### Upgrade
+
+Nothing changes unless `node.implementation` or `node.rustNodes` is set. To
+try the agent on an iSCSI install, canary it with `node.rustNodes` first;
+removing the setting hands the nodes back to the Go plugin with no volume work.
+
 ## v1.16.0 — publication records in Kubernetes
 
 A publication record says "this volume is published to this node, with this
