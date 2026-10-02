@@ -1,5 +1,19 @@
 # Release notes — v1.17.0 (next)
 
+## v1.20.0 (draft)
+
+- **Kernel NVMe-oF: a stage right after a handover waits for the current /dev
+  node.** When one plugin unstaged a kernel NVMe-oF volume and the other
+  staged it at once (disconnect, then connect to the same subsystem), the
+  device wait found the namespace in sysfs and took `/dev/nvmeXnY` as soon as
+  it existed. That node could still be the previous namespace's, because
+  devtmpfs and udev remove it a little later, so blkid or mkfs failed with
+  ENXIO. Both plugins now accept the native multipath head (found under the
+  subsystem) or a controller's namespace (found through `nvme list-subsys`)
+  only when its `/dev` node is a block device whose number matches the
+  namespace's sysfs `dev` file, and keep polling until then, within the
+  existing device timeout. The ublk data path is unchanged.
+
 ## v1.17.0 — Kubernetes Events from the Rust node agent
 
 ### The Rust node agent records Kubernetes Events
