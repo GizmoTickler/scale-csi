@@ -31,6 +31,24 @@ func TestISCSIAdmNSenterUsesHostPIDOneAndPreservesProcessResults(t *testing.T) {
 	}
 }
 
+func TestMultipathdNSenterUsesHostPIDOne(t *testing.T) {
+	result := runWrapper(t, "multipathd", []string{
+		"MULTIPATHD_HOST_STRATEGY=nsenter",
+		"MULTIPATHD_HOST_PATH=/usr/sbin/multipathd",
+	}, "resize", "map", "mpatha")
+
+	wantArgv := []string{
+		"-t", "1", "--mount", "--net", "--",
+		"/usr/sbin/multipathd", "resize", "map", "mpatha",
+	}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("nsenter argv = %#v, want %#v", result.argv, wantArgv)
+	}
+	if result.exitCode != 23 {
+		t.Fatalf("exit code = %d, want 23", result.exitCode)
+	}
+}
+
 func TestNVMeNSenterUsesHostPIDOne(t *testing.T) {
 	result := runWrapper(t, "nvme", []string{
 		"NVME_HOST_STRATEGY=nsenter",

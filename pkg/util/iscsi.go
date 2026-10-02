@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
@@ -958,8 +959,12 @@ func pollForISCSISessionCleanup(ctx context.Context, timeout time.Duration, sess
 
 // findISCSIDevice finds the device path for an iSCSI LUN.
 func findISCSIDevice(iqn string, lun int) (string, error) {
+	return findISCSIDeviceInPaths(iqn, lun, "/sys/class", "/dev")
+}
+
+func findISCSIDeviceInPaths(iqn string, lun int, sysClassRoot, devRoot string) (string, error) {
 	// Look in /sys/class/iscsi_session for the session
-	sessionDirs, err := filepath.Glob("/sys/class/iscsi_session/session*")
+	sessionDirs, err := filepath.Glob(filepath.Join(sysClassRoot, "iscsi_session", "session*"))
 	if err != nil {
 		return "", err
 	}
@@ -980,7 +985,7 @@ func findISCSIDevice(iqn string, lun int) (string, error) {
 		// Found the session, now find the device
 		// Session directory contains device subdirectory
 		sessionName := filepath.Base(sessionDir)
-		devicePath, err := findDeviceForSession(sessionName, lun)
+		devicePath, err := findDeviceForSessionInPaths(sessionName, lun, sysClassRoot, devRoot)
 		if err == nil && devicePath != "" {
 			return devicePath, nil
 		}
@@ -989,11 +994,8 @@ func findISCSIDevice(iqn string, lun int) (string, error) {
 	return "", fmt.Errorf("device not found for iqn=%s, lun=%d", iqn, lun)
 }
 
-// findDeviceForSession finds the block device for a specific session and LUN.
-func findDeviceForSession(sessionName string, lun int) (string, error) {
-	return findDeviceForSessionInPaths(sessionName, lun, "/sys/class", "/dev")
-}
-
+// findDeviceForSessionInPaths finds the block device for a specific session and
+// LUN whose /dev node is current (see isCurrentBlockDeviceNode).
 func findDeviceForSessionInPaths(sessionName string, lun int, sysClassRoot, devRoot string) (string, error) {
 	// Extract session number
 	var sessionNum int
@@ -1025,14 +1027,51 @@ func findDeviceForSessionInPaths(sessionName string, lun int, sysClassRoot, devR
 			return "", globErr
 		}
 		for _, device := range devices {
-			devicePath := filepath.Join(devRoot, filepath.Base(device))
-			if _, statErr := os.Stat(devicePath); statErr == nil {
+			name := filepath.Base(device)
+			devicePath := filepath.Join(devRoot, name)
+			if isCurrentBlockDeviceNode(devicePath, filepath.Join(sysClassRoot, "block", name, "dev")) {
 				return devicePath, nil
 			}
 		}
 	}
 
 	return "", fmt.Errorf("device for session %d not found", sessionNum)
+}
+
+// blockDeviceNumber returns the device number of the block device node at path,
+// following symlinks. It is a seam because test fixtures cannot mknod.
+var blockDeviceNumber = func(path string) (uint64, error) {
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil {
+		return 0, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return 0, fmt.Errorf("%s is not a block device", path)
+	}
+	return uint64(stat.Rdev), nil //nolint:unconvert // Stat_t.Rdev width differs per platform (darwin: int32)
+}
+
+// isCurrentBlockDeviceNode reports whether devicePath is a block device node
+// whose number equals the kernel's for that disk (sysDevFile holds "MAJ:MIN").
+// Right after a logout and a new login to the same target, sysfs already names
+// the new disk while /dev can still hold the previous disk's node of the same
+// name (devtmpfs/udev removal lags), or a stale node with no fresh one yet.
+// Opening such a node fails with ENXIO/ENODEV, so a device wait must keep
+// polling until the node matches. One stat and one small sysfs read.
+func isCurrentBlockDeviceNode(devicePath, sysDevFile string) bool {
+	rdev, err := blockDeviceNumber(devicePath)
+	if err != nil {
+		return false
+	}
+	want, err := os.ReadFile(sysDevFile)
+	if err != nil {
+		return false
+	}
+	var major, minor uint32
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(want)), "%d:%d", &major, &minor); err != nil {
+		return false
+	}
+	return unix.Major(rdev) == major && unix.Minor(rdev) == minor
 }
 
 // CheckISCSIDeviceMultipathOwnership refuses raw SCSI devices that multipathd
@@ -1109,17 +1148,20 @@ func findISCSIMultipathDeviceInPaths(wwid, sysBlockRoot, devRoot string) (string
 			continue
 		}
 		name, nameErr := os.ReadFile(filepath.Join(dmDevice, "dm", "name"))
+		// A just-built map can sit beside the previous map's /dev/mapper link or
+		// dm node (removal lags), so either path must carry this map's number.
+		sysDevFile := filepath.Join(dmDevice, "dev")
 		// A legitimate device-mapper name is a single path component (no "/").
 		// Refusing anything else keeps a corrupted/adversarial sysfs read from
 		// building a mapperPath that escapes devRoot/mapper via "..".
 		if trimmedName := strings.TrimSpace(string(name)); nameErr == nil && trimmedName != "" && !strings.ContainsRune(trimmedName, '/') {
 			mapperPath := filepath.Join(devRoot, "mapper", trimmedName)
-			if _, statErr := os.Stat(mapperPath); statErr == nil { //nolint:gosec // trimmedName is validated just above to contain no "/", so mapperPath cannot escape devRoot/mapper via ".."; gosec's taint tracker flags the Stat sink regardless of that guard
+			if isCurrentBlockDeviceNode(mapperPath, sysDevFile) {
 				return mapperPath, nil
 			}
 		}
 		devicePath := filepath.Join(devRoot, filepath.Base(dmDevice))
-		if _, statErr := os.Stat(devicePath); statErr == nil {
+		if isCurrentBlockDeviceNode(devicePath, sysDevFile) {
 			return devicePath, nil
 		}
 	}
@@ -1168,6 +1210,68 @@ func ISCSIRescanSessionWithContext(ctx context.Context, portal, iqn string) erro
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("rescan failed: %w, output: %s", err, string(output))
+	}
+	return nil
+}
+
+// MultipathPaths returns the dm-multipath map devicePath is (or resolves to)
+// and the path devices under it. isMap is false for a plain disk and for any
+// dm device whose dm UUID is not mpath-<wwid>.
+func MultipathPaths(devicePath string) (mapName string, paths []string, isMap bool, err error) {
+	return multipathPathsIn(devicePath, "/sys/block", "/dev")
+}
+
+func multipathPathsIn(devicePath, sysBlockRoot, devRoot string) (mapName string, paths []string, isMap bool, err error) {
+	if resolved, resolveErr := filepath.EvalSymlinks(devicePath); resolveErr == nil {
+		devicePath = resolved
+	}
+	devicePath = blockDeviceParentAt(filepath.Join(filepath.Dir(sysBlockRoot), "class", "block"), devicePath)
+	deviceName := filepath.Base(devicePath)
+	if !strings.HasPrefix(deviceName, "dm-") {
+		return "", nil, false, nil
+	}
+	// Only a dm-multipath map (dm UUID mpath-<wwid>) is a map; any other dm
+	// device (a kpartx partition, an LVM volume) is a single device.
+	uuid, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "uuid"))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return "", nil, false, fmt.Errorf("failed to read the dm UUID of %s: %w", devicePath, readErr)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(string(uuid)), "mpath-") {
+		return "", nil, false, nil
+	}
+	name, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "name"))
+	if readErr != nil {
+		return "", nil, true, fmt.Errorf("failed to read the map name of %s: %w", devicePath, readErr)
+	}
+	slaves, readErr := os.ReadDir(filepath.Join(sysBlockRoot, deviceName, "slaves"))
+	if readErr != nil {
+		return "", nil, true, fmt.Errorf("failed to inspect dm-multipath slaves for %s: %w", devicePath, readErr)
+	}
+	for _, slave := range slaves {
+		paths = append(paths, filepath.Join(devRoot, slave.Name()))
+	}
+	return strings.TrimSpace(string(name)), paths, true, nil
+}
+
+// MultipathResizeMapWithContext runs `multipathd resize map <name>`: a map
+// takes its paths' new size only when told to, after every path was
+// rescanned. Bounded by the inbound context and the iSCSI timeout.
+func MultipathResizeMapWithContext(ctx context.Context, mapName string) error {
+	ctx, cancel, err := commandContext(ctx, getISCSITimeout())
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "multipathd", "resize", "map", mapName)
+	cmd.Env = localeInvariantEnv()
+	HardenCmd(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("multipathd resize map %s failed: %w, output: %s", mapName, err, string(output))
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(string(output))), "fail") {
+		return fmt.Errorf("multipathd resize map %s failed, output: %s", mapName, string(output))
 	}
 	return nil
 }

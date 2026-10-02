@@ -1207,6 +1207,14 @@
             "type": "string"
           }
         },
+        "nodeIdentityNetworks": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
         "shareMaprootUser": {
           "type": "string"
         },

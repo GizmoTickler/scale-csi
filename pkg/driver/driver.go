@@ -439,8 +439,12 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		// done) hangs node startup indefinitely and the pod never becomes
 		// serviceable. commandTimeouts.nvme is already the configured budget
 		// for every other nvme-cli invocation this driver makes.
+		identityNetworks, networksErr := parseNodeIdentityNetworks(cfg.Config.NFS.NodeIdentityNetworks)
+		if networksErr != nil {
+			return nil, networksErr
+		}
 		identityCtx, identityCancel := context.WithTimeout(context.Background(), util.GetConfig().NVMeTimeout)
-		identity := discoverNodeIdentity(identityCtx, cfg.NodeID)
+		identity := discoverNodeIdentity(identityCtx, cfg.NodeID, identityNetworks)
 		identityCancel()
 		identity = nodeIdentityForEnabledProtocols(identity, cfg.Config)
 		var identityErr error
@@ -448,6 +452,9 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		if identityErr != nil {
 			return nil, fmt.Errorf("node startup identity cannot be encoded within CSI's %d-byte node_id limit: %w",
 				maxCSINodeIDBytes, identityErr)
+		}
+		for _, ip := range nodeIdentityDroppedIPs(identity, identityNetworks, encodedNodeID) {
+			klog.Warningf("nfs.nodeIdentityNetworks address %s does not fit in CSI's %d-byte node_id and is left out: the controller cannot grant it, so NFS mounts from it will be refused", ip, maxCSINodeIDBytes)
 		}
 	}
 

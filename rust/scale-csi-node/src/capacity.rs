@@ -42,9 +42,12 @@ fn sectors_to_bytes(path: &Path) -> Result<i64> {
         .with_context(|| format!("device size from {} exceeds int64 bytes", path.display()))
 }
 
-/// A block device's size in bytes, from sysfs by name.
+/// A block device's size in bytes, from sysfs by name. A link
+/// (`/dev/mapper/<name>`) is resolved to the node it names first: sysfs knows
+/// a multipath map as dm-N only.
 pub fn device_size(state: &State, device: &str) -> Result<i64> {
-    let name = Path::new(device).file_name().context("a device path has a name")?;
+    let resolved = std::fs::canonicalize(device).unwrap_or_else(|_| Path::new(device).to_path_buf());
+    let name = resolved.file_name().context("a device path has a name")?;
     sectors_to_bytes(&state.host.sysfs.join("class/block").join(name).join("size"))
 }
 
@@ -234,12 +237,34 @@ pub async fn node_expand_volume(
         }
         return Err(Status::internal("failed to resolve block device for expansion"));
     }
-    if crate::nvme::controller_of(&device).is_none() {
+    let transport = if crate::nvme::controller_of(&device).is_some() {
+        Transport::Nvme
+    } else if state.config.iscsi_enabled
+        && (state.iscsi.is_likely_iscsi_device(
+            &std::fs::canonicalize(&device).map_or_else(|_| device.clone(), |p| p.to_string_lossy().into_owned()),
+        ) || crate::capability::attach_driver(&Default::default(), &state.driver_name) == ShareType::Iscsi)
+    {
+        // Go blockTransportForDevice: a SCSI disk or dm-multipath map, else
+        // the driver's default protocol. A /dev/mapper name is resolved to its
+        // dm-N first (the Go node classifies the link's own name, so a
+        // multipath filesystem on a generic driver name was never rescanned).
+        Transport::Iscsi
+    } else {
         return Err(Status::failed_precondition(format!(
-            "volume {volume_id} is on {device}, which is not an NVMe-oF device; the Rust node agent does not serve it yet"
+            "volume {volume_id} is on {device}, which is not an NVMe-oF or iSCSI device; the Rust node agent does not serve it yet"
         )));
-    }
-    expand_kernel_nvme(state, volume_id, path, &device, raw_block, capacity, deadline).await
+    };
+    expand_kernel(
+        state, volume_id, path, &device, raw_block, capacity, transport, deadline,
+    )
+    .await
+}
+
+/// The kernel transport a block device is rescanned through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Nvme,
+    Iscsi,
 }
 
 /// How long a rescanned device may take to show its new size.
@@ -274,19 +299,24 @@ async fn wait_for_device_size(state: &State, device: &str, before: Option<i64>, 
     }
 }
 
-/// Kernel NVMe-oF: rescan the namespace, wait for the size, then grow the
-/// filesystem (or, raw block, just check the size).
-async fn expand_kernel_nvme(
+/// Kernel NVMe-oF and iSCSI: rescan the namespace or the session, wait for
+/// the size, then grow the filesystem (or, raw block, just check the size).
+#[allow(clippy::too_many_arguments)]
+async fn expand_kernel(
     state: &State,
     volume_id: &str,
     path: &str,
     device: &str,
     raw_block: bool,
     capacity: i64,
+    transport: Transport,
     deadline: Option<Instant>,
 ) -> Result<csi::NodeExpandVolumeResponse, Status> {
     if raw_block {
-        crate::nvme_kernel::validate_raw_block_ownership(state, volume_id, device)?;
+        match transport {
+            Transport::Nvme => crate::nvme_kernel::validate_raw_block_ownership(state, volume_id, device)?,
+            Transport::Iscsi => crate::iscsi_stage::validate_raw_block_ownership(state, volume_id, device).await?,
+        }
     }
     let before = match device_size(state, device) {
         Ok(size) => {
@@ -298,11 +328,14 @@ async fn expand_kernel_nvme(
             None
         }
     };
-    state
-        .nvme
-        .rescan(device, deadline)
-        .await
-        .map_err(|e| Status::internal(format!("failed to rescan NVMe-oF device {device}: {e:#}")))?;
+    match transport {
+        Transport::Nvme => state
+            .nvme
+            .rescan(device, deadline)
+            .await
+            .map_err(|e| Status::internal(format!("failed to rescan NVMe-oF device {device}: {e:#}")))?,
+        Transport::Iscsi => crate::iscsi_stage::rescan_device(state, device, deadline).await?,
+    }
     let after = wait_for_device_size(state, device, before, capacity)
         .await
         .map_err(|e| Status::internal(format!("device size did not settle after rescan for {device}: {e:#}")))?;

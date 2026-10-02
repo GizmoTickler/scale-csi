@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status};
 use crate::config::Config;
 use crate::csi::{self, identity_server::Identity, node_server::Node};
 use crate::events::{Events, LogEvents};
+use crate::iscsi::Iscsi;
 use crate::locks::OperationLocks;
 use crate::metrics::Metrics;
 use crate::mount::{CLocaleRunner, Mounter, Timeouts};
@@ -27,11 +28,18 @@ use crate::ublk_client::{self, Daemon};
 /// A path's device number, when it is a block device.
 pub type BlockDeviceNumber = Arc<dyn Fn(&str) -> std::io::Result<Option<u64>> + Send + Sync>;
 
-fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
+pub(crate) fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let meta = std::fs::metadata(path)?;
     Ok(meta.file_type().is_block_device().then(|| meta.rdev()))
 }
+
+/// lstat(2) of a path the node looks at directly (never one that may be a
+/// network mount: on a dead server it blocks).
+pub type PathProbe = Arc<dyn Fn(&str) -> std::io::Result<std::fs::Metadata> + Send + Sync>;
+
+/// readlink(2) of a staging path.
+pub type LinkReader = Arc<dyn Fn(&str) -> std::io::Result<PathBuf> + Send + Sync>;
 
 /// Where the node looks at the host; the tests point it elsewhere.
 pub struct Host {
@@ -43,6 +51,9 @@ pub struct Host {
     pub host_id_files: Vec<PathBuf>,
     /// stat(2) of a block device's number (the tests supply their own).
     pub device_number: BlockDeviceNumber,
+    /// lstat(2) and readlink(2) of a path (the tests watch which paths).
+    pub lstat: PathProbe,
+    pub read_link: LinkReader,
 }
 
 impl Default for Host {
@@ -53,6 +64,8 @@ impl Default for Host {
             sysfs: PathBuf::from("/sys"),
             host_id_files: crate::ublk_state::default_host_id_files(),
             device_number: Arc::new(block_device_number),
+            lstat: Arc::new(|path: &str| std::fs::symlink_metadata(path)),
+            read_link: Arc::new(|path: &str| std::fs::read_link(path)),
         }
     }
 }
@@ -81,6 +94,10 @@ pub struct State {
     pub operations: Arc<RwLock<()>>,
     /// Session GC's orphaned sessions and when it first saw them.
     pub orphans: crate::session_gc::Orphans,
+    /// The kernel iSCSI initiator (iscsiadm and sysfs).
+    pub iscsi: Iscsi,
+    /// Session GC's orphaned iSCSI sessions, kept apart from NVMe-oF's.
+    pub iscsi_orphans: crate::session_gc::Orphans,
 }
 
 impl State {
@@ -93,6 +110,9 @@ impl State {
             format: config.command_timeouts.format(),
         };
         let nvme_timeout = config.command_timeouts.nvme();
+        let mut iscsi = Iscsi::new(Arc::new(CLocaleRunner), config.command_timeouts.iscsi());
+        iscsi.max_concurrent_logins = config.rate_limiting.max_concurrent_logins();
+        iscsi.discovery_cache = config.rate_limiting.discovery_cache_duration();
         State {
             metrics,
             driver_name,
@@ -116,6 +136,8 @@ impl State {
             host: Host::default(),
             operations: Arc::default(),
             orphans: Default::default(),
+            iscsi,
+            iscsi_orphans: Default::default(),
         }
     }
 }

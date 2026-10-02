@@ -8,8 +8,9 @@
 //! a raw-block volume gets a symlink to its device at the staging path, a
 //! filesystem volume is formatted if blank and mounted there.
 //!
-//! This agent serves NVMe-oF through nvmeublkd only, so far. A volume on any
-//! other path is refused with FailedPrecondition before anything is changed.
+//! This agent serves NVMe-oF (nvmeublkd and the kernel initiator), iSCSI where
+//! the install enables it, and NFS (`nfs.rs`). Any other volume is refused with
+//! FailedPrecondition before anything is changed.
 
 use std::collections::HashMap;
 use std::os::unix::fs::DirBuilderExt;
@@ -27,7 +28,8 @@ use crate::config::DataPath;
 use crate::csi;
 use crate::events::node_volume_ref;
 use crate::locks::node_volume_key;
-use crate::mount::Mounter;
+use crate::mount::{Mounter, is_nfs_mount_source};
+use crate::nfs;
 use crate::nvme_kernel;
 use crate::records::MountRecord;
 use crate::service::State;
@@ -100,10 +102,7 @@ async fn verify_stage_device_source(
             ublk_stage::verify_stage_source(state, volume_id, device, context, deadline).await
         }
         ShareType::Nvmeof => nvme_kernel::verify_stage_source(state, device, context),
-        _ => Err(not_served(format!(
-            "staging target is backed by {device}, a kernel {} device",
-            share_name(share)
-        ))),
+        ShareType::Iscsi => crate::iscsi_stage::verify_stage_source(state, device, context).await,
     }
 }
 
@@ -137,7 +136,14 @@ pub async fn handle_existing_stage(state: &State, want: &Wanted<'_>) -> Result<b
         .is_mounted(staging, want.deadline)
         .await
         .map_err(|e| Status::internal(format!("failed to check mount status: {e:#}")))?;
-    let symlink = std::fs::symlink_metadata(staging).is_ok_and(|m| m.file_type().is_symlink());
+    // A mount point is never a symlink; a dead network mount's lstat would
+    // block, so it is not looked at.
+    let symlink = !mounted && {
+        let (path, lstat) = (staging.to_string(), state.host.lstat.clone());
+        bounded_path_call(state, move || lstat(&path).is_ok_and(|m| m.file_type().is_symlink()))
+            .await
+            .unwrap_or(false)
+    };
     if !mounted && !symlink {
         state.records.delete_stage(staging);
         return Ok(false);
@@ -181,8 +187,12 @@ pub async fn handle_existing_stage(state: &State, want: &Wanted<'_>) -> Result<b
             // ANOTHER volume's device. The daemon already proved it stale;
             // unless a record says the path is another volume's, re-stage (the
             // other device is never touched).
-            if is_ublk_device(&device)
-                && source.code() == Code::AlreadyExists
+            // iSCSI disk names are reassigned in login order after a reboot
+            // the same way; the session proves the link stale there.
+            let stale = (is_ublk_device(&device) && source.code() == Code::AlreadyExists)
+                || (want.share == ShareType::Iscsi
+                    && crate::iscsi_stage::link_is_stale(state, &device, want.context).await);
+            if stale
                 && state
                     .records
                     .stage(staging)
@@ -295,13 +305,21 @@ pub async fn node_stage(
         .ok_or_else(|| Status::aborted("operation already in progress"))?;
 
     let share = capability::attach_driver(&req.volume_context, &state.driver_name);
-    if share != ShareType::Nvmeof {
+    // iSCSI is served where the install enables it (the Go node would try
+    // anyway; an install without it has no iSCSI settings to stage with).
+    if share == ShareType::Iscsi && !state.config.iscsi_enabled {
         return Err(not_served(format!(
             "volume {volume_id} is a {} volume",
             share_name(share)
         )));
     }
-    let stage_context = with_publish_hint(&req.volume_context, &req.publish_context, "addresses");
+    // The attach-scoped path hint: iSCSI portals, NVMe-oF addresses.
+    let hint = if share == ShareType::Iscsi {
+        "portals"
+    } else {
+        "addresses"
+    };
+    let stage_context = with_publish_hint(&req.volume_context, &req.publish_context, hint);
     let signature = capability::signature(Some(capability))?;
     let expected = capability::stage_source_identity(share, &req.volume_context)?;
     let want = Wanted {
@@ -314,6 +332,34 @@ pub async fn node_stage(
         deadline,
     };
     if handle_existing_stage(state, &want).await? {
+        if share == ShareType::Iscsi {
+            let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+            crate::iscsi_stage::converge_existing(
+                state,
+                &stage_context,
+                &req.secrets,
+                staging,
+                event.as_ref(),
+                deadline,
+            )
+            .await;
+            info!("Volume {volume_id} is already staged compatibly at {staging}");
+            return Ok(());
+        }
+        if share == ShareType::Nfs {
+            let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+            nfs::converge_existing(
+                state,
+                &stage_context,
+                staging,
+                Some(capability),
+                event.as_ref(),
+                deadline,
+            )
+            .await;
+            info!("Volume {volume_id} is already staged compatibly at {staging}");
+            return Ok(());
+        }
         // Kernel path convergence is for kernel controllers only: a ublk
         // device has none, and the daemon runs its own multipath.
         let ublk = state
@@ -341,6 +387,43 @@ pub async fn node_stage(
         .create(directory)
         .map_err(|e| Status::internal(format!("failed to create staging directory: {e}")))?;
     let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
+
+    if share == ShareType::Iscsi {
+        crate::iscsi_stage::stage(
+            state,
+            crate::iscsi_stage::StageRequest {
+                context: &stage_context,
+                secrets: &req.secrets,
+                staging,
+                capability,
+                event: event.as_ref(),
+                deadline,
+            },
+        )
+        .await?;
+        if !handle_existing_stage(state, &want).await? {
+            remember_stage(state, &want).await;
+        }
+        info!("Volume {volume_id} staged successfully at {staging}");
+        return Ok(());
+    }
+
+    if share == ShareType::Nfs {
+        nfs::stage(
+            state,
+            &stage_context,
+            staging,
+            Some(capability),
+            event.as_ref(),
+            deadline,
+        )
+        .await?;
+        if !handle_existing_stage(state, &want).await? {
+            remember_stage(state, &want).await;
+        }
+        info!("Volume {volume_id} staged successfully at {staging}");
+        return Ok(());
+    }
 
     match ublk_stage::data_path_for_volume(state, &stage_context)? {
         DataPath::Ublk => {
@@ -380,14 +463,124 @@ pub async fn node_stage(
     Ok(())
 }
 
-/// `os.RemoveAll`: absent is fine, a directory goes with its contents.
-pub(crate) fn remove_all(path: &str) -> std::io::Result<()> {
+/// The source of the topmost mount on `path`, from mountinfo (never stats
+/// `path`, which on a dead NFS server blocks).
+fn mountinfo_source(state: &State, path: &str) -> Option<String> {
+    let mounts = state.mounter.list_mounts().ok()?;
+    mounts
+        .into_iter()
+        .rev()
+        .find(|m| m.target == path)
+        .map(|m| m.source)
+        .filter(|s| !s.is_empty())
+}
+
+/// Runs a filesystem call off the async workers, bounded by the mount
+/// timeout. A path call on a dead hard NFS mount blocks in D state; on a
+/// runtime worker that stalls every RPC once enough volumes hang, here it
+/// holds one blocking-pool thread and the caller gets `None`.
+pub(crate) async fn bounded_path_call<T: Send + 'static>(
+    state: &State,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match tokio::time::timeout(state.mounter.timeouts.mount, tokio::task::spawn_blocking(call)).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            warn!("filesystem call failed to run: {e}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "filesystem call did not return within {:?}",
+                state.mounter.timeouts.mount
+            );
+            None
+        }
+    }
+}
+
+/// Removes an unmounted mount point without descending into it (mount-utils
+/// CleanupMountPoint): absent is fine, a directory goes only when empty, a
+/// file (a raw-block bind target) goes. Never recursive: what is under a mount
+/// point may be a volume's data.
+fn remove_mount_point(path: &str) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
         Ok(_) => std::fs::remove_file(path),
     }
+}
+
+/// rmdir(2)'s answer for a directory that still has entries.
+fn is_not_empty(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST))
+}
+
+/// Removes an unmounted mount point. A directory that still has files in it
+/// fails the call: reporting success would leave kubelet's own teardown
+/// failing with ENOTEMPTY forever, and the files are not ours to delete.
+/// `what` names the path ("staging path", "target path").
+pub(crate) fn cleanup_mount_point(path: &str, what: &str) -> Result<(), Status> {
+    match remove_mount_point(path) {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_empty(&e) => Err(Status::internal(format!(
+            "{what} {path} is not empty after unmount; its contents (on the node's disk, not the volume) are left in place and must be removed by hand"
+        ))),
+        Err(e) => {
+            warn!("Failed to remove {what} {path}: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Unmounts `path` and proves nothing is left mounted there before it may be
+/// removed. One umount lifts only the top of a stack of mounts, and what is
+/// underneath may be a live share or filesystem. `what` names the path in
+/// errors ("staging path", "target path").
+pub(crate) async fn unmount_fully(
+    state: &State,
+    path: &str,
+    what: &str,
+    deadline: Option<Instant>,
+) -> Result<(), Status> {
+    let unmounted = state.mounter.unmount(path, deadline).await;
+    if let Err(unmount) = &unmounted {
+        warn!("Failed to unmount {what}: {unmount:#}");
+    }
+    // The check runs on the mount timeout alone: a slow unmount that
+    // succeeded may have spent the RPC's deadline, and an unanswered check
+    // would fail the call although nothing is mounted any more.
+    match (state.mounter.is_mounted(path, None).await, unmounted) {
+        (Ok(false), Err(_)) => {
+            info!("{} {path} is not mounted, proceeding with cleanup", capitalize(what));
+            Ok(())
+        }
+        (Ok(false), Ok(())) => Ok(()),
+        (Err(check), Err(unmount)) => {
+            warn!("Failed to check mount status after unmount failure: {check:#}");
+            Err(Status::internal(format!(
+                "failed to unmount {what} and cannot verify mount status: {unmount:#}"
+            )))
+        }
+        (Err(check), Ok(())) => Err(Status::internal(format!(
+            "cannot verify that {what} {path} is unmounted: {check:#}"
+        ))),
+        (Ok(true), Err(unmount)) => Err(Status::internal(format!(
+            "failed to unmount {what} (still mounted): {unmount:#}"
+        ))),
+        (Ok(true), Ok(())) => Err(Status::internal(format!(
+            "{what} {path} is still mounted after unmount: another mount is stacked underneath; retrying unmounts it"
+        ))),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 pub async fn node_unstage(
@@ -408,30 +601,56 @@ pub async fn node_unstage(
         .try_lock(node_volume_key(volume_id))
         .ok_or_else(|| Status::aborted("operation already in progress"))?;
 
+    nfs::cleanup_trunk_probes(state, staging, deadline).await;
+
     // The device, read before anything is unmounted; a block volume's staging
-    // path is a symlink to it, not a mount.
-    let device = match state.mounter.mount_source(staging, deadline).await {
-        Ok(device) if !device.is_empty() => device,
-        mounted => match std::fs::read_link(staging) {
-            Ok(target) => target.to_string_lossy().into_owned(),
-            Err(link) => {
-                debug!(
-                    "Could not get device from staging path {staging}: mount err={:?}, symlink err={link}",
-                    mounted.err()
-                );
-                String::new()
-            }
-        },
+    // path is a symlink to it, not a mount. findmnt stats the path, so on a
+    // dead server it fails; mountinfo names the source without touching the
+    // path. Only a path with nothing mounted on it is looked at directly.
+    let in_mountinfo = mountinfo_source(state, staging);
+    // A mount point is never a symlink (mount resolves one); anything else is
+    // a local path, and its lstat is still bounded.
+    let symlink = match in_mountinfo {
+        Some(_) => false,
+        None => {
+            let (path, lstat) = (staging.to_string(), state.host.lstat.clone());
+            bounded_path_call(state, move || lstat(&path).is_ok_and(|m| m.file_type().is_symlink()))
+                .await
+                .unwrap_or(false)
+        }
     };
-    // Only NVMe-oF is served: an iSCSI (or other) device is refused before
-    // anything changes rather than half unstaged.
-    if !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") {
+    let mounted_source = match state.mounter.mount_source(staging, deadline).await {
+        Ok(device) if !device.is_empty() => Some(device),
+        found => {
+            if in_mountinfo.is_none() {
+                debug!("Nothing mounted on staging path {staging} (findmnt: {:?})", found.err());
+            }
+            in_mountinfo
+        }
+    };
+    let link = match (&mounted_source, symlink) {
+        (None, true) => {
+            let (path, read_link) = (staging.to_string(), state.host.read_link.clone());
+            bounded_path_call(state, move || read_link(&path))
+                .await
+                .and_then(Result::ok)
+                .map(|target| target.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
+    let device = mounted_source.or(link).unwrap_or_default();
+    // An NFS mount's source is server:/share; it holds no session.
+    let nfs = is_nfs_mount_source(&device);
+    // Without iSCSI only NVMe-oF and NFS are served: another device is refused
+    // before anything changes rather than half unstaged. With it, a device that
+    // is not NVMe-oF is cleaned up as iSCSI, as in the Go node.
+    if !nfs && !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") && !state.config.iscsi_enabled
+    {
         return Err(not_served(format!(
             "volume {volume_id} is staged on {device}, which is not an NVMe-oF device"
         )));
     }
 
-    let symlink = std::fs::symlink_metadata(staging).is_ok_and(|m| m.file_type().is_symlink());
     if symlink {
         if let Err(e) = std::fs::remove_file(staging)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -439,26 +658,13 @@ pub async fn node_unstage(
             warn!("Failed to remove staging symlink: {e}");
         }
     } else {
-        if let Err(unmount) = state.mounter.unmount(staging, deadline).await {
-            warn!("Failed to unmount staging path: {unmount:#}");
-            match state.mounter.is_mounted(staging, deadline).await {
-                Err(check) => {
-                    warn!("Failed to check mount status after unmount failure: {check:#}");
-                    return Err(Status::internal(format!(
-                        "failed to unmount staging path and cannot verify mount status: {unmount:#}"
-                    )));
-                }
-                Ok(true) => {
-                    return Err(Status::internal(format!(
-                        "failed to unmount staging path (still mounted): {unmount:#}"
-                    )));
-                }
-                Ok(false) => info!("Staging path {staging} is not mounted, proceeding with cleanup"),
-            }
-        }
-        if let Err(e) = remove_all(staging) {
-            warn!("Failed to remove staging directory: {e}");
-        }
+        unmount_fully(state, staging, "staging path", deadline).await?;
+        cleanup_mount_point(staging, "staging path")?;
+    }
+    if nfs {
+        state.records.delete_stage(staging);
+        info!("Volume {volume_id} unstaged successfully");
+        return Ok(());
     }
 
     // The userspace data path holds no kernel session: detach from nvmeublkd
@@ -467,12 +673,14 @@ pub async fn node_unstage(
         // A block link's literal /dev name can be stale after a reboot: the
         // session is found by the volume's subsystem name instead. A device
         // read from the live mount before the unmount is safe to use.
-        let cleanup =
-            if !symlink && !device.is_empty() && nvme_kernel::disconnect_device(state, &device, deadline).await {
-                Ok(())
-            } else {
-                nvme_kernel::cleanup_by_volume(state, volume_id, deadline).await
-            };
+        let iscsi = !device.contains("nvme") && (!device.is_empty() || state.config.iscsi_enabled);
+        let cleanup = if iscsi {
+            crate::iscsi_stage::unstage_cleanup(state, volume_id, &device, symlink, deadline).await
+        } else if !symlink && !device.is_empty() && nvme_kernel::disconnect_device(state, &device, deadline).await {
+            Ok(())
+        } else {
+            nvme_kernel::cleanup_by_volume(state, volume_id, deadline).await
+        };
         // Fail closed: a session that was found but would not disconnect is
         // not unstaged, so kubelet retries rather than leaking it.
         cleanup.map_err(|e| {
@@ -584,6 +792,23 @@ pub fn create_symlink_atomic(target: &Path, link: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mount_point_is_removed_only_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        cleanup_mount_point(&path("absent"), "target path").expect("absent is fine");
+        std::fs::write(path("block-target"), b"").unwrap();
+        cleanup_mount_point(&path("block-target"), "target path").expect("a raw-block bind target goes");
+        assert!(!Path::new(&path("block-target")).exists());
+        std::fs::create_dir(path("empty")).unwrap();
+        cleanup_mount_point(&path("empty"), "target path").unwrap();
+        assert!(!Path::new(&path("empty")).exists());
+        std::fs::create_dir_all(dir.path().join("full/sub")).unwrap();
+        let err = cleanup_mount_point(&path("full"), "target path").unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(dir.path().join("full/sub").exists(), "never recursive");
+    }
 
     #[test]
     fn symlink_replacement_rules() {
