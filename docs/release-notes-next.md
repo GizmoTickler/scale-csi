@@ -1,5 +1,73 @@
 # Release notes — v1.17.0 (next)
 
+## v1.22.0 (draft) — a restart of seconds, a drain that does not wait for it
+
+Nothing to configure. Startup with strict fencing, a drain that overlaps a
+controller restart, and ListVolumes all cost less.
+
+At 1,000 volumes, a controller restart with everything already in place
+takes about 3 s if TrueNAS serves the controller's concurrent reads in
+parallel, and about 10 s if it serialises them (9.8 s in the serial run),
+against 34 s and 107 s before. These times are not measured on hardware.
+They come from an in-process model: the TrueNAS mock with per-call latencies
+calibrated on nas01, strict fencing, NVMe-oF with four portals, records in
+Kubernetes. Whether nas01 serves the reads in parallel is not established,
+hence the range.
+
+| | 30 volumes | 300 | 1,000 |
+|---|---|---|---|
+| Restart, everything in place, reads served in parallel | 0.9 s → 0.3 s | 8.8 s → 1.1 s | 34 s → 3.1 s |
+| Restart, everything in place, reads serialised | 3.3 s → 0.4 s | 32 s → 3.1 s | 107 s → 9.8 s |
+| 30-volume drain overlapping a restart (10 moves at 30 volumes) | 10.6 s → 6.1 s | 41 s → 18.2 s | 101 s → 18.4 s |
+
+The model charges each portal's port lookup once per process, as a point
+read: the client caches the port after that.
+
+- **Per-volume readiness for publishes.** With strict fencing a
+  ControllerPublishVolume no longer waits until every attached volume in the
+  cluster has converged. Once startup has taken its VolumeAttachment
+  snapshot, a publish waits only for its own volume: a volume that has
+  converged, or had no VolumeAttachment in the snapshot, is published at
+  once; one still pending is converged by the publish itself, under the
+  volume lock, before the node is granted, and the publish returns
+  Unavailable if that fails. CreateVolume, ControllerExpandVolume and the
+  other provisioning calls still wait for global readiness, as before.
+- **A busy volume no longer fails the startup pass.** A startup worker waits
+  up to 15 seconds for a volume lock a live operation holds, and when some
+  volumes do fail, the retry re-runs only those.
+- **Diff-first startup.** A full startup pass reads the fleet once (the
+  attached volumes' datasets, by name, in up to four requests, and the nvmet
+  subsystem, namespace, port and host tables) and converges on its own, under
+  the volume lock, only the volumes whose records or backend differ from what
+  their attachments need. A restart with everything in place makes no
+  per-volume TrueNAS call and takes no volume lock. This covers strict
+  NVMe-oF volumes; NFS, iSCSI and additive mode take the per-volume path as
+  before. A volume a live operation touches while the diff reads is never
+  judged from those reads. The diff never grants, revokes or writes a
+  volume's records or share. On a fresh process it does resolve the
+  configured portals, up to four port lookups with multipath, and
+  NVMeoFGetOrCreatePort creates a port that is missing, as the per-volume
+  path would.
+- **ListVolumes from the listing.** With records in Kubernetes, a
+  ListVolumes walk takes each entry's capacity from the one managed-dataset
+  listing it already makes and its published nodes from the
+  VolumePublication cache, instead of re-reading every page from TrueNAS.
+  Only a dataset that still carries ZFS publication records (not yet
+  imported) is re-read. At 1,000 volumes a walk is 1 TrueNAS call instead of
+  11, and in the benchmark 144 ms and 17.8 MB instead of 343 ms and 30.1 MB.
+  With records on ZFS every page is still re-read by name, as before, because
+  a record written during the walk exists only on its dataset. The entries
+  are the same as before, with two exceptions. With records in Kubernetes, a
+  later page reports a volume's capacity as the walk's first page listed it,
+  so a volume expanded mid-walk shows its new size on the next walk. And a
+  zvol whose volsize cannot be read is reported with capacity 0 (unknown)
+  instead of the pool's free space. A volume deleted while a walk is in
+  flight is left out of it, as before.
+- **Concurrent listings share one read.** The startup readers that list every
+  managed dataset at about the same time (the stale-record sweep, the orphan
+  reconcile, the publication import, the unlock reconciler, ListVolumes) now
+  share one listing in flight; each gets its own copy.
+
 ## v1.21.0 — the Rust node agent is the default
 
 `node.implementation` now defaults to `rust`: the node DaemonSet runs the Rust

@@ -141,6 +141,11 @@ type Driver struct {
 	snapshotPageCache     []*truenas.Snapshot
 	snapshotPageCacheTime time.Time
 
+	// managedListingMu guards managedListing, the managed-dataset listing in
+	// flight that concurrent callers share (listAllManagedDatasets).
+	managedListingMu sync.Mutex
+	managedListing   *managedListingCall
+
 	// ListVolumes paging cache (P-3): the name-sorted managed-dataset listing
 	// fetched at the START of a paging walk (empty starting token), served to
 	// that walk's continuation pages within a short TTL. pool.dataset.query
@@ -152,9 +157,22 @@ type Driver struct {
 	// above: the cache feeds only read-only CSI listing pages, an empty
 	// starting token always refetches, and no delete/authorization decision
 	// ever reads it.
-	volumePageCacheMu   sync.Mutex
-	volumePageCache     []string // sorted dataset names of the walk's frozen listing
+	volumePageCacheMu sync.Mutex
+	volumePageCache   []listedVolume // the walk's frozen listing, sorted by name
+	// volumePageDeleted is when DeleteVolume removed each volume this
+	// controller deleted. A listing that began at or before that time may
+	// still hold the volume, so its pages leave it out. Entries no listing
+	// can need any more are pruned (pruneListedVolumeDeletes).
+	volumePageDeleted   map[string]time.Time
 	volumePageCacheTime time.Time
+	// volumePageCacheStart is when the cached view's listing began reading.
+	volumePageCacheStart time.Time
+	// volumePageListings are the ListVolumes listings in flight, each with
+	// the earliest time its rows can date from.
+	volumePageListings map[*volumeListing]struct{}
+	// unknownVolsizeLogged is the zvols ListVolumes has warned about once
+	// for an unreadable volsize.
+	unknownVolsizeLogged sync.Map
 
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
@@ -255,6 +273,15 @@ type Driver struct {
 	// reconcile loop has returned: later re-run requests are dropped instead of
 	// collecting in startupReconcilePending with nothing left to take them.
 	startupReconcileExited bool
+	// startupLockWatch, while the startup diff reads, records every volume
+	// lock held or taken (startup_diff.go).
+	startupLockWatch atomic.Pointer[startupLockWatch]
+	// startupGateMu guards the per-volume publish gate (startup_gate.go):
+	// whether a pass has taken its VolumeAttachment snapshot, and the volumes
+	// that snapshot saw attached that have not converged since.
+	startupGateMu       sync.Mutex
+	startupGateSnapshot bool
+	startupGatePending  map[string]*startupFencingVolume
 
 	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
 	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
@@ -907,6 +934,12 @@ func (d *Driver) strictStartupControllerRPCBlocked(fullMethod string) bool {
 		return false
 	}
 	switch fullMethod {
+	case "/csi.v1.Controller/ControllerPublishVolume":
+		// Gated per volume inside the handler, under the volume lock
+		// (startupPublishGate): a volume that has converged, or that had no
+		// VolumeAttachment when startup took its snapshot, is published at
+		// once instead of waiting for every other volume.
+		return false
 	case "/csi.v1.Controller/ControllerGetCapabilities",
 		"/csi.v1.Controller/ValidateVolumeCapabilities",
 		"/csi.v1.Controller/GetCapacity",
@@ -958,15 +991,65 @@ func requestWithoutSecrets(req interface{}) interface{} {
 }
 
 // acquireOperationLock acquires a lock for the given operation key.
-// Returns false if the lock is already held.
+// Returns false if the lock is already held. The held value is a channel the
+// release closes, so a caller that may wait (acquireOperationLockWait) learns
+// of the release without polling.
 func (d *Driver) acquireOperationLock(key string) bool {
-	_, loaded := d.operationLock.LoadOrStore(key, struct{}{})
-	return !loaded
+	if _, held := d.operationLock.Load(key); held {
+		return false
+	}
+	if _, loaded := d.operationLock.LoadOrStore(key, make(chan struct{})); loaded {
+		return false
+	}
+	d.operationLockTaken(key)
+	return true
+}
+
+// operationLockTaken tells a running startup diff that key's lock was taken
+// (startupLockWatch).
+func (d *Driver) operationLockTaken(key string) {
+	if watch := d.startupLockWatch.Load(); watch != nil {
+		watch.touch(key)
+	}
+}
+
+// acquireOperationLockWait is acquireOperationLock that waits up to wait for
+// a held lock to be released. It returns false if the lock is still held
+// when wait runs out or ctx ends.
+func (d *Driver) acquireOperationLockWait(ctx context.Context, key string, wait time.Duration) bool {
+	if d.acquireOperationLock(key) {
+		return true
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		released := make(chan struct{})
+		actual, loaded := d.operationLock.LoadOrStore(key, released)
+		if !loaded {
+			d.operationLockTaken(key)
+			return true
+		}
+		held, ok := actual.(chan struct{})
+		if !ok {
+			return false
+		}
+		select {
+		case <-held:
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
 
 // releaseOperationLock releases the lock for the given operation key.
 func (d *Driver) releaseOperationLock(key string) {
-	d.operationLock.Delete(key)
+	if held, ok := d.operationLock.LoadAndDelete(key); ok {
+		if released, isChannel := held.(chan struct{}); isChannel {
+			close(released)
+		}
+	}
 }
 
 // GetTrueNASClient returns the TrueNAS API client.

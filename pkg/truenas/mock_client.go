@@ -2781,6 +2781,41 @@ func (m *MockClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsys
 	return associations, nil
 }
 
+// NVMeoFHostSubsysList returns a copy of every association.
+func (m *MockClient) NVMeoFHostSubsysList(ctx context.Context) ([]*NVMeoFHostSubsys, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	associations := make([]*NVMeoFHostSubsys, 0, len(m.NVMeHostSubsystems))
+	for _, association := range m.NVMeHostSubsystems {
+		associationCopy := *association
+		if m.EmptyNVMeHostNQN {
+			associationCopy.HostNQN = ""
+		}
+		associations = append(associations, &associationCopy)
+	}
+	sort.Slice(associations, func(i, j int) bool { return associations[i].ID < associations[j].ID })
+	return associations, nil
+}
+
+// NVMeoFHostList returns a copy of every host.
+func (m *MockClient) NVMeoFHostList(ctx context.Context) ([]*NVMeoFHost, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	hosts := make([]*NVMeoFHost, 0, len(m.NVMeHosts))
+	for _, host := range m.NVMeHosts {
+		hostCopy := *host
+		hosts = append(hosts, &hostCopy)
+	}
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].ID < hosts[j].ID })
+	return hosts, nil
+}
+
 func (m *MockClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3015,8 +3050,10 @@ func (m *MockClient) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespac
 
 	list := make([]*NVMeoFNamespace, 0, len(m.NVMeNamespaces))
 	for _, n := range m.NVMeNamespaces {
-		list = append(list, n)
+		namespaceCopy := *n
+		list = append(list, &namespaceCopy)
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list, nil
 }
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
@@ -3109,8 +3146,13 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 
 	list := make([]*NVMeoFSubsystem, 0, len(m.NVMeSubsystems))
 	for _, s := range m.NVMeSubsystems {
-		list = append(list, s)
+		subsystemCopy := *s
+		subsystemCopy.Hosts = append([]int(nil), s.Hosts...)
+		subsystemCopy.Namespaces = append([]int(nil), s.Namespaces...)
+		subsystemCopy.Ports = append([]int(nil), s.Ports...)
+		list = append(list, &subsystemCopy)
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list, nil
 }
 func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {

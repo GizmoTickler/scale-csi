@@ -28,6 +28,7 @@ func (p rawProperty) toDatasetProperty() DatasetProperty {
 		Value:    p.Value,
 		Parsed:   p.Parsed,
 		Rawvalue: p.Rawvalue,
+		Raw:      p.Raw,
 		Source:   string(p.Source),
 	}
 }

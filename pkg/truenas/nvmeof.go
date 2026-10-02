@@ -339,6 +339,54 @@ func (c *Client) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID i
 	return associations, nil
 }
 
+// NVMeoFHostSubsysList lists every allowed-host association on the
+// appliance in one unfiltered query: the startup diff reads the whole table
+// once instead of one filtered query per subsystem. A row that cannot be
+// parsed fails the listing: a dropped row would hide an association, and a
+// caller deciding that a subsystem's allowlist is exactly what it wants must
+// never see less than the backend holds.
+func (c *Client) NVMeoFHostSubsysList(ctx context.Context) ([]*NVMeoFHostSubsys, error) {
+	result, err := c.Call(ctx, "nvmet.host_subsys.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list host_subsys associations: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected host_subsys response type")
+	}
+	associations := make([]*NVMeoFHostSubsys, 0, len(items))
+	for _, item := range items {
+		association, parseErr := parseNVMeoFHostSubsys(item)
+		if parseErr != nil {
+			return nil, fmt.Errorf("unparseable host_subsys association: %w", parseErr)
+		}
+		associations = append(associations, association)
+	}
+	return associations, nil
+}
+
+// NVMeoFHostList lists every NVMe-oF host on the appliance in one query. A
+// row that cannot be parsed fails the listing.
+func (c *Client) NVMeoFHostList(ctx context.Context) ([]*NVMeoFHost, error) {
+	result, err := c.Call(ctx, "nvmet.host.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list NVMe-oF hosts: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected NVMe-oF host response type")
+	}
+	hosts := make([]*NVMeoFHost, 0, len(items))
+	for _, item := range items {
+		host, parseErr := parseNVMeoFHost(item)
+		if parseErr != nil {
+			return nil, fmt.Errorf("unparseable NVMe-oF host: %w", parseErr)
+		}
+		hosts = append(hosts, host)
+	}
+	return hosts, nil
+}
+
 // NVMeoFHostSubsysDelete removes one allowed-host association idempotently.
 func (c *Client) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.host_subsys.delete", id)

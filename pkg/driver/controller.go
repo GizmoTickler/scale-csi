@@ -1733,6 +1733,9 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	volumeID := req.GetVolumeId()
 	defer func() {
 		d.recordOperationFailureEvent(volumeEventRef(volumeID), EventReasonVolumeDeleteFailed, "DeleteVolume", operationErr)
+		if operationErr == nil && volumeID != "" {
+			d.forgetListedVolume(volumeID)
+		}
 	}()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
@@ -2156,6 +2159,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
 	defer d.releaseOperationLock(lockKey)
+	// Strict fencing at startup: converge this volume first if startup has not
+	// yet (startup_gate.go). The dataset is read below, after it.
+	if gateErr := d.startupPublishGate(ctx, volumeID); gateErr != nil {
+		return nil, gateErr
+	}
 
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
@@ -2320,14 +2328,16 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 // gone — its cost scaled with the TOTAL system dataset count (the middleware
 // materializes user properties for the whole system on every such call; the
 // same 47 rows went 152ms→630ms when 300 unrelated datasets were added
-// elsewhere). Each WALK now reuses listAllManagedDatasets — the reconciler's
+// elsewhere). Each WALK reuses listAllManagedDatasets — the reconciler's
 // path-scoped zfs.resource.query read with its paged pool.dataset.query
-// fallback — exactly once, and hydrates ONLY the page being returned through
-// id-filtered DatasetGetByNames reads (no materialization cost). The hydration
-// is REQUIRED, not an optimization detail: zfs.resource.query carries no
-// encryption fields at all (P-11), and the entry's VolumeCondition must see
-// Encrypted/Locked; it also restores the per-property Source that
-// publicationRecordsFromDataset depends on for PublishedNodeIds.
+// fallback — exactly once, for the walk's membership and order. With records
+// in Kubernetes every page is served from it: the capacity from the listing's
+// properties, the published nodes from the VolumePublication cache; only a
+// dataset that still carries ZFS publication record keys (not yet imported)
+// is re-read, by name (DatasetGetByNames), because the listing carries no
+// property sources and publicationRecordsFromDataset trusts only a LOCAL
+// record. With records on ZFS every page is re-read by name, as before v1.22:
+// a record written after the listing exists only on its dataset.
 //
 // STABILITY (P-3): pool.dataset.query offset pagination has NO ordering (rows
 // come back in DB-row order), so pages skipped/duplicated volumes under
@@ -2335,10 +2345,10 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 // periodically. Exactly like ListSnapshots, a fresh walk (empty starting
 // token) freezes the name-sorted managed listing into a short-TTL cache and
 // continuation tokens slice that frozen view. Starting-token semantics
-// (integer offset) are unchanged.
-//
-// The client-side managed-resource check on the hydrated dataset remains as a
-// compatibility safeguard.
+// (integer offset) are unchanged. A volume this controller deleted at or
+// after the moment the walk's listing began reading (a shared listing it
+// joined may have begun before the walk) is left out of the walk, as a
+// re-read would have left it out.
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	klog.V(4).Info("ListVolumes called")
 
@@ -2358,19 +2368,27 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		requestedLimit = 100
 	}
 
-	names, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
+	page, viewStart, hasMore, err := d.managedVolumesForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
 
-	// Hydrate ONLY this page via one id-filtered pool.dataset.query
-	// (chunked only if a page's names outgrow the request budget). The
-	// ["id","in",names] filter skips the full-system user-property
-	// materialization that made the old filtered listing O(system size), and
-	// unlike the zfs.resource.query listing it carries the encryption fields
-	// (P-11) and user-property sources the entries below are built from.
-	hydrated := make(map[string]*truenas.Dataset, len(names))
-	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
+	// Re-read the page by name (chunked only if the names outgrow the request
+	// budget): the listing has no property sources, and only a local record is
+	// the volume's own. With records on ZFS every page is re-read, as before
+	// v1.22: a record written after the walk's listing (a publish between two
+	// pages) is on the dataset only, so the frozen view cannot know of it.
+	// With records in Kubernetes only the datasets still carrying ZFS record
+	// keys (not yet imported) are re-read; new records go to Kubernetes.
+	reReadAll := d.publicationRecordsOnZFS()
+	var keyed []string
+	for _, entry := range page {
+		if reReadAll || entry.recordKeys {
+			keyed = append(keyed, entry.name)
+		}
+	}
+	hydrated := make(map[string]*truenas.Dataset, len(keyed))
+	for _, chunk := range chunkDatasetNames(keyed, datasetGetByNamesBatchBudget) {
 		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
 		if getErr != nil {
 			// DatasetGetByNames omits absent names instead of erroring, so a
@@ -2382,35 +2400,37 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		}
 	}
 
-	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(names))
-	for _, name := range names {
-		ds, ok := hydrated[name]
-		if !ok {
-			// Deleted between the walk's frozen listing and this page's
-			// hydration: skip the entry rather than report a gone volume.
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(page))
+	for _, listed := range page {
+		if d.listedVolumeDeletedSince(listed.name, viewStart) {
 			continue
 		}
-
-		// Skip if not managed by CSI (compatibility safeguard; the listing
-		// already filtered on the managed stamp).
-		if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" { //nolint:gocritic // compatibility pre-filter only ('the listing already filtered on the managed stamp' per the preceding comment); not the authoritative check
-			continue
+		capacity := listed.capacity
+		ds := &truenas.Dataset{Name: listed.name}
+		if reReadAll || listed.recordKeys {
+			var ok bool
+			if ds, ok = hydrated[listed.name]; !ok {
+				// Deleted between the walk's frozen listing and this page's
+				// re-read: skip the entry rather than report a gone volume.
+				continue
+			}
+			// Skip if not managed by CSI (compatibility safeguard; the listing
+			// already filtered on the managed stamp).
+			if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" { //nolint:gocritic // compatibility pre-filter only; not the authoritative check
+				continue
+			}
+			capacity = d.listedCapacity(ds)
 		}
-
-		volumeID := path.Base(ds.Name)
-		capacity := d.getDatasetCapacity(ds)
 
 		entries = append(entries, &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
-				VolumeId:      volumeID,
+				VolumeId:      path.Base(listed.name),
 				CapacityBytes: capacity,
 			},
 			Status: &csi.ListVolumesResponse_VolumeStatus{
-				// LIST_VOLUMES_PUBLISHED_NODES (F-1): the hydrated dataset
-				// already carries the volume's publication records, so this is
-				// free. Requires the source-bearing pool.dataset.query read
-				// above — publicationRecordsFromDataset only trusts LOCAL
-				// properties, and the resource-query listing strips sources.
+				// LIST_VOLUMES_PUBLISHED_NODES (F-1): from the publication
+				// store. A dataset without record keys has no ZFS records, so
+				// only the Kubernetes side (the cache) can name any.
 				PublishedNodeIds: d.publishedNodeIDs(ctx, ds),
 			},
 		})
@@ -2420,7 +2440,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	// hydration misses above do not affect page math.
 	nextToken := ""
 	if hasMore {
-		nextToken = strconv.Itoa(offset + len(names))
+		nextToken = strconv.Itoa(offset + len(page))
 	}
 
 	return &csi.ListVolumesResponse{
@@ -2437,54 +2457,252 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 // always refetches regardless of TTL.
 const volumeListPageCacheTTL = 30 * time.Second
 
-// managedDatasetsForListPage returns the names of one page of the parent's
-// managed datasets for ListVolumes, plus whether more pages remain in the
-// frozen view. The page is hydrated by name, so the frozen view keeps only the
-// sorted names, not the listing's decoded datasets, for its TTL. A fresh
-// walk (empty starting token) fetches the full managed set once via
-// listAllManagedDatasets (path-scoped zfs.resource.query, paged
-// pool.dataset.query fallback — both filtered to PropManagedResource=="true"),
-// sorts it by name so offsets are stable across pages, and repopulates the
-// cache; a continuation token within the TTL is served from that frozen view,
-// so a walk can neither skip nor duplicate volumes however much create/delete
-// churn happens meanwhile. A continuation arriving after the TTL (or before
-// any walk populated the cache, e.g. across a controller restart) refetches —
-// offset tokens remain valid against the refreshed set exactly as they were
-// against the old per-page reads.
-func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []string, hasMore bool, err error) {
+// listedVolume is one managed volume as a ListVolumes walk's frozen view
+// keeps it: its dataset name, its capacity as the listing reported it, and
+// whether the dataset carries ZFS publication record keys (and so must be
+// re-read for its records).
+type listedVolume struct {
+	name       string
+	capacity   int64
+	recordKeys bool
+}
+
+// managedVolumesForListPage returns one page of the parent's managed volumes
+// for ListVolumes, when the listing behind it began, and whether more pages
+// remain in the frozen view. A fresh walk (empty starting token) fetches the
+// full managed set once via listAllManagedDatasets (path-scoped
+// zfs.resource.query, paged pool.dataset.query fallback — both filtered to
+// PropManagedResource=="true"), sorts it by name so offsets are stable across
+// pages, and repopulates the cache; a continuation token within the TTL is
+// served from that frozen view, so a walk can neither skip nor duplicate
+// volumes however much create/delete churn happens meanwhile. A continuation
+// arriving after the TTL (or before any walk populated the cache, e.g. across
+// a controller restart) refetches — offset tokens remain valid against the
+// refreshed set exactly as they were against the old per-page reads. The view
+// keeps three small fields per volume, not the listing's decoded datasets.
+func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []listedVolume, viewStart time.Time, hasMore bool, err error) {
 	if !freshWalk {
 		d.volumePageCacheMu.Lock()
 		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
-			cached := d.volumePageCache
+			cached, cachedStart := d.volumePageCache, d.volumePageCacheStart
 			d.volumePageCacheMu.Unlock()
 			page, hasMore = sliceVolumeListPage(cached, limit, offset)
-			return page, hasMore, nil
+			return page, cachedStart, hasMore, nil
 		}
 		d.volumePageCacheMu.Unlock()
 	}
-	all, err := d.listAllManagedDatasets(ctx)
+	listing := d.beginVolumeListing()
+	defer d.endVolumeListing(listing)
+	all, start, err := d.listAllManagedDatasetsWithStart(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, time.Time{}, false, err
 	}
 	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
 	// pool.dataset.query fallback guarantees one.
-	names := make([]string, len(all))
-	for i, dataset := range all {
-		names[i] = dataset.Name
+	volumes := make([]listedVolume, 0, len(all))
+	for _, dataset := range all {
+		volumes = append(volumes, listedVolume{
+			name:       dataset.Name,
+			capacity:   d.listedCapacity(dataset),
+			recordKeys: datasetHasPublicationRecordKeys(dataset),
+		})
 	}
-	sort.Strings(names)
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].name < volumes[j].name })
 	d.volumePageCacheMu.Lock()
-	d.volumePageCache = names
-	d.volumePageCacheTime = time.Now()
+	// A volume DeleteVolume removed at or after the listing began may still
+	// be in its rows: leave it out of the view.
+	kept := volumes[:0]
+	for _, volume := range volumes {
+		if deletedAt, deleted := d.volumePageDeleted[volume.name]; deleted && !deletedAt.Before(start) {
+			continue
+		}
+		kept = append(kept, volume)
+	}
+	volumes = kept
+	// A slower walk's older listing does not replace a newer one's view.
+	if d.volumePageCache == nil || !start.Before(d.volumePageCacheStart) {
+		d.volumePageCache = volumes
+		d.volumePageCacheTime = time.Now()
+		d.volumePageCacheStart = start
+	}
 	d.volumePageCacheMu.Unlock()
-	page, hasMore = sliceVolumeListPage(names, limit, offset)
-	return page, hasMore, nil
+	page, hasMore = sliceVolumeListPage(volumes, limit, offset)
+	return page, start, hasMore, nil
+}
+
+// volumeListing is one ListVolumes listing in flight. floor is the earliest
+// time its rows can date from: its own arrival, or the start of the shared
+// listing already in flight that it may join.
+type volumeListing struct {
+	floor time.Time
+}
+
+// beginVolumeListing registers a listing so that deletes it may need to leave
+// out are kept until it is done.
+func (d *Driver) beginVolumeListing() *volumeListing {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	listing := &volumeListing{floor: d.sharedListingFloor(time.Now())}
+	if d.volumePageListings == nil {
+		d.volumePageListings = make(map[*volumeListing]struct{})
+	}
+	d.volumePageListings[listing] = struct{}{}
+	return listing
+}
+
+func (d *Driver) endVolumeListing(listing *volumeListing) {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	delete(d.volumePageListings, listing)
+	d.pruneListedVolumeDeletes(time.Now())
+}
+
+// sharedListingFloor is the earlier of now and the start of the shared
+// managed listing in flight: a listing that begins now may join it.
+func (d *Driver) sharedListingFloor(now time.Time) time.Time {
+	d.managedListingMu.Lock()
+	defer d.managedListingMu.Unlock()
+	if d.managedListing != nil && d.managedListing.start.Before(now) {
+		return d.managedListing.start
+	}
+	return now
+}
+
+// pruneListedVolumeDeletes drops the deletes no listing can need: those
+// before the start of the cached view (while it is served), of every listing
+// in flight, and of the shared listing in flight that a new one may join.
+// With none of these, every entry goes, so the map stays bounded when nothing
+// lists. The caller holds volumePageCacheMu.
+func (d *Driver) pruneListedVolumeDeletes(now time.Time) {
+	floor := d.sharedListingFloor(now)
+	held := floor.Before(now)
+	if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
+		held = true
+		if d.volumePageCacheStart.Before(floor) {
+			floor = d.volumePageCacheStart
+		}
+	}
+	for listing := range d.volumePageListings {
+		held = true
+		if listing.floor.Before(floor) {
+			floor = listing.floor
+		}
+	}
+	if !held {
+		clear(d.volumePageDeleted)
+		return
+	}
+	for name, deletedAt := range d.volumePageDeleted {
+		if deletedAt.Before(floor) {
+			delete(d.volumePageDeleted, name)
+		}
+	}
+}
+
+// forgetListedVolume records that DeleteVolume removed a volume, so a listing
+// that began at or before now leaves it out. It is recorded even while no walk
+// is cached: a fresh listing may be in flight.
+func (d *Driver) forgetListedVolume(volumeID string) {
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return
+	}
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	if d.volumePageDeleted == nil {
+		d.volumePageDeleted = make(map[string]time.Time)
+	}
+	now := time.Now()
+	d.volumePageDeleted[datasetName] = now
+	d.pruneListedVolumeDeletes(now)
+}
+
+// listedVolumeDeletedSince reports a volume DeleteVolume removed at or after
+// viewStart, the start of the listing a page is served from.
+func (d *Driver) listedVolumeDeletedSince(datasetName string, viewStart time.Time) bool {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	deletedAt, deleted := d.volumePageDeleted[datasetName]
+	return deleted && !deletedAt.Before(viewStart)
+}
+
+// publicationRecordsOnZFS reports the plain ZFS publication store: records
+// live only on dataset properties, so a listing cannot carry ones written
+// after it was taken.
+func (d *Driver) publicationRecordsOnZFS() bool {
+	_, onZFS := d.publications().(zfsPublicationStore)
+	return onZFS
+}
+
+// listedCapacity is a ListVolumes entry's capacity (listedDatasetCapacity).
+// A zvol whose volsize cannot be read is reported as 0, unknown, and logged
+// once per volume.
+func (d *Driver) listedCapacity(ds *truenas.Dataset) int64 {
+	capacity, known := listedDatasetCapacity(ds)
+	if !known {
+		if _, logged := d.unknownVolsizeLogged.LoadOrStore(ds.Name, struct{}{}); !logged {
+			klog.Warningf("ListVolumes: the volsize of zvol %s is unreadable; reporting its capacity as unknown (0)", ds.Name)
+		}
+	}
+	return capacity
+}
+
+// listedDatasetCapacity is getDatasetCapacity over a listing's dataset. The
+// zfs.resource.query listing reports a property as {value, raw} with no
+// parsed field: value is the number, raw its string. A pool.dataset.query row
+// (the listing's fallback, and the re-read) has parsed. Each is read in that
+// order. A zvol's capacity is its volsize and nothing else: when volsize is
+// unreadable the capacity is unknown (0, which CSI allows for capacity_bytes)
+// and known is false. Falling through to available would report the pool's
+// free space as the zvol's size.
+func listedDatasetCapacity(ds *truenas.Dataset) (capacity int64, known bool) {
+	if ds.Type == "VOLUME" {
+		if bytes, ok := listedPropertyBytes(ds.Volsize); ok {
+			return bytes, true
+		}
+		return 0, false
+	}
+	if bytes, ok := listedPropertyBytes(ds.Refquota); ok && bytes > 0 {
+		return bytes, true
+	}
+	if requestedSize := datasetUserProperty(ds, PropRequestedSizeBytes); requestedSize != "" && requestedSize != "-" {
+		if parsed, err := strconv.ParseInt(requestedSize, 10, 64); err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	if bytes, ok := listedPropertyBytes(ds.Available); ok {
+		return bytes, true
+	}
+	return 0, true
+}
+
+// listedPropertyBytes reads a numeric property from parsed, then value, then
+// the rawvalue string (pool.dataset.query), then the raw string
+// (zfs.resource.query).
+func listedPropertyBytes(property truenas.DatasetProperty) (int64, bool) {
+	if parsed, ok := property.Parsed.(float64); ok {
+		return int64(parsed), true
+	}
+	switch value := property.Value.(type) {
+	case float64:
+		return int64(value), true
+	case string:
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	for _, text := range []string{property.Rawvalue, property.Raw} {
+		if parsed, err := strconv.ParseInt(text, 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 // sliceVolumeListPage slices one offset/limit page out of the frozen listing.
 // Because the full set length is known, hasMore is exact — no lookahead row and
 // no trailing empty page, matching the old fetchLimit=limit+1 token semantics.
-func sliceVolumeListPage(names []string, limit, offset int) (page []string, hasMore bool) {
+func sliceVolumeListPage(names []listedVolume, limit, offset int) (page []listedVolume, hasMore bool) {
 	if offset < 0 {
 		offset = 0
 	}

@@ -154,8 +154,12 @@ func datasetKeyFormat(raw interface{}) string {
 type DatasetProperty struct {
 	Value    interface{} `json:"value"`
 	Rawvalue string      `json:"rawvalue"`
-	Parsed   interface{} `json:"parsed"`
-	Source   string      `json:"source"`
+	// Raw is zfs.resource.query's exact string form of the value
+	// ({"raw": "<digits>", "value": <number>, "source": {...}}); pool.dataset.query
+	// sends rawvalue instead.
+	Raw    string      `json:"raw"`
+	Parsed interface{} `json:"parsed"`
+	Source string      `json:"source"`
 }
 
 // UserProperty represents a user-defined ZFS property.
@@ -1513,6 +1517,9 @@ func parseProperty(data interface{}) DatasetProperty {
 		prop.Value = m["value"]
 		if v, ok := m["rawvalue"].(string); ok {
 			prop.Rawvalue = v
+		}
+		if v, ok := m["raw"].(string); ok {
+			prop.Raw = v
 		}
 		prop.Parsed = m["parsed"]
 		if v, ok := m["source"].(string); ok {

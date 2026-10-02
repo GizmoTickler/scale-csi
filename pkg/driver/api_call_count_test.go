@@ -608,6 +608,16 @@ func (c *apiCallCountingClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Cont
 	return c.MockClient.NVMeoFPortSubsysFindBySubsystem(ctx, subsysID)
 }
 
+func (c *apiCallCountingClient) NVMeoFHostSubsysList(ctx context.Context) ([]*truenas.NVMeoFHostSubsys, error) {
+	c.record("NVMeoFHostSubsysList")
+	return c.MockClient.NVMeoFHostSubsysList(ctx)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostList(ctx context.Context) ([]*truenas.NVMeoFHost, error) {
+	c.record("NVMeoFHostList")
+	return c.MockClient.NVMeoFHostList(ctx)
+}
+
 func (c *apiCallCountingClient) NVMeoFPortSubsysList(ctx context.Context) ([]*truenas.NVMeoFPortSubsys, error) {
 	c.record("NVMeoFPortSubsysList")
 	return c.MockClient.NVMeoFPortSubsysList(ctx)
