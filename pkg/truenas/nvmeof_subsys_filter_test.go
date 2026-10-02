@@ -19,6 +19,9 @@ type subsysFilterServer struct {
 	mu           sync.Mutex
 	filters      map[string][]interface{}
 	rejectFilter bool
+	// rejectCode is the error code of a rejection (default -32602, invalid
+	// params); any other code models a transient middleware failure.
+	rejectCode   int
 	ignoreFilter bool
 }
 
@@ -66,7 +69,11 @@ func (s *subsysFilterServer) start(t *testing.T) *Client {
 				s.filters[req.Method] = append(s.filters[req.Method], filter)
 				s.mu.Unlock()
 				if len(filter) > 0 && s.rejectFilter {
-					resp.Error = &rpcError{Code: -32602, Message: "Invalid params"}
+					code := s.rejectCode
+					if code == 0 {
+						code = -32602
+					}
+					resp.Error = &rpcError{Code: code, Message: "Invalid params"}
 					break
 				}
 				var want float64 = -1
@@ -161,4 +168,21 @@ func TestNVMeoFAssociationListsFallBackWhenServerRejectsFilter(t *testing.T) {
 	empty := []interface{}{}
 	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, empty}, server.calls("nvmet.host_subsys.query"))
 	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, empty}, server.calls("nvmet.port_subsys.query"))
+}
+
+// A filtered call that fails with anything but invalid params (a transient
+// middleware error) is answered unfiltered, but the filter is tried again next
+// time: only a real rejection of the filter switches it off for good.
+func TestNVMeoFAssociationListsKeepFilterAfterTransientError(t *testing.T) {
+	ctx := context.Background()
+	server := &subsysFilterServer{rejectFilter: true, rejectCode: -32001}
+	client := server.start(t)
+
+	for i := 0; i < 2; i++ {
+		hosts, err := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+		require.NoError(t, err)
+		require.Len(t, hosts, 1)
+	}
+	empty := []interface{}{}
+	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, subsysFilterFor(7), empty}, server.calls("nvmet.host_subsys.query"))
 }

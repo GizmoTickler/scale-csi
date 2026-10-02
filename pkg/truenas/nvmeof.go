@@ -242,9 +242,10 @@ func subsysIDFilter(subsysID int) [][]interface{} {
 // on the server, so the reply no longer grows with every volume on the NAS.
 // The filter is an optimisation only: callers still re-filter the rows
 // client-side, so a backend that ignores it returns the right answer. A
-// backend that REJECTS it (an API error, not a transport failure) is retried
-// once unfiltered, and if that works the rejection is remembered so later
-// calls skip the filtered attempt.
+// filtered call that fails with an API error (not a transport failure) is
+// retried once unfiltered. Only a rejection of the filter itself (-32602,
+// invalid params) is remembered so later calls skip the filtered attempt; a
+// transient middleware error leaves the filter on for the next call.
 func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejected *atomic.Bool) (interface{}, error) {
 	if !rejected.Load() {
 		result, err := c.Call(ctx, method, subsysIDFilter(subsysID), map[string]interface{}{})
@@ -259,7 +260,7 @@ func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID i
 		if unfilteredErr != nil {
 			return nil, unfilteredErr
 		}
-		if !rejected.Swap(true) {
+		if apiErr.Code == -32602 && !rejected.Swap(true) {
 			klog.Warningf("%s rejected a subsys.id filter (%v); listing the whole table and filtering client-side from now on", method, err)
 		}
 		return result, nil
