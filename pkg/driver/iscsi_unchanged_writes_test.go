@@ -83,8 +83,7 @@ func TestStrictISCSIMoveGoldenAPICallCounts(t *testing.T) {
 	_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest(iscsiMoveVolume, nodeB))
 	require.NoError(t, err)
 
-	assertAPICallCount(t, "strict iSCSI move", client, 19)
-	assertAPICallMethodMap(t, "strict iSCSI move", client, map[string]int{
+	want := map[string]int{
 		"DatasetGet":                  2,
 		"DatasetRemoveUserProperties": 1,
 		"DatasetSetUserProperties":    2,
@@ -96,7 +95,18 @@ func TestStrictISCSIMoveGoldenAPICallCounts(t *testing.T) {
 		"ISCSITargetGet":              3,
 		"ServiceReload":               2,
 		"WaitForZvolReady":            1,
-	})
+	}
+	total := 19
+	if recordsInKubernetes() {
+		// The three remaining dataset property calls are the publication
+		// records ("unpublishing", removal, new record); with records kept as
+		// VolumePublications they are Kubernetes requests instead.
+		delete(want, "DatasetRemoveUserProperties")
+		delete(want, "DatasetSetUserProperties")
+		total = 16
+	}
+	assertAPICallCount(t, "strict iSCSI move", client, total)
+	assertAPICallMethodMap(t, "strict iSCSI move", client, want)
 
 	// The move really moved: only B is allowed now.
 	target, err := client.MockClient.ISCSITargetFindByName(ctx, d.iscsiShareName(iscsiMoveVolume))

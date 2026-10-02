@@ -221,7 +221,7 @@ type ZFSConfig struct {
 	// the dataset. "on-failure" (the default) runs them only after a delete
 	// fails with anything but a plain snapshot/children dependency, so the
 	// record exists when it can explain a failure. "always" (or true, the
-	// behaviour before v1.24.0) runs them before every delete, which is the only
+	// behavior before v1.24.0) runs them before every delete, which is the only
 	// record that a forced delete took a dataset that was still in use, at about
 	// 1.3 s of TrueNAS middleware time per delete. "never" (or false) skips them.
 	ObserveBusyBeforeDelete BusyObservationMode `yaml:"observeBusyBeforeDelete"`
@@ -1046,7 +1046,7 @@ type BusyObservationMode string
 const (
 	// BusyObservationOnFailure scans only after a delete fails (the default).
 	BusyObservationOnFailure BusyObservationMode = "on-failure"
-	// BusyObservationAlways scans before every delete (true; the behaviour
+	// BusyObservationAlways scans before every delete (true; the behavior
 	// before v1.24.0).
 	BusyObservationAlways BusyObservationMode = "always"
 	// BusyObservationNever never scans (false).
