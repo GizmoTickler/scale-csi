@@ -171,14 +171,29 @@ used to hold one worker until the agent stopped answering for every protocol.
   the volume's data (two plugins staging during a handover can stack mounts).
   Both now check that nothing is mounted after the unmount (Internal
   otherwise, so kubelet retries and the next unmount lifts the next mount) and
-  remove the mount point without recursing.
+  remove the mount point without recursing. That check runs on its own budget
+  (the mount timeout), so an unmount that succeeded but used up the RPC's
+  deadline no longer fails the call.
+- **A non-empty directory after the unmount fails the call.** Both plugins
+  follow Kubernetes mount-utils `CleanupMountPoint`: an absent path is fine, a
+  file (a raw-block publish target) is removed, an empty directory is removed,
+  and a directory that still has files in it once nothing is mounted fails
+  unstage or unpublish with Internal ("staging path X is not empty after
+  unmount; its contents (on the node's disk, not the volume) are left in place
+  and must be removed by hand"). Before, both plugins logged a warning and
+  reported success, and kubelet's own removal of the directory then failed
+  with ENOTEMPTY on every retry. Nothing is ever deleted recursively: remove the
+  files by hand and kubelet's next retry finishes.
 - **iSCSI multipath expansion.** A dm-multipath map grows only when multipathd
   resizes it, and only to its smallest path. Expansion rescanned the session of
   one path and waited for a size that never came, so the PVC stayed in
   `FileSystemResizePending`. Both plugins now rescan every path's session, then
   run `multipathd resize map <name>` through a new host wrapper
   (`/usr/local/bin/multipathd`, as for `iscsiadm`; the node's multipath-tools
-  must provide `multipathd`).
+  must provide `multipathd`). multipathd exiting non-zero, or answering
+  `fail`, fails the expansion with Internal. Only a dm-multipath map (dm UUID
+  `mpath-<wwid>`) is expanded this way; any other device-mapper device, such
+  as a kpartx partition or an LVM volume, takes the single-device rescan.
 
 ## v1.16.0 — publication records in Kubernetes
 
