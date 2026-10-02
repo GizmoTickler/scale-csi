@@ -15,6 +15,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 const startupReconcileWorkers = 4
@@ -24,15 +26,12 @@ var (
 	startupReconcileMaxBackoff     = time.Minute
 )
 
-// startupQuarantineRecheckInterval is how often a loop with quarantined
-// volumes re-runs them without a signal. A quarantine is normally released by
-// the stale-record revoke's signal, but the record can also go another way
-// (an operator, or a revoke that found it already gone) and nothing would
-// ever re-run the volume. A var so tests can shorten it.
-var startupQuarantineRecheckInterval = 2 * time.Minute
+// startupReconcileRequestedHook, when set (tests only), sees every re-run
+// request as it is made.
+var startupReconcileRequestedHook func(datasetName string)
 
 // errStartupVolumeBusy is a volume a pass skipped because a live CSI operation
-// held its lock. That operation converges the volume itself.
+// held its lock. The pass's targets are kept, and the retry runs it.
 var errStartupVolumeBusy = errors.New("live CSI operation is in progress")
 
 // startupErrOnlyBusy is whether every error in a pass's (joined, wrapped)
@@ -63,15 +62,62 @@ func startupErrOnlyBusy(err error) bool {
 	return false
 }
 
-// startupQuarantinedDatasets is the datasets of every quarantined volume.
-func (d *Driver) startupQuarantinedDatasets() []string {
+// startupQuarantine is a volume quarantineStaleStartupFencingVolume carved
+// out: its dataset and the key of the stale record blocking it.
+type startupQuarantine struct {
+	datasetName string
+	staleKey    string
+}
+
+// healStartupQuarantines asks the startup loop to re-run each quarantined
+// volume whose blocking stale record is gone. The stale-record revoke signals
+// its own volume, but the record can also go another way (an operator, or a
+// revoke that found it already gone); the periodic stale-record sweep calls
+// this with the datasets it just listed, so no quarantine outlives its cause
+// by more than one sweep. Quarantines are rare: this reads only theirs.
+func (d *Driver) healStartupQuarantines(ctx context.Context, datasets []*truenas.Dataset) {
 	d.startupReconcileTargetsMu.Lock()
-	defer d.startupReconcileTargetsMu.Unlock()
-	datasets := make([]string, 0, len(d.startupQuarantined))
-	for _, datasetName := range d.startupQuarantined {
-		datasets = append(datasets, datasetName)
+	quarantined := make([]startupQuarantine, 0, len(d.startupQuarantined))
+	for _, q := range d.startupQuarantined {
+		quarantined = append(quarantined, q)
 	}
-	return datasets
+	d.startupReconcileTargetsMu.Unlock()
+	if len(quarantined) == 0 {
+		return
+	}
+	byName := make(map[string]*truenas.Dataset, len(datasets))
+	for _, dataset := range datasets {
+		if dataset != nil {
+			byName[dataset.Name] = dataset
+		}
+	}
+	for _, q := range quarantined {
+		dataset := byName[q.datasetName]
+		if dataset == nil {
+			continue
+		}
+		records, err := d.publications().records(ctx, q.datasetName, dataset)
+		if err != nil {
+			klog.V(2).Infof("Quarantined volume %s: publication records unreadable, not re-run yet: %v", q.datasetName, err)
+			continue
+		}
+		if _, blocked := records[q.staleKey]; !blocked {
+			d.requestStartupAttachmentReconcile(q.datasetName)
+		}
+	}
+}
+
+// clearStartupQuarantineVolume forgets one volume's quarantine. A pass calls
+// it from the volume's own worker once the volume lock is held, so a volume
+// the pass could not take (busy) keeps its quarantine and its gauge.
+func (d *Driver) clearStartupQuarantineVolume(volumeID string) {
+	d.startupReconcileTargetsMu.Lock()
+	_, was := d.startupQuarantined[volumeID]
+	delete(d.startupQuarantined, volumeID)
+	d.startupReconcileTargetsMu.Unlock()
+	if was {
+		ClearStartupFencingUnconverged(volumeID)
+	}
 }
 
 type startupPublication struct {
@@ -256,14 +302,12 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 	// quarantineStaleStartupFencingVolume and the field's doc comment in
 	// driver.go).
 	//
-	// A targeted pass clears only its own volumes' quarantine verdicts: a
-	// volume it does not touch keeps its quarantine (and its gauge) until a
-	// pass that does re-runs it.
+	// A targeted pass clears only its own volumes' quarantine verdicts, each
+	// in the volume's worker once its lock is held: a volume it does not touch,
+	// or cannot take, keeps its quarantine (and its gauge).
 	if targets == nil {
 		ResetStartupFencingUnconvergedVolumes()
 		d.resetStartupQuarantine()
-	} else {
-		d.clearStartupQuarantine(targets)
 	}
 	jobs := make(chan *startupFencingVolume)
 	results := make(chan error, len(volumeIDs))
@@ -376,9 +420,9 @@ func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolum
 	RecordStartupFencingUnconverged(volume.volumeID)
 	d.startupReconcileTargetsMu.Lock()
 	if d.startupQuarantined == nil {
-		d.startupQuarantined = make(map[string]string)
+		d.startupQuarantined = make(map[string]startupQuarantine)
 	}
-	d.startupQuarantined[volume.volumeID] = datasetName
+	d.startupQuarantined[volume.volumeID] = startupQuarantine{datasetName: datasetName, staleKey: publicationPropertyKey(staleNode)}
 	d.startupReconcileTargetsMu.Unlock()
 	return nil
 }
@@ -388,19 +432,6 @@ func (d *Driver) resetStartupQuarantine() {
 	d.startupReconcileTargetsMu.Lock()
 	d.startupQuarantined = nil
 	d.startupReconcileTargetsMu.Unlock()
-}
-
-// clearStartupQuarantine forgets the quarantines of the targeted datasets
-// before a targeted pass re-runs them.
-func (d *Driver) clearStartupQuarantine(targets map[string]struct{}) {
-	d.startupReconcileTargetsMu.Lock()
-	defer d.startupReconcileTargetsMu.Unlock()
-	for volumeID, datasetName := range d.startupQuarantined {
-		if _, targeted := targets[datasetName]; targeted {
-			delete(d.startupQuarantined, volumeID)
-			ClearStartupFencingUnconverged(volumeID)
-		}
-	}
 }
 
 // startupQuarantineCount is the number of volumes currently quarantined.
@@ -429,6 +460,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		return fmt.Errorf("startup reconcile volume %s: %w", volume.volumeID, errStartupVolumeBusy)
 	}
 	defer d.releaseOperationLock(lockKey)
+	d.clearStartupQuarantineVolume(volume.volumeID)
 
 	// The initial list only schedules work. Rebuild the current attachment set
 	// after taking the same per-volume lock as ControllerPublish/Unpublish. A VA
@@ -459,6 +491,9 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	records, err := d.publications().records(ctx, datasetName, dataset)
 	if err != nil {
 		return fmt.Errorf("read publication records for attached volume %s: %w", volume.volumeID, err)
+	}
+	if err := d.refreshStartupIdentities(ctx, volume, records); err != nil {
+		return fmt.Errorf("refresh node identity for attached volume %s: %w", volume.volumeID, err)
 	}
 	shareType := shareTypeForPublishedVolume(dataset, volume.volumeAttributes)
 	compatibilityRecords := make(map[string]publicationRecord, len(records)+len(volume.publications))
@@ -609,10 +644,9 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 // VolumeAttachment the snapshot saw for this volume: one GET by name each. A
 // VA that is gone, or replaced by an object for another PV or node, no longer
 // claims anything; one being deleted or no longer Attached still claims its
-// node but is never (re)granted. The node identity of each grant is re-read
-// here too (a GET of its CSINode and Node): the snapshot's can be a whole pass
-// old, and a node that re-registered since (a new address or NQN) would
-// otherwise have its current identity revoked and the old one granted.
+// node but is never (re)granted. Node identities still come from the
+// snapshot here; reconcileStartupFencingVolume re-reads one wherever it would
+// change the stored record (refreshStartupIdentities).
 func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *startupFencingVolume) (*startupFencingVolume, error) {
 	result := &startupFencingVolume{
 		volumeID:         snapshot.volumeID,
@@ -621,7 +655,6 @@ func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *star
 		attachments:      snapshot.attachments,
 	}
 	attachments := d.eventRecorder.clientset.StorageV1().VolumeAttachments()
-	identities := make(map[string]startupNodeIdentityRead)
 	for i := range snapshot.attachments {
 		attachment := &snapshot.attachments[i]
 		current, err := attachments.Get(ctx, attachment.name, metav1.GetOptions{})
@@ -642,15 +675,42 @@ func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *star
 		if !current.Status.Attached || !current.DeletionTimestamp.IsZero() {
 			continue
 		}
-		publication := attachment.publication
-		identity, nodeID, err := d.currentStartupNodeIdentity(ctx, attachment.nodeName, identities)
-		if err != nil {
-			return nil, err
-		}
-		publication.identity, publication.nodeID = identity, nodeID
-		result.publications = append(result.publications, publication)
+		result.publications = append(result.publications, attachment.publication)
 	}
 	return result, nil
+}
+
+// refreshStartupIdentities re-reads, under the volume lock, the node identity
+// of each grant whose snapshot identity would change the stored record. The
+// snapshot can be a whole pass old: a node that re-registered since (a new
+// address, NQN or IQN), and that a live publish already granted, would
+// otherwise have its current identity revoked and the old one granted. A grant
+// the stored record already matches needs no read, so a steady restart costs
+// no CSINode or Node request at all.
+func (d *Driver) refreshStartupIdentities(
+	ctx context.Context,
+	volume *startupFencingVolume,
+	records map[string]publicationRecord,
+) error {
+	identities := make(map[string]startupNodeIdentityRead)
+	for i := range volume.publications {
+		publication := &volume.publications[i]
+		if previous, ok := records[publicationPropertyKey(publication.identity.Name)]; ok {
+			candidate, err := newPublicationRecord(publication.identity, publication.mode, publication.readonly)
+			if err == nil {
+				candidate.keepCONodeID(publication.nodeID)
+				if samePublicationRecordExceptTime(previous, candidate) {
+					continue
+				}
+			}
+		}
+		identity, nodeID, err := d.currentStartupNodeIdentity(ctx, publication.identity.Name, identities)
+		if err != nil {
+			return err
+		}
+		publication.identity, publication.nodeID = identity, nodeID
+	}
+	return nil
 }
 
 type startupNodeIdentityRead struct {
@@ -900,26 +960,11 @@ func (d *Driver) startStartupAttachmentReconcile() {
 				// (revokeStalePublicationRecord) signals this channel, allowing
 				// retry without a permanent cluster-wide polling and backend-write
 				// loop.
-				// While a volume is quarantined, it is also re-run on a timer:
-				// the stale record blocking it may go without a signal.
-				var recheck <-chan time.Time
-				var recheckTimer *time.Timer
-				if d.startupQuarantineCount() > 0 {
-					recheckTimer = time.NewTimer(startupQuarantineRecheckInterval)
-					recheck = recheckTimer.C
-				}
 				select {
 				case <-signal:
 					backoff = startupReconcileInitialBackoff
 					waitForSignal = false
-				case <-recheck:
-					waitForSignal = false
 				case <-ctx.Done():
-				}
-				if recheckTimer != nil {
-					recheckTimer.Stop()
-				}
-				if ctx.Err() != nil {
 					return
 				}
 			}
@@ -929,11 +974,6 @@ func (d *Driver) startStartupAttachmentReconcile() {
 					targets = make(map[string]struct{}, len(pending))
 				}
 				for datasetName := range pending {
-					targets[datasetName] = struct{}{}
-				}
-				// Every targeted pass also re-runs the quarantined volumes
-				// (rare and few), so none waits on a signal naming it alone.
-				for _, datasetName := range d.startupQuarantinedDatasets() {
 					targets[datasetName] = struct{}{}
 				}
 				if len(targets) == 0 {
@@ -980,9 +1020,11 @@ func (d *Driver) startStartupAttachmentReconcile() {
 			if ctx.Err() != nil {
 				return
 			}
-			// A targeted pass that only met busy volumes keeps readiness: the
-			// live operations holding them converge those volumes themselves,
-			// and dropping readiness would gate every CSI call in the cluster.
+			// A targeted pass runs only after a full pass converged, on volumes
+			// that pass left converged or quarantined. One that only met busy
+			// volumes keeps readiness (their quarantine and gauge stand, and
+			// the targets are kept for the retry below): dropping it would gate
+			// every CSI call in the cluster on a lock some other operation holds.
 			if d.config.Fencing.Mode == FencingModeStrict && (full || !startupErrOnlyBusy(err)) {
 				d.ready.Store(false)
 			}
@@ -1018,6 +1060,9 @@ func (d *Driver) startupAttachmentReconcileSignal() <-chan struct{} {
 // the volume whose dataset is datasetName, and only that volume. The request
 // is dropped harmlessly if the loop has already exited.
 func (d *Driver) requestStartupAttachmentReconcile(datasetName string) {
+	if startupReconcileRequestedHook != nil {
+		startupReconcileRequestedHook(datasetName)
+	}
 	d.startupReconcileTargetsMu.Lock()
 	if d.startupReconcileExited {
 		d.startupReconcileTargetsMu.Unlock()

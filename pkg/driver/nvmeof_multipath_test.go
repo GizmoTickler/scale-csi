@@ -13,6 +13,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -517,4 +519,26 @@ func TestNVMeoFVolumeContextResolvesWhenMemoHasNoNQN(t *testing.T) {
 	require.NoError(t, d.nvmeofVolumeContext(ctx, ds, "pool/parent/memo-no-nqn", volumeContext, res))
 	assert.Equal(t, subsystem.NQN, volumeContext["nqn"])
 	assert.NotEmpty(t, volumeContext["nqn"])
+}
+
+// A subsystem the backend reports without an NQN is never written into the
+// immutable volume context, whichever path resolved it.
+func TestNVMeoFVolumeContextRefusesASubsystemWithoutNQN(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeOff)
+	d.config.NVMeoF.SubsystemAllowAnyHost = true
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("backend-no-nqn", "nvmeof"))
+	require.NoError(t, err)
+	ds, err := client.MockClient.DatasetGet(ctx, "pool/parent/backend-no-nqn")
+	require.NoError(t, err)
+	subsystem, err := client.MockClient.NVMeoFSubsystemFindByName(ctx, d.nvmeSubsystemName("pool/parent/backend-no-nqn"))
+	require.NoError(t, err)
+	client.MockClient.NVMeSubsystems[subsystem.ID].NQN = ""
+
+	volumeContext := map[string]string{}
+	err = d.nvmeofVolumeContext(ctx, ds, "pool/parent/backend-no-nqn", volumeContext, nil)
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.NotContains(t, volumeContext, "nqn")
 }

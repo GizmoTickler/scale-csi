@@ -105,19 +105,24 @@ func TestStartupReconcileRequestsPerVolume(t *testing.T) {
 	d.publicationStore = store
 
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
-	want := map[string]int{
+	steady := map[string]int{
 		"list persistentvolumes": 1, "list volumeattachments": 1, "list csinodes": 1, "list nodes": 1,
 		"get volumeattachments": volumes,
-		// The grant's node identity is re-read under the lock, never the
-		// snapshot's (TestStartupReconcileGrantsTheNodesCurrentIdentity).
-		"get csinodes": volumes, "get nodes": volumes,
 	}
-	assert.Equal(t, want, requests.take(), "4 cluster-wide lists per pass, then a VolumeAttachment, CSINode and Node GET per attachment (was 4 more lists per volume)")
+	// A grant that would change (here: create) a stored record re-reads its
+	// node's identity under the lock, never trusting the snapshot's
+	// (TestStartupReconcileGrantsTheNodesCurrentIdentity).
+	first := map[string]int{"get csinodes": volumes, "get nodes": volumes}
+	for request, count := range steady {
+		first[request] = count
+	}
+	assert.Equal(t, first, requests.take(), "4 cluster-wide lists per pass, a VolumeAttachment GET per attachment, and a CSINode and Node GET per record to write (was 4 more lists per volume)")
 	assert.Equal(t, volumes, store.storeCount(), "the first pass writes each missing record")
 
-	// A restart: every record is already in place and unchanged.
+	// A restart: every record is already in place and unchanged, so no node
+	// identity is re-read.
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
-	assert.Equal(t, want, requests.take())
+	assert.Equal(t, steady, requests.take())
 	assert.Zero(t, store.storeCount(), "an unchanged record is not rewritten on restart")
 	for i := 0; i < volumes; i++ {
 		dataset, err := client.DatasetGet(ctx, fmt.Sprintf("pool/parent/restart-%d", i))
@@ -289,7 +294,7 @@ func TestStartupRevokeSignalReRunsOnlyItsVolume(t *testing.T) {
 	require.Eventually(t, func() bool { return converged("q1") }, 3*time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool { return d.startupQuarantineCount() == 1 }, 3*time.Second, 10*time.Millisecond)
 	assert.Equal(t, 1, gets.get("va-settled"), "a converged volume is not re-run by another volume's signal")
-	assert.Equal(t, 2, gets.get("va-q2"), "a targeted pass also re-runs the quarantined volumes")
+	assert.Equal(t, 1, gets.get("va-q2"), "a quarantined volume is not re-run by another volume's signal")
 	assert.Equal(t, float64(1), testutil.ToFloat64(startupFencingUnconvergedVolumes.WithLabelValues("q2")),
 		"q2 is still quarantined")
 	assert.False(t, converged("q2"))

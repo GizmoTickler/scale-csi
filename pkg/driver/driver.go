@@ -250,7 +250,7 @@ type Driver struct {
 	// must not exit while this set is non-empty, since only its later passes
 	// (woken by requestStartupAttachmentReconcile, e.g. from
 	// revokeStalePublicationRecord) can ever converge a quarantined volume.
-	startupQuarantined map[string]string
+	startupQuarantined map[string]startupQuarantine
 	// startupReconcileExited is set (under startupReconcileTargetsMu) when the
 	// reconcile loop has returned: later re-run requests are dropped instead of
 	// collecting in startupReconcilePending with nothing left to take them.

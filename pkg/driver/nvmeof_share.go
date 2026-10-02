@@ -65,6 +65,11 @@ func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, d
 	if namespace == nil || namespace.SubsystemID != subsys.ID {
 		return status.Errorf(codes.Internal, "NVMe-oF namespace for %s is missing or references a different subsystem", datasetName)
 	}
+	if subsys.NQN == "" {
+		// The volume context is immutable: an empty nqn would leave the PV
+		// unattachable for good. Fail, and let the caller retry.
+		return status.Errorf(codes.Internal, "NVMe-oF subsystem %d for %s has no NQN", subsys.ID, datasetName)
+	}
 	volumeContext["nqn"] = subsys.NQN
 	volumeContext["transport"] = d.config.NVMeoF.Transport
 	volumeContext["address"] = d.config.NVMeoF.TransportAddress
