@@ -974,7 +974,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// before the dependency guards and destructive calls.
 		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
 		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
-		{name: "DeleteVolume NFS", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume NFS", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-nfs", "nfs"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -985,7 +988,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// before cleanup, then retains the two dataset dependency guards.
 		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
 		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
-		{name: "DeleteVolume iSCSI", want: 11, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume iSCSI", want: 9, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -997,7 +1003,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// StorageClass reference it), so DeleteVolume adds +0 CHAP round trips.
 		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
 		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
-		{name: "DeleteVolume iSCSI CHAP", want: 11, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume iSCSI CHAP", want: 9, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("delete-iscsi-chap"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -1078,7 +1087,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		//     an assumed write is exactly what wedges a retry forever.
 		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
 		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
-		{name: "DeleteVolume NFS scheduled", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume NFS scheduled", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			_, err := d.CreateVolume(context.Background(), req)

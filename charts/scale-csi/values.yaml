@@ -375,13 +375,17 @@ zfs:
   # delete refuses regardless of this setting.
   destroyForeignSnapshotsOnDelete: false
 
-  # Before every dataset delete, ask TrueNAS whether anything still uses the
-  # dataset (pool.dataset.attachments and pool.dataset.processes). The answer
-  # is only logged and counted (scale_csi_dataset_busy_observations_total); it
-  # never blocks the delete, which is forced, so it is the only record that a
-  # zvol was still in use when it was deleted. The two scans cost about 0.7 s of
-  # TrueNAS middleware time per delete; false skips them.
-  observeBusyBeforeDelete: true
+  # Ask TrueNAS whether anything still uses a dataset (pool.dataset.attachments
+  # and pool.dataset.processes) around its delete. The answer is only logged and
+  # counted (scale_csi_dataset_busy_observations_total); it never blocks the
+  # delete. The two scans cost about 1.3 s of TrueNAS middleware time.
+  #   on-failure  scan only after a delete fails (other than on snapshots), when
+  #               the answer can explain the failure. The default.
+  #   always      (or true) scan before every delete: the only record that a
+  #               forced delete took a zvol that was still in use. The
+  #               behaviour before v1.24.0.
+  #   never       (or false) skip them.
+  observeBusyBeforeDelete: on-failure
 
   # Place a deletion-proof ZFS hold (the fixed `truenas` tag) on every CSI
   # VolumeSnapshot at create so foreign actors — a box-wide periodic-snapshot

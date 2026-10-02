@@ -1191,19 +1191,31 @@ func TestChartStartupConnectTimeoutFailsAtRenderPastInt32(t *testing.T) {
 	}
 }
 
-// TestChartObserveBusyBeforeDeletePlumbing: zfs.observeBusyBeforeDelete is on
-// by default and rendered only when turned off, so the default configmap stays
-// byte-identical and an older binary (which does not know the key) still
-// strict-parses it.
+// TestChartObserveBusyBeforeDeletePlumbing: zfs.observeBusyBeforeDelete
+// defaults to on-failure (the controller's own default) and is rendered only
+// when set to something else, so the default configmap carries no key an
+// older binary would refuse. The boolean forms render as booleans, which every
+// release since the key was added accepts; the mode names render as strings.
 func TestChartObserveBusyBeforeDeletePlumbing(t *testing.T) {
-	for _, args := range [][]string{nil, {"--set", "zfs.observeBusyBeforeDelete=true"}} {
+	for _, args := range [][]string{nil, {"--set", "zfs.observeBusyBeforeDelete=on-failure"}} {
 		out := helmTemplate(t, append([]string{"--show-only", "templates/configmap.yaml"}, args...)...)
 		if strings.Contains(out, "observeBusyBeforeDelete") {
-			t.Errorf("%v: the configmap must not emit zfs.observeBusyBeforeDelete while it is on", args)
+			t.Errorf("%v: the configmap must not emit zfs.observeBusyBeforeDelete at its default", args)
 		}
 	}
-	out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.observeBusyBeforeDelete=false")
-	if !strings.Contains(out, "      observeBusyBeforeDelete: false\n") {
-		t.Errorf("--set zfs.observeBusyBeforeDelete=false did not reach the rendered configmap; got:\n%s", out)
+	for value, want := range map[string]string{
+		"true":   "      observeBusyBeforeDelete: true\n",
+		"false":  "      observeBusyBeforeDelete: false\n",
+		"always": "      observeBusyBeforeDelete: \"always\"\n",
+		"never":  "      observeBusyBeforeDelete: \"never\"\n",
+	} {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.observeBusyBeforeDelete="+value)
+		if !strings.Contains(out, want) {
+			t.Errorf("--set zfs.observeBusyBeforeDelete=%s did not render %q; got:\n%s", value, want, out)
+		}
+	}
+	out := helmTemplateExpectError(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.observeBusyBeforeDelete=sometimes")
+	if !strings.Contains(out, "observeBusyBeforeDelete") {
+		t.Errorf("the schema must reject zfs.observeBusyBeforeDelete=sometimes by name; got:\n%s", out)
 	}
 }

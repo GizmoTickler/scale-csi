@@ -470,18 +470,20 @@ func (c *namespaceListFailingClient) NVMeoFNamespaceListBySubsystem(context.Cont
 	return nil, errors.New("simulated listing failure")
 }
 
-// zfs.observeBusyBeforeDelete=false skips the two observation-only scans that
-// otherwise precede every dataset delete; absent, they run.
+// zfs.observeBusyBeforeDelete decides when the two observation-only scans run
+// around a dataset delete. On a delete that succeeds they run only in "always"
+// mode (true); the default, on-failure, and never (false) skip them.
 func TestBusyObservationBeforeDeleteCanBeTurnedOff(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name    string
-		setting *bool
+		setting BusyObservationMode
 		want    int
 	}{
-		{"default", nil, 1},
-		{"on", ptrTo(true), 1},
-		{"off", ptrTo(false), 0},
+		{"default", "", 0},
+		{"always", BusyObservationAlways, 1},
+		{"on-failure", BusyObservationOnFailure, 0},
+		{"never", BusyObservationNever, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newAPICallCountingClient()

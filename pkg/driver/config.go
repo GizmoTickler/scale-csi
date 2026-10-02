@@ -215,12 +215,16 @@ type ZFSConfig struct {
 	// snapshots that were not created by the CSI driver (default: false)
 	DestroyForeignSnapshotsOnDelete bool `yaml:"destroyForeignSnapshotsOnDelete"`
 
-	// ObserveBusyBeforeDelete runs the observation-only pool.dataset.attachments
-	// and pool.dataset.processes scans before every dataset delete (default:
-	// true). They never block the delete, which is forced, so they are the only
-	// record that something still used the dataset; false saves their TrueNAS
-	// middleware time (together about 0.7 s) on every delete.
-	ObserveBusyBeforeDelete *bool `yaml:"observeBusyBeforeDelete"`
+	// ObserveBusyBeforeDelete controls the observation-only
+	// pool.dataset.attachments and pool.dataset.processes scans around a dataset
+	// delete. They never block the delete; they log and count what still used
+	// the dataset. "on-failure" (the default) runs them only after a delete
+	// fails with anything but a plain snapshot/children dependency, so the
+	// record exists when it can explain a failure. "always" (or true, the
+	// behaviour before v1.24.0) runs them before every delete, which is the only
+	// record that a forced delete took a dataset that was still in use, at about
+	// 1.3 s of TrueNAS middleware time per delete. "never" (or false) skips them.
+	ObserveBusyBeforeDelete BusyObservationMode `yaml:"observeBusyBeforeDelete"`
 
 	// HoldCSISnapshots places a deletion-proof ZFS hold (the fixed `truenas` tag)
 	// on every CSI VolumeSnapshot at create so foreign actors — a box-wide
@@ -1035,10 +1039,56 @@ func (c NVMeoFConfig) ublkAvailable() bool {
 	return c.Ublk.Enabled || c.defaultDataPath() == NVMeoFDataPathUblk
 }
 
-// observeBusyBeforeDelete reports whether dataset deletes first run the busy
-// observation scans (zfs.observeBusyBeforeDelete, default true).
-func (c *Config) observeBusyBeforeDelete() bool {
-	return c == nil || c.ZFS.ObserveBusyBeforeDelete == nil || *c.ZFS.ObserveBusyBeforeDelete
+// BusyObservationMode is zfs.observeBusyBeforeDelete: when the observation-only
+// busy scans run around a dataset delete.
+type BusyObservationMode string
+
+const (
+	// BusyObservationOnFailure scans only after a delete fails (the default).
+	BusyObservationOnFailure BusyObservationMode = "on-failure"
+	// BusyObservationAlways scans before every delete (true; the behaviour
+	// before v1.24.0).
+	BusyObservationAlways BusyObservationMode = "always"
+	// BusyObservationNever never scans (false).
+	BusyObservationNever BusyObservationMode = "never"
+)
+
+// UnmarshalYAML accepts the boolean form earlier releases used (true is
+// "always", false is "never") as well as the three mode names.
+func (m *BusyObservationMode) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("zfs.observeBusyBeforeDelete: expected true, false, %q, %q or %q",
+			BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever)
+	}
+	if node.Tag == "!!bool" {
+		var on bool
+		if err := node.Decode(&on); err != nil {
+			return fmt.Errorf("zfs.observeBusyBeforeDelete: %w", err)
+		}
+		if on {
+			*m = BusyObservationAlways
+		} else {
+			*m = BusyObservationNever
+		}
+		return nil
+	}
+	switch mode := BusyObservationMode(node.Value); mode {
+	case BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever:
+		*m = mode
+		return nil
+	default:
+		return fmt.Errorf("zfs.observeBusyBeforeDelete: %q is not one of true, false, %q, %q, %q",
+			node.Value, BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever)
+	}
+}
+
+// busyObservationMode reports when dataset deletes run the busy observation
+// scans (zfs.observeBusyBeforeDelete, default on-failure).
+func (c *Config) busyObservationMode() BusyObservationMode {
+	if c == nil || c.ZFS.ObserveBusyBeforeDelete == "" {
+		return BusyObservationOnFailure
+	}
+	return c.ZFS.ObserveBusyBeforeDelete
 }
 
 // nodeVolumeLimit is the volume count NodeGetInfo advertises (0: none).
