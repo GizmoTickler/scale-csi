@@ -355,7 +355,8 @@ func TestNVMeoFShareDeleteIsOneForcedSubsystemDeleteWhenTheSubsystemIsTheVolumes
 		namespaces, err := client.NVMeoFNamespaceList(ctx)
 		require.NoError(t, err)
 		require.Len(t, namespaces, 1)
-		namespaces[0].SubsystemID = 0
+		// The listing returns copies; edit the mock's own record.
+		client.MockClient.NVMeNamespaces[namespaces[0].ID].SubsystemID = 0
 		require.NoError(t, d.deleteNVMeoFShareForDataset(ctx, nil, datasetName))
 		assert.Equal(t, 1, client.calls["subsys.delete(force)"])
 		assert.Equal(t, 1, client.calls["namespace.delete"], "the namespace the cascade did not cover is deleted on its own")
