@@ -2330,14 +2330,14 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 // same 47 rows went 152ms→630ms when 300 unrelated datasets were added
 // elsewhere). Each WALK reuses listAllManagedDatasets — the reconciler's
 // path-scoped zfs.resource.query read with its paged pool.dataset.query
-// fallback — exactly once, and serves every page from it: the capacity from
-// the listing's properties, the published nodes from the publication store
-// (the VolumePublication cache when records are kept in Kubernetes). Only a
-// dataset that still carries ZFS publication record keys is re-read, by name
-// (DatasetGetByNames), because the listing carries no property sources and
-// publicationRecordsFromDataset trusts only a LOCAL record. With records on
-// ZFS that is every published volume; with records in Kubernetes, only volumes
-// whose records the import has not moved yet.
+// fallback — exactly once, for the walk's membership and order. With records
+// in Kubernetes every page is served from it: the capacity from the listing's
+// properties, the published nodes from the VolumePublication cache; only a
+// dataset that still carries ZFS publication record keys (not yet imported)
+// is re-read, by name (DatasetGetByNames), because the listing carries no
+// property sources and publicationRecordsFromDataset trusts only a LOCAL
+// record. With records on ZFS every page is re-read by name, as before v1.22:
+// a record written after the listing exists only on its dataset.
 //
 // STABILITY (P-3): pool.dataset.query offset pagination has NO ordering (rows
 // come back in DB-row order), so pages skipped/duplicated volumes under
