@@ -295,3 +295,30 @@ func TestISCSIDeleteAndInitiatorCreateLeaveAReloadOwed(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"), "creating the allow-all initiator group leaves a reload owed")
 }
+
+// A retried revoke whose allowlist is already right (an earlier attempt wrote
+// it, its reload unconfirmed) still reloads, even on a controller whose own
+// ledger owes nothing: the ledger is per process.
+func TestISCSIRetriedRevokeReloadsEvenWhenNothingIsOwed(t *testing.T) {
+	ctx := context.Background()
+	d, client, nodeA, _ := newPublishedStrictISCSIVolume(t)
+	target, err := client.MockClient.ISCSITargetFindByName(ctx, d.iscsiShareName(iscsiMoveVolume))
+	require.NoError(t, err)
+	group := client.MockClient.ISCSIInitiators[target.Groups[0].Initiator]
+	group.Initiators = iscsiDenyAllInitiators() // the earlier attempt's write
+
+	// A new controller whose ledger has just been satisfied.
+	d.serviceReloadDebouncer.Stop()
+	d.serviceReloadDebouncer = NewServiceReloadDebouncer(0, func(ctx context.Context, service string) error {
+		return client.ServiceReload(ctx, service)
+	})
+	require.NoError(t, d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"))
+	require.False(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"))
+	client.resetCalls()
+
+	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: iscsiMoveVolume, NodeId: nodeA})
+	require.NoError(t, err)
+	_, methods := client.callSnapshot()
+	assert.Zero(t, methods["ISCSIInitiatorUpdate"], "the allowlist is already the deny-all sentinel")
+	assert.Equal(t, 1, methods["ServiceReload"], "a revoke always reloads")
+}

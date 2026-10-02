@@ -1614,6 +1614,16 @@ func isISCSIDenyAllSentinel(iqn string) bool {
 }
 
 func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, hasDeferredActiveISCSI bool, res *fenceResolution) error {
+	return d.applyISCSIFenceRevoking(ctx, ds, datasetName, active, hasDeferredActiveISCSI, false, res)
+}
+
+// applyISCSIFenceRevoking is applyISCSIFence for a fence that may be revoking
+// a node (an unpublish, a stale-grant revoke: records being removed). Such a
+// fence always reloads, even when it wrote nothing: the reload ledger is per
+// process, so a retried revoke whose allowlist an earlier attempt (or another
+// controller) already wrote, with the reload never confirmed, must not trust
+// it. A publish that changed nothing still reloads only when one is owed.
+func (d *Driver) applyISCSIFenceRevoking(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, hasDeferredActiveISCSI, revoking bool, res *fenceResolution) error {
 	target, err := d.resolvedISCSITarget(ctx, res, ds, datasetName)
 	if err != nil {
 		return err
@@ -1754,8 +1764,11 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		}
 	}
 	// Reload when this fence (or an earlier change still not loaded) needs it;
-	// a fence that wrote nothing on a service that has loaded everything does
-	// not reload.
+	// a publish fence that wrote nothing on a service that has loaded
+	// everything does not reload. A revoking fence always reloads.
+	if revoking && d.serviceReloadDebouncer != nil {
+		return d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget")
+	}
 	return d.requestISCSIReloadIfOwed(ctx)
 }
 

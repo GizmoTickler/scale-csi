@@ -34,7 +34,7 @@ func (b iscsiShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset,
 }
 
 func (b iscsiShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, hasDeferredActiveISCSI bool, res *fenceResolution) error {
-	return b.d.applyISCSIFence(ctx, ds, datasetName, enforceable, hasDeferredActiveISCSI, res)
+	return b.d.applyISCSIFenceRevoking(ctx, ds, datasetName, enforceable, hasDeferredActiveISCSI, len(removing) > 0, res)
 }
 
 func (b iscsiShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, _ *fenceResolution) error {
