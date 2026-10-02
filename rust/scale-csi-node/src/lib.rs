@@ -3,6 +3,7 @@
 //! interchangeable with it on a live node.
 
 pub mod args;
+pub mod blockdev;
 pub mod capability;
 pub mod capacity;
 pub mod config;

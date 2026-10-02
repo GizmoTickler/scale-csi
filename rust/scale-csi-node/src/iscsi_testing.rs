@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::blockdev::BlockDeviceNumber;
 use crate::exec::Output;
 use crate::iscsi::{Iscsi, same_portal, set_record_param, split_portal};
 use crate::mount::Runner;
-use crate::service::BlockDeviceNumber;
 use crate::testing::{HOST_NQN, Node, fake_device_number, node};
 
 pub const PORTAL: &str = "192.0.2.30:3260";
