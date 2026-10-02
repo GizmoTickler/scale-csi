@@ -1213,9 +1213,16 @@ func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string)
 // listing, so it costs the same. A failure here is returned (fail closed): a
 // narrower fallback could miss the very clone the caller asks about.
 //
-// Without the resource API the read stays the parent-scoped pool.dataset.query.
+// The read stays the parent-scoped pool.dataset.query only when the resource
+// API is DETECTED absent (method not found). A capability probe that failed
+// transiently, or that this caller gave up waiting on, is not detection: the
+// scan then fails rather than quietly narrowing to the parent.
 func (c *Client) queryDatasetOrigins(ctx context.Context, datasetName, parent string) (map[string]string, error) {
-	if c.hasDatasetResourceQuery(ctx, datasetName) {
+	available, detected := c.datasetResourceQueryStatus(ctx, datasetName)
+	if !detected {
+		return nil, fmt.Errorf("failed to query dataset origins: cannot tell whether the dataset resource API (zfs.resource.query) is available; refusing a parent-scoped scan that could miss a clone")
+	}
+	if available {
 		options := map[string]interface{}{
 			"paths":        resourceProbePaths(datasetName),
 			"get_children": true,

@@ -129,3 +129,42 @@ func TestMockOriginScanScope(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, has, "without the resource API only the parent is scanned")
 }
+
+// A capability probe that fails transiently is not detection: the origin scan
+// fails rather than narrowing to the parent, where the clone outside it would
+// be missed.
+func TestOriginScanFailsClosedWhenTheCapabilityProbeFails(t *testing.T) {
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case datasetResourceQueryMethod:
+				resp.Error = &rpcError{Code: -32001, Message: "Method call error"} // transient
+			case "pool.dataset.query":
+				// The parent holds no clone; the real one is outside it.
+				resp.Result = []interface{}{map[string]interface{}{"id": "tank/k8s/volumes/source", "name": "tank/k8s/volumes/source",
+					"origin": map[string]interface{}{"value": "", "parsed": "", "rawvalue": ""}}}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	has, err := client.DatasetHasDependentClones(context.Background(), "tank/k8s/volumes/source")
+	require.Error(t, err, "an undetected capability must not become a parent-scoped \"no clones\"")
+	assert.False(t, has)
+	_, err = client.SnapshotDependentClones(context.Background(), "tank/k8s/volumes/source@snap-1")
+	require.Error(t, err)
+}

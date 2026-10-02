@@ -43,10 +43,11 @@ and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
   read-only on a live TrueNAS 26.0 system: this sees the pool's internal
   datasets that `pool.dataset.query` hides, among them a real clone whose
   origin is in another parent, and costs about what the parent scan did (78
-  datasets in 0.39 s against 47 in 0.45 s). If the pool scan fails, the
-  delete fails and is retried; it never falls back to a narrower answer. On
-  an appliance without `zfs.resource.query` the scan stays parent-scoped,
-  with the old gap.
+  datasets in 0.39 s against 47 in 0.45 s). If the pool scan fails, or the
+  controller cannot tell whether `zfs.resource.query` exists (its capability
+  check failed), the delete fails and is retried rather than scanning less.
+  Only on an appliance where `zfs.resource.query` is known to be absent does
+  the scan stay parent-scoped, with the old gap.
 - **Delete: the busy scans run when a delete fails, by default.**
   `zfs.observeBusyBeforeDelete` now takes a mode:
   - `on-failure` (the new default): the two observation-only scans

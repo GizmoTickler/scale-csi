@@ -608,7 +608,9 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 		if extent == nil {
 			// Cleanup target on failure
-			if delErr := d.truenasClient.ISCSITargetDelete(ctx, targetID, true); delErr != nil {
+			delErr := d.truenasClient.ISCSITargetDelete(ctx, targetID, true)
+			d.markISCSIChanged()
+			if delErr != nil {
 				klog.Warningf("Failed to cleanup iSCSI target after extent creation failure: %v", delErr)
 			}
 			return status.Errorf(codes.Internal, "failed to create iSCSI extent after %d attempts: %v", defaultShareRetryAttempts, lastErr)
@@ -643,10 +645,14 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			// Cleanup orphaned target and extent on association failure
 			// These resources are useless without the association and will block future provisioning
 			klog.Errorf("Failed to create target-extent association, cleaning up orphaned resources: %v", err)
-			if delErr := d.truenasClient.ISCSIExtentDelete(ctx, extentID, false, true); delErr != nil {
+			delErr := d.truenasClient.ISCSIExtentDelete(ctx, extentID, false, true)
+			d.markISCSIChanged()
+			if delErr != nil {
 				klog.Warningf("Failed to cleanup orphaned iSCSI extent %d: %v", extentID, delErr)
 			}
-			if delErr := d.truenasClient.ISCSITargetDelete(ctx, targetID, true); delErr != nil {
+			delErr = d.truenasClient.ISCSITargetDelete(ctx, targetID, true)
+			d.markISCSIChanged()
+			if delErr != nil {
 				klog.Warningf("Failed to cleanup orphaned iSCSI target %d: %v", targetID, delErr)
 			}
 			return status.Errorf(codes.Internal, "failed to create target-extent association: %v", err)

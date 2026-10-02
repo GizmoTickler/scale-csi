@@ -322,3 +322,65 @@ func TestISCSIRetriedRevokeReloadsEvenWhenNothingIsOwed(t *testing.T) {
 	assert.Zero(t, methods["ISCSIInitiatorUpdate"], "the allowlist is already the deny-all sentinel")
 	assert.Equal(t, 1, methods["ServiceReload"], "a revoke always reloads")
 }
+
+// reloadingRollbackClient fails the target-extent association create, and runs
+// a reload (as a concurrent pass could) just before the rollback's first
+// delete: only marks made after that point keep the deletes owed a reload.
+type reloadingRollbackClient struct {
+	*apiCallCountingClient
+	d *Driver
+}
+
+func (c *reloadingRollbackClient) ISCSITargetExtentCreate(context.Context, int, int, int) (*truenas.ISCSITargetExtent, error) {
+	return nil, errors.New("simulated association failure")
+}
+
+func (c *reloadingRollbackClient) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {
+	if err := c.d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
+		return err
+	}
+	return c.apiCallCountingClient.ISCSIExtentDelete(ctx, id, remove, force)
+}
+
+func TestISCSICreateRollbackDeletesLeaveAReloadOwed(t *testing.T) {
+	ctx := context.Background()
+	counting := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, counting, "iscsi", FencingModeOff)
+	d.truenasClient = &reloadingRollbackClient{apiCallCountingClient: counting, d: d}
+	ds, err := counting.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/rollback", Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+
+	err = d.createISCSIShareForDataset(ctx, ds, "pool/parent/rollback", "rollback", true, true, nil)
+	require.Error(t, err)
+	assert.True(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"), "the rollback's deletes are owed a reload")
+}
+
+// failingExtentDeleteClient fails the orphan sweep's extent delete, after the
+// association delete has already been written.
+type failingExtentDeleteClient struct {
+	*truenas.MockClient
+}
+
+func (c *failingExtentDeleteClient) ISCSIExtentDelete(context.Context, int, bool, bool) error {
+	return errors.New("simulated extent delete failure")
+}
+
+func TestOrphanISCSISweepEarlyFailureLeavesAReloadOwed(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(mock)
+	d.truenasClient = &failingExtentDeleteClient{MockClient: mock}
+	d.serviceReloadDebouncer = NewServiceReloadDebouncer(0, func(context.Context, string) error { return nil })
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	createISCSIShareFixture(t, ctx, mock, d, "gone-volume", "pool/parent/gone-volume")
+	require.NoError(t, d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"))
+	require.False(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"))
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+	require.Len(t, report.OrphanShares, 1)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
+	require.Empty(t, report.DeletedShares, "the sweep stopped at the extent delete")
+	assert.True(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"), "the association delete it did write is owed a reload")
+}
