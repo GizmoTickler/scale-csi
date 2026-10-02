@@ -1589,29 +1589,27 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi", nodeA))
 		require.NoError(t, err)
-		// Eight calls:
+		// Six calls:
 		// 1. DatasetGet                  — ControllerPublishVolume volume read.
 		// 2. ISCSITargetGet              — ensureShare resolves the stored target.
 		// 3. WaitForZvolReady            — zvol readiness gate before extent work.
 		// 4. ISCSIExtentGet              — ensureShare resolves the stored extent.
 		// 5. ISCSITargetExtentGet        — ensureShare resolves the target-extent
 		//                                  association.
-		// 6. DatasetSetUserProperties    — ensureShare re-stamps the target/extent/
-		//                                  association IDs.
-		// 7. ServiceReload               — debounced iscsitarget reload so the target
-		//                                  is discoverable.
-		// 8. DatasetSetUserProperties    — storePublicationRecord (off mode skips
+		// 6. DatasetSetUserProperties    — storePublicationRecord (off mode skips
 		//                                  validateBackend/applyBackendFence, so this
 		//                                  is the floor).
-		assertAPICallCount(t, "off iSCSI publish", client, 8)
+		// Batch 4.3 MOVEMENT 8 -> 6: the IDs are already stamped locally with
+		// these values, so ensureShare no longer re-stamps them, and nothing
+		// changed since CreateVolume's reload succeeded, so no ServiceReload.
+		assertAPICallCount(t, "off iSCSI publish", client, 6)
 		assertAPICallMethodMap(t, "off iSCSI publish", client, map[string]int{
 			"DatasetGet":               1,
 			"ISCSITargetGet":           1,
 			"WaitForZvolReady":         1,
 			"ISCSIExtentGet":           1,
 			"ISCSITargetExtentGet":     1,
-			"DatasetSetUserProperties": 2,
-			"ServiceReload":            1,
+			"DatasetSetUserProperties": 1,
 		})
 	})
 	t.Run("off iSCSI multipath publish", func(t *testing.T) {
@@ -1630,10 +1628,11 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		response, err := d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi-multipath", nodeA))
 		require.NoError(t, err)
 		assert.Equal(t, `["192.0.2.10:3260","192.0.2.11:3260"]`, response.GetPublishContext()["portals"])
-		// Ten calls: the eight-call single-path floor above plus exactly one
+		// Eight calls: the six-call single-path floor above plus exactly one
 		// ISCSIPortalList and one ISCSIInitiatorGet for the single distinct
 		// initiator template inspected by publish-time multipath convergence.
-		assertAPICallCount(t, "off iSCSI multipath publish", client, 10)
+		// Batch 4.3 MOVEMENT 10 -> 8, as for single path.
+		assertAPICallCount(t, "off iSCSI multipath publish", client, 8)
 		assertAPICallMethodMap(t, "off iSCSI multipath publish", client, map[string]int{
 			"DatasetGet":               1,
 			"ISCSITargetGet":           1,
@@ -1642,8 +1641,7 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 			"WaitForZvolReady":         1,
 			"ISCSIExtentGet":           1,
 			"ISCSITargetExtentGet":     1,
-			"DatasetSetUserProperties": 2,
-			"ServiceReload":            1,
+			"DatasetSetUserProperties": 1,
 		})
 	})
 	t.Run("off iSCSI unpublish", func(t *testing.T) {
@@ -1684,34 +1682,35 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("strict-iscsi", nodeA))
 		require.NoError(t, err)
-		// Sixteen calls, per-method tally:
+		// Twelve calls, per-method tally:
 		//   DatasetGet                x1 — ControllerPublishVolume volume read.
 		//   ISCSITargetGet            x2 — ensureShare resolves the target; the fence
 		//                                  re-resolves it at its mutation boundary.
 		//   WaitForZvolReady          x1 — zvol readiness gate before extent work.
 		//   ISCSIExtentGet            x1 — ensureShare resolves the extent.
 		//   ISCSITargetExtentGet      x1 — ensureShare resolves the association.
-		//   DatasetSetUserProperties  x3 — ensureShare ID re-stamp, strict per-volume
-		//                                  initiator-group ID stamp, storePublicationRecord.
-		//   ServiceReload             x2 — ensureShare reload + post-fence reload.
+		//   DatasetSetUserProperties  x1 — storePublicationRecord.
+		//   ServiceReload             x1 — post-fence reload (the allowlist changed).
 		//   ISCSIPortalList           x1 — fence resolves the portal group IDs.
 		//   ISCSIInitiatorGet         x2 — fence reads the per-volume initiator group.
 		//   ISCSIInitiatorUpdate      x1 — fence converges the initiator allowlist.
-		//   ISCSITargetUpdate         x1 — fence rebinds the target to the converged
-		//                                  initiator group.
-		assertAPICallCount(t, "strict iSCSI publish", client, 16)
+		// Batch 4.3 MOVEMENT 16 -> 12: ensureShare's ID re-stamp and the strict
+		// initiator-group ID stamp are already set locally with these values; the
+		// target is already bound to the per-volume group on every portal (so no
+		// ISCSITargetUpdate); and ensureShare changed nothing, so only the
+		// post-fence reload remains.
+		assertAPICallCount(t, "strict iSCSI publish", client, 12)
 		assertAPICallMethodMap(t, "strict iSCSI publish", client, map[string]int{
 			"DatasetGet":               1,
 			"ISCSITargetGet":           2,
 			"WaitForZvolReady":         1,
 			"ISCSIExtentGet":           1,
 			"ISCSITargetExtentGet":     1,
-			"DatasetSetUserProperties": 3,
-			"ServiceReload":            2,
+			"DatasetSetUserProperties": 1,
+			"ServiceReload":            1,
 			"ISCSIPortalList":          1,
 			"ISCSIInitiatorGet":        2,
 			"ISCSIInitiatorUpdate":     1,
-			"ISCSITargetUpdate":        1,
 		})
 	})
 	t.Run("strict iSCSI unpublish", func(t *testing.T) {
@@ -1726,24 +1725,24 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-iscsi-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Nine calls, per-method tally:
+		// Seven calls, per-method tally:
 		//   DatasetGet                  x1 — ControllerUnpublishVolume volume read.
-		//   DatasetSetUserProperties    x2 — flip the record to "unpublishing", then
-		//                                    the fence's record update.
+		//   DatasetSetUserProperties    x1 — flip the record to "unpublishing".
 		//   ISCSITargetGet              x1 — fence resolves the target.
 		//   ISCSIInitiatorGet           x1 — fence reads the per-volume initiator group.
 		//   ISCSIInitiatorUpdate        x1 — fence revokes the node's initiator.
-		//   ISCSITargetUpdate           x1 — fence rebinds the target after the revoke.
 		//   ServiceReload               x1 — post-fence iscsitarget reload.
 		//   DatasetRemoveUserProperties x1 — removePublicationRecords clears the record.
-		assertAPICallCount(t, "strict iSCSI unpublish", client, 9)
+		// Batch 4.3 MOVEMENT 9 -> 7: the fence's initiator-group ID stamp is
+		// already set locally, and the target's groups already reference the
+		// per-volume group, so neither is rewritten.
+		assertAPICallCount(t, "strict iSCSI unpublish", client, 7)
 		assertAPICallMethodMap(t, "strict iSCSI unpublish", client, map[string]int{
 			"DatasetGet":                  1,
-			"DatasetSetUserProperties":    2,
+			"DatasetSetUserProperties":    1,
 			"ISCSITargetGet":              1,
 			"ISCSIInitiatorGet":           1,
 			"ISCSIInitiatorUpdate":        1,
-			"ISCSITargetUpdate":           1,
 			"ServiceReload":               1,
 			"DatasetRemoveUserProperties": 1,
 		})

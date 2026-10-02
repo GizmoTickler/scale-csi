@@ -1566,6 +1566,29 @@ func dedupeISCSITargetGroupsByPortal(groups []truenas.ISCSITargetGroup) []truena
 	return result
 }
 
+// sameISCSITargetGroupSet reports whether two target-group lists hold the same
+// groups (portal, initiator, auth method, auth), in any order.
+func sameISCSITargetGroupSet(current, desired []truenas.ISCSITargetGroup) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+	matched := make([]bool, len(current))
+	for _, want := range desired {
+		found := false
+		for i, have := range current {
+			if !matched[i] && have.Portal == want.Portal && sameISCSIGroupTemplate(have, want) {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 // iscsiDenyAllSentinelIQN is a non-matchable initiator IQN that makes a CSI-owned
 // fencing initiator group genuinely deny-all. TrueNAS 26.0 SCST renders an EMPTY
 // initiator allowlist as INITIATOR * (allow-all) — live-verified 2026-07-31 — so
@@ -1650,20 +1673,28 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	if err != nil {
 		return err
 	}
-	if dynamicGroup == nil {
+	switch {
+	case dynamicGroup == nil:
 		// Keeping this CSI-owned group attached to the target preserves portal
 		// validity on the last unpublish; the sentinel allowlist (not an empty
 		// list) is what actually denies every initiator.
 		dynamicGroup, err = d.truenasClient.ISCSIInitiatorCreateWithInitiators(ctx, allowlist, "scale-csi fencing: "+datasetName)
-	} else {
+		d.markISCSIChanged()
+	case dynamicGroup.Initiators != nil && slices.Equal(slices.Sorted(slices.Values(dynamicGroup.Initiators)), allowlist):
+		// The group (just read) already holds exactly this allowlist, byte for
+		// byte. A null list is the legacy allow-all shape and never matches.
+	default:
 		dynamicGroup, err = d.truenasClient.ISCSIInitiatorUpdate(ctx, dynamicGroup.ID, allowlist, dynamicGroup.Comment)
+		d.markISCSIChanged()
 	}
 	if err != nil {
 		return err
 	}
 	dynamicID = dynamicGroup.ID
-	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{PropISCSIInitiatorID: strconv.Itoa(dynamicID)}); err != nil {
-		return err
+	if initiatorProp := map[string]string{PropISCSIInitiatorID: strconv.Itoa(dynamicID)}; !datasetHasLocalUserProperties(ds, initiatorProp) {
+		if err := d.setDatasetUserProperties(ctx, ds, datasetName, initiatorProp); err != nil {
+			return err
+		}
 	}
 	if len(iqns) > 0 {
 		portals, portalErr := d.resolveISCSIPortalIDs(ctx)
@@ -1714,16 +1745,18 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		}
 	}
 	// The dedupe this site used to apply inline now lives in
-	// iscsiTargetUpdateGroups, so the next caller cannot forget it.
-	if _, err := d.iscsiTargetUpdateGroups(ctx, target.ID, groups); err != nil {
-		return err
-	}
-	if d.serviceReloadDebouncer != nil {
-		if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
+	// iscsiTargetUpdateGroups, so the next caller cannot forget it. A target
+	// (read at this boundary) that already carries exactly these groups is not
+	// rewritten.
+	if !sameISCSITargetGroupSet(target.Groups, dedupeISCSITargetGroupsByPortal(groups)) {
+		if _, err := d.iscsiTargetUpdateGroups(ctx, target.ID, groups); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Reload when this fence (or an earlier change still not loaded) needs it;
+	// a fence that wrote nothing on a service that has loaded everything does
+	// not reload.
+	return d.requestISCSIReloadIfOwed(ctx)
 }
 
 func (d *Driver) applyNVMeFence(
