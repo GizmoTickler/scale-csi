@@ -304,11 +304,12 @@ func TestControllerGetCapabilitiesAdvertisesListVolumesPublishedNodes(t *testing
 }
 
 // TestListVolumesWalkAPICallBudget pins the API shape: a full walk costs
-// exactly ONE path-scoped listing call (fresh page only), one id-filtered
-// DatasetGetByNames re-read for each page that holds a dataset with ZFS
-// publication record keys (and only those datasets), and ZERO
+// exactly ONE path-scoped listing call (fresh page only) and ZERO
 // pool.dataset.query DatasetList calls, whose cost scaled with total system
-// dataset count. Until v1.22 every page was re-read: 1 + pages calls.
+// dataset count. With records in Kubernetes, a page is re-read (one
+// id-filtered DatasetGetByNames) only for its datasets with ZFS publication
+// record keys; with records on ZFS every page is re-read, as before v1.22:
+// 1 + pages calls.
 func TestListVolumesWalkAPICallBudget(t *testing.T) {
 	client := newAPICallCountingClient()
 	for i := 0; i < 5; i++ {
@@ -338,10 +339,19 @@ func TestListVolumesWalkAPICallBudget(t *testing.T) {
 
 	total, methods := client.callSnapshot()
 	assert.Equal(t, 1, methods["DatasetQueryByParent"], "one listing per walk")
-	assert.Equal(t, [][]string{{listWalkParent + "/vol-3"}}, reads.names,
-		"only the dataset with ZFS record keys is re-read")
 	assert.Zero(t, methods["DatasetList"], "the full-system-materializing filtered query must not run")
-	assert.Equal(t, 2, total, "no other backend call may hide in the walk")
+	if recordsInKubernetes() {
+		assert.Equal(t, [][]string{{listWalkParent + "/vol-3"}}, reads.names,
+			"only the dataset with ZFS record keys is re-read")
+		assert.Equal(t, 2, total, "no other backend call may hide in the walk")
+		return
+	}
+	assert.Equal(t, [][]string{
+		{listWalkParent + "/vol-0", listWalkParent + "/vol-1"},
+		{listWalkParent + "/vol-2", listWalkParent + "/vol-3"},
+		{listWalkParent + "/vol-4"},
+	}, reads.names, "with records on ZFS every page is re-read by name")
+	assert.Equal(t, 4, total, "no other backend call may hide in the walk")
 }
 
 // recordingDatasetGetByNames records the names each DatasetGetByNames reads.

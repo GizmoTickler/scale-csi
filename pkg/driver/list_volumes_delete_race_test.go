@@ -121,6 +121,29 @@ func TestListVolumesDeleteRecordStaysBoundedWithoutAWalk(t *testing.T) {
 	require.Empty(t, d.volumePageDeleted)
 }
 
+// A volume published between two pages of a walk is reported with its node
+// on the later page when records are on ZFS: the record exists only on the
+// dataset, so every page is re-read by name.
+func TestListVolumesLaterPageSeesAZFSRecordWrittenAfterTheWalkBegan(t *testing.T) {
+	if recordsInKubernetes() {
+		t.Skip("records are kept in Kubernetes; a publish never writes a ZFS record")
+	}
+	mock := truenas.NewMockClient()
+	seedListWalkVolume(mock, "vol-0")
+	late := seedListWalkVolume(mock, "vol-1")
+	d := newListWalkDriver(mock)
+	resp, err := d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 1})
+	require.NoError(t, err)
+	require.Equal(t, "1", resp.NextToken)
+	// ControllerPublishVolume of vol-1 completes between the pages.
+	seedListWalkPublicationRecord(t, late, publicationRecord{Version: publicationRecordVersion, Node: "node-a",
+		EncodedID: "encoded-node-a", State: publicationStatePublished}, "local")
+	resp, err = d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 1, StartingToken: "1"})
+	require.NoError(t, err)
+	require.Len(t, resp.Entries, 1)
+	require.Equal(t, []string{"encoded-node-a"}, resp.Entries[0].GetStatus().GetPublishedNodeIds())
+}
+
 // A walk that arrived while a shared listing was in flight may be served that
 // listing's rows after it ends; a delete made after the shared listing began
 // is kept for the walk even when the listing has ended and another delete

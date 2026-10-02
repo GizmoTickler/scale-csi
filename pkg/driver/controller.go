@@ -2373,13 +2373,17 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
 
-	// Re-read, by name, only the page's datasets that carry ZFS publication
-	// record keys (chunked only if their names outgrow the request budget):
-	// the listing has no property sources, and only a local record is the
-	// volume's own.
+	// Re-read the page by name (chunked only if the names outgrow the request
+	// budget): the listing has no property sources, and only a local record is
+	// the volume's own. With records on ZFS every page is re-read, as before
+	// v1.22: a record written after the walk's listing (a publish between two
+	// pages) is on the dataset only, so the frozen view cannot know of it.
+	// With records in Kubernetes only the datasets still carrying ZFS record
+	// keys (not yet imported) are re-read; new records go to Kubernetes.
+	reReadAll := d.publicationRecordsOnZFS()
 	var keyed []string
 	for _, entry := range page {
-		if entry.recordKeys {
+		if reReadAll || entry.recordKeys {
 			keyed = append(keyed, entry.name)
 		}
 	}
@@ -2403,7 +2407,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		}
 		capacity := listed.capacity
 		ds := &truenas.Dataset{Name: listed.name}
-		if listed.recordKeys {
+		if reReadAll || listed.recordKeys {
 			var ok bool
 			if ds, ok = hydrated[listed.name]; !ok {
 				// Deleted between the walk's frozen listing and this page's
@@ -2620,6 +2624,14 @@ func (d *Driver) listedVolumeDeletedSince(datasetName string, viewStart time.Tim
 	defer d.volumePageCacheMu.Unlock()
 	deletedAt, deleted := d.volumePageDeleted[datasetName]
 	return deleted && !deletedAt.Before(viewStart)
+}
+
+// publicationRecordsOnZFS reports the plain ZFS publication store: records
+// live only on dataset properties, so a listing cannot carry ones written
+// after it was taken.
+func (d *Driver) publicationRecordsOnZFS() bool {
+	_, onZFS := d.publications().(zfsPublicationStore)
+	return onZFS
 }
 
 // listedCapacity is a ListVolumes entry's capacity (listedDatasetCapacity).
