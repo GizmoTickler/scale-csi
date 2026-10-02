@@ -2,9 +2,11 @@ package driver
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -32,7 +34,8 @@ func TestListVolumesOlderWalkKeepsTheNewerViewAndFiltersItsDeletes(t *testing.T)
 	}
 	done := make(chan result, 1)
 	go func() {
-		page, start, _, err := d.managedVolumesForListPage(context.Background(), true, 10, 0)
+		page, start, _, listing, err := d.managedVolumesForListPage(context.Background(), true, 10, 0)
+		d.endVolumeListing(listing)
 		done <- result{page, start, err}
 	}()
 	<-client.read // the listing began at S1 and has read its rows
@@ -60,4 +63,57 @@ func TestListVolumesOlderWalkKeepsTheNewerViewAndFiltersItsDeletes(t *testing.T)
 	defer d.volumePageCacheMu.Unlock()
 	assert.Equal(t, newer, d.volumePageCacheStart, "the older walk replaced the newer view")
 	assert.Equal(t, newerView, d.volumePageCache)
+}
+
+// listPageHookClient runs hook once, inside the first DatasetGetByNames: the
+// re-read of a page's datasets that still carry ZFS record keys.
+type listPageHookClient struct {
+	*truenas.MockClient
+	once sync.Once
+	hook func()
+}
+
+func (c *listPageHookClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*truenas.Dataset, error) {
+	c.once.Do(c.hook)
+	return c.MockClient.DatasetGetByNames(ctx, names)
+}
+
+// A continuation page is served from the cached view: the page's TTL can
+// lapse while the page re-reads, and a delete pruned then would bring back,
+// on that page, a volume DeleteVolume removed after the view's listing
+// began. Serving the page registers it as a listing from the view's start
+// until its entries are built, so no prune can drop that delete.
+func TestListVolumesContinuationPageKeepsItsDeletesAcrossATTLLapse(t *testing.T) {
+	mock := truenas.NewMockClient()
+	seedListWalkVolume(mock, "vol-a")
+	keyed := seedListWalkVolume(mock, "vol-b")
+	// Not yet imported: a ZFS record key, so the page re-reads vol-b.
+	seedListWalkPublicationRecord(t, keyed, publicationRecord{Version: publicationRecordVersion, Node: "node-a",
+		EncodedID: "encoded-node-a", State: publicationStatePublished}, "local")
+	seedListWalkVolume(mock, "vol-c")
+	client := &listPageHookClient{MockClient: mock}
+	d := newListWalkDriverWithRecordsInKubernetes(client)
+
+	resp, err := d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 1})
+	require.NoError(t, err)
+	require.Equal(t, "1", resp.NextToken)
+
+	// DeleteVolume of vol-c completes between the pages.
+	delete(mock.Datasets, listWalkParent+"/vol-c")
+	d.forgetListedVolume("vol-c")
+	client.hook = func() {
+		// The view's TTL lapses while the page re-reads, and another
+		// volume's delete prunes the record meanwhile.
+		d.volumePageCacheMu.Lock()
+		d.volumePageCacheTime = time.Now().Add(-2 * volumeListPageCacheTTL)
+		d.volumePageCacheMu.Unlock()
+		d.forgetListedVolume("vol-unrelated")
+	}
+	resp, err = d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 2, StartingToken: "1"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"vol-b"}, listWalkPageIDs(t, resp), "a volume DeleteVolume removed is reported")
+
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	assert.Empty(t, d.volumePageListings, "the page's listing ended")
 }

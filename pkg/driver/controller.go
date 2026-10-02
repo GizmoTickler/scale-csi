@@ -2377,10 +2377,13 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		requestedLimit = 100
 	}
 
-	page, viewStart, hasMore, err := d.managedVolumesForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
+	page, viewStart, hasMore, listing, err := d.managedVolumesForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
+	// The page is a listing until its entries are built: the deletes it
+	// filters on are kept until then, however long the re-read below takes.
+	defer d.endVolumeListing(listing)
 
 	// Re-read the page by name (chunked only if the names outgrow the request
 	// budget): the listing has no property sources, and only a local record is
@@ -2489,22 +2492,29 @@ type listedVolume struct {
 // a controller restart) refetches — offset tokens remain valid against the
 // refreshed set exactly as they were against the old per-page reads. The view
 // keeps three small fields per volume, not the listing's decoded datasets.
-func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []listedVolume, viewStart time.Time, hasMore bool, err error) {
+//
+// The returned listing is registered, and the caller ends it
+// (endVolumeListing) once it has filtered the page's entries: until then the
+// deletes since viewStart are kept. A continuation page's listing starts at
+// the cached view's start, registered under the same lock the view is read
+// under, so no prune in between can drop a delete the page needs.
+func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []listedVolume, viewStart time.Time, hasMore bool, listing *volumeListing, err error) {
 	if !freshWalk {
 		d.volumePageCacheMu.Lock()
 		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
 			cached, cachedStart := d.volumePageCache, d.volumePageCacheStart
+			listing = d.registerVolumeListingLocked(cachedStart)
 			d.volumePageCacheMu.Unlock()
 			page, hasMore = sliceVolumeListPage(cached, limit, offset)
-			return page, cachedStart, hasMore, nil
+			return page, cachedStart, hasMore, listing, nil
 		}
 		d.volumePageCacheMu.Unlock()
 	}
-	listing := d.beginVolumeListing()
-	defer d.endVolumeListing(listing)
+	listing = d.beginVolumeListing()
 	all, start, err := d.listAllManagedDatasetsWithStart(ctx)
 	if err != nil {
-		return nil, time.Time{}, false, err
+		d.endVolumeListing(listing)
+		return nil, time.Time{}, false, nil, err
 	}
 	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
 	// pool.dataset.query fallback guarantees one.
@@ -2536,7 +2546,7 @@ func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, 
 	}
 	d.volumePageCacheMu.Unlock()
 	page, hasMore = sliceVolumeListPage(volumes, limit, offset)
-	return page, start, hasMore, nil
+	return page, start, hasMore, listing, nil
 }
 
 // volumeListing is one ListVolumes listing in flight. floor is the earliest
@@ -2551,7 +2561,13 @@ type volumeListing struct {
 func (d *Driver) beginVolumeListing() *volumeListing {
 	d.volumePageCacheMu.Lock()
 	defer d.volumePageCacheMu.Unlock()
-	listing := &volumeListing{floor: d.sharedListingFloor(time.Now())}
+	return d.registerVolumeListingLocked(d.sharedListingFloor(time.Now()))
+}
+
+// registerVolumeListingLocked registers a listing whose rows date from floor.
+// The caller holds volumePageCacheMu.
+func (d *Driver) registerVolumeListingLocked(floor time.Time) *volumeListing {
+	listing := &volumeListing{floor: floor}
 	if d.volumePageListings == nil {
 		d.volumePageListings = make(map[*volumeListing]struct{})
 	}
@@ -2559,7 +2575,11 @@ func (d *Driver) beginVolumeListing() *volumeListing {
 	return listing
 }
 
+// endVolumeListing ends a listing; nil is a no-op.
 func (d *Driver) endVolumeListing(listing *volumeListing) {
+	if listing == nil {
+		return
+	}
 	d.volumePageCacheMu.Lock()
 	defer d.volumePageCacheMu.Unlock()
 	delete(d.volumePageListings, listing)
