@@ -133,7 +133,7 @@ func (d *Driver) importPublicationRecordsOf(ctx context.Context, store importing
 		return true
 	}
 	if err == nil {
-		err = store.importLegacy(ctx, datasetName, ds, nil)
+		err = store.importLegacy(ctx, datasetName, ds, nil, false)
 	}
 	if err != nil {
 		d.recordReconcileObjectFailure("publication_import", datasetName, err)

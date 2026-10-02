@@ -69,7 +69,7 @@ func (d *Driver) selectPublicationStore(ctx context.Context) error {
 	if namespace == "" {
 		return errors.New("publication records: the driver's namespace is empty")
 	}
-	store := kubernetesPublicationStore{client: d.eventRecorder.dynamicClient, namespace: namespace, instance: d.config.DriverInstanceID}
+	store := newKubernetesPublicationStore(d.eventRecorder.dynamicClient, namespace, d.config.DriverInstanceID)
 	for attempt := 1; ; attempt++ {
 		_, err = store.resource().List(ctx, metav1.ListOptions{Limit: 1})
 		switch {

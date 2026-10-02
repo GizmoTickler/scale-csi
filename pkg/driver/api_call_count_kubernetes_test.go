@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
 
 // newKubernetesRecordsAPICallCountDriver is newFencedAPICallCountDriver with
@@ -15,7 +17,7 @@ func newKubernetesRecordsAPICallCountDriver(t *testing.T, client *apiCallCountin
 	t.Helper()
 	d := newFencedAPICallCountDriver(t, client, protocol, mode)
 	d.publicationStore = importingPublicationStore{
-		kube:   kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "golden"},
+		kube:   newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "golden"),
 		legacy: zfsPublicationStore{client: client},
 	}
 	return d
@@ -137,4 +139,53 @@ func TestControllerPublishUnpublishGoldenAPICallCountsWithRecordsInKubernetes(t 
 			"NVMeoFHostSubsysDelete":          1,
 		})
 	})
+}
+
+// kubernetesRecordVerbs runs op and returns the VolumePublication requests it
+// made, by verb.
+func kubernetesRecordVerbs(t *testing.T, d *Driver, op func()) map[string]int {
+	t.Helper()
+	fake, ok := d.publicationStore.(importingPublicationStore).kube.client.(*dynamicfake.FakeDynamicClient)
+	require.True(t, ok)
+	fake.ClearActions()
+	op()
+	verbs := make(map[string]int)
+	for _, action := range fake.Actions() {
+		verbs[action.GetVerb()]++
+	}
+	return verbs
+}
+
+// The Kubernetes requests of a strict NVMe-oF move's two halves. Each record
+// write is one request: it is a compare-and-set at the resourceVersion the
+// locked read saw (v1.23; a GET before every write until then).
+func TestControllerPublishUnpublishGoldenKubernetesRequestCounts(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newKubernetesRecordsAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("k-requests", "nvmeof"))
+	require.NoError(t, err)
+	node, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
+	require.NoError(t, err)
+
+	publish := kubernetesRecordVerbs(t, d, func() {
+		_, err := d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("k-requests", node))
+		require.NoError(t, err)
+	})
+	// The locked read and the record create: 2 (3 before).
+	assert.Equal(t, map[string]int{"list": 1, "create": 1}, publish, "first publish")
+
+	republish := kubernetesRecordVerbs(t, d, func() {
+		_, err := d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("k-requests", node))
+		require.NoError(t, err)
+	})
+	// An unchanged record is not rewritten: the read is all.
+	assert.Equal(t, map[string]int{"list": 1}, republish, "republish")
+
+	unpublish := kubernetesRecordVerbs(t, d, func() {
+		_, err := d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "k-requests", NodeId: node})
+		require.NoError(t, err)
+	})
+	// The read, the removing tombstone, the removal: 3 (4 before).
+	assert.Equal(t, map[string]int{"list": 1, "update": 1, "delete": 1}, unpublish, "unpublish")
 }

@@ -412,7 +412,7 @@ func (d *Driver) revokeStalePublicationRecordLocked(
 	if err != nil {
 		return false, fmt.Errorf("fresh dataset read: %w", err)
 	}
-	records, err := d.publications().records(ctx, datasetName, dataset)
+	records, err := d.publications().lockedRecords(ctx, datasetName, dataset)
 	if err != nil {
 		return false, fmt.Errorf("fresh publication record read: %w", err)
 	}

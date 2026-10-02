@@ -146,7 +146,7 @@ func newListingShapeDriverWith(t *testing.T, n, legacy int, mutate func(i int, r
 		Timeout: 30 * time.Second, ConnectTimeout: 5 * time.Second, MaxConnections: 1})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
-	kube := kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "listing"}
+	kube := newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "listing")
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
 		node := fmt.Sprintf("k8s-%d", i%3)

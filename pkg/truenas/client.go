@@ -1751,14 +1751,22 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		}
 	}
 
-	// Acquire a request slot (limit concurrent requests). Waiters are admitted
-	// by priority, then by the age of the operation they belong to; see
-	// WithPriority and WithOperationStart.
-	if err := c.semaphore.acquire(ctx); err != nil {
+	// Acquire a request slot (limit concurrent requests) in the method's lane
+	// (laneForMethod). Waiters are admitted by priority, then by the age of
+	// the operation they belong to; see WithPriority and WithOperationStart.
+	lane := laneForMethod(method)
+	if err := c.semaphore.acquireLane(ctx, lane); err != nil {
 		abandonProbe()
 		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", err)
 	}
-	defer c.semaphore.release() // Release slot when done
+	// The slot is let go while the call backs off between retries, and taken
+	// again, in the same lane and at the same priority, for the next attempt.
+	holding := true
+	defer func() {
+		if holding {
+			c.semaphore.releaseLane(lane)
+		}
+	}()
 
 	maxRetries := c.config.APIRetryMaxAttempts
 	var lastErr error
@@ -1900,6 +1908,9 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 
 		// Don't retry on last attempt or if context is done
 		if attempt < maxRetries-1 {
+			// A backing-off call holds no slot: other calls use it meanwhile.
+			c.semaphore.releaseLane(lane)
+			holding = false
 			timer := time.NewTimer(retryDelay)
 			select {
 			case <-timer.C:
@@ -1921,6 +1932,15 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 				}
 				return nil, finalErr
 			}
+			if err := c.semaphore.acquireLane(ctx, lane); err != nil {
+				abandonProbe()
+				finalErr := fmt.Errorf("context canceled during retry: %w", err)
+				if c.metricsRecorder != nil {
+					c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
+				}
+				return nil, finalErr
+			}
+			holding = true
 		}
 	}
 

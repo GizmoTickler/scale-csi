@@ -175,7 +175,7 @@ func newScaleDriver(tb testing.TB, n int) *Driver {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { _ = client.Close() })
-	kube := kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "bench"}
+	kube := newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "bench")
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
 		node := fmt.Sprintf("k8s-%d", i%3)

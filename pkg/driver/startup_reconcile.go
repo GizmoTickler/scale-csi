@@ -588,7 +588,7 @@ func (d *Driver) reconcileStartupFencingVolumeLocked(ctx context.Context, volume
 	if err != nil {
 		return fmt.Errorf("read attached volume %s: %w", volume.volumeID, err)
 	}
-	records, err := d.publications().records(ctx, datasetName, dataset)
+	records, err := d.publications().lockedRecords(ctx, datasetName, dataset)
 	if err != nil {
 		return fmt.Errorf("read publication records for attached volume %s: %w", volume.volumeID, err)
 	}

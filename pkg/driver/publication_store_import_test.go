@@ -32,7 +32,7 @@ func newImportingStore(t *testing.T, legacy ...publicationRecord) (importingPubl
 		require.NoError(t, zfs.store(context.Background(), ds.Name, ds, publicationPropertyKey(record.Node), record))
 	}
 	client.resetCalls()
-	kube := kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "one"}
+	kube := newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "one")
 	return importingPublicationStore{kube: kube, legacy: zfs}, client, ds
 }
 
@@ -164,7 +164,7 @@ func TestStaleSweepRevokesRecordsInEitherStoreDuringImport(t *testing.T) {
 	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "10m"}
 	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
 	fake := newFakeVolumePublicationClient()
-	kube := kubernetesPublicationStore{client: fake, namespace: "scale-csi", instance: "one"}
+	kube := newKubernetesPublicationStore(fake, "scale-csi", "one")
 	d.publicationStore = importingPublicationStore{kube: kube, legacy: zfsPublicationStore{client: client}}
 
 	dataset := addReconcileDataset(client, "importing", time.Now().Add(-time.Hour), true, 1)

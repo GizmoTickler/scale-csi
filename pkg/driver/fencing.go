@@ -1009,6 +1009,10 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 		nodeID = blocking.Node
 	}
 	if revokeErr := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, nodeID, nil); revokeErr != nil {
+		if status.Code(revokeErr) == codes.Aborted {
+			// A record conflict: the CO's retry decides again from a fresh read.
+			return ds, records, revokeErr
+		}
 		return ds, records, status.Errorf(codes.Internal,
 			"revoke stale publication for node %s before granting node %s: %v", blocking.Node, requested.Node, revokeErr)
 	}
@@ -1025,7 +1029,7 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 	if err != nil {
 		return ds, records, status.Errorf(codes.Internal, "re-read dataset after stale publication takeover: %v", err)
 	}
-	freshRecords, err := d.publications().records(ctx, datasetName, freshDS)
+	freshRecords, err := d.publications().lockedRecords(ctx, datasetName, freshDS)
 	if err != nil {
 		return ds, records, status.Errorf(codes.Internal, "re-read publication records after stale publication takeover: %v", err)
 	}
@@ -1060,7 +1064,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 			return err
 		}
 	}
-	records, err := d.publications().records(ctx, datasetName, ds)
+	records, err := d.publications().lockedRecords(ctx, datasetName, ds)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to read durable publication records: %v", err)
 	}
@@ -1123,7 +1127,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 		// detected it sees a new generation and backs off.
 		record = previous
 	} else if err := d.publications().store(ctx, datasetName, ds, key, record); err != nil {
-		return status.Errorf(codes.Internal, "failed to store publication identity: %v", err)
+		return publicationWriteStatus(err, "failed to store publication identity")
 	}
 	d.stalePublicationRecordsSeen.Delete(observationKey)
 	records[key] = record
@@ -1143,7 +1147,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 }
 
 func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, nodeID string, res *fenceResolution) error {
-	records, err := d.publications().records(ctx, datasetName, ds)
+	records, err := d.publications().lockedRecords(ctx, datasetName, ds)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to read durable publication records: %v", err)
 	}
@@ -1177,7 +1181,7 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 		record.State = publicationStateRemoving
 		record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		if err := d.publications().store(ctx, datasetName, ds, key, record); err != nil {
-			return status.Errorf(codes.Internal, "failed to store unpublish tombstone: %v", err)
+			return publicationWriteStatus(err, "failed to store unpublish tombstone")
 		}
 		records[key] = record
 	}
@@ -1189,9 +1193,19 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 		}
 	}
 	if err := d.publications().remove(ctx, datasetName, ds, keys); err != nil {
-		return status.Errorf(codes.Internal, "failed to remove durable publication records: %v", err)
+		return publicationWriteStatus(err, "failed to remove durable publication records")
 	}
 	return nil
+}
+
+// publicationWriteStatus is the status of a failed record write. A conflict
+// (the record changed since the locked read the write was decided on) is
+// Aborted: the CO retries, and the retry decides again from a fresh read.
+func publicationWriteStatus(err error, message string) error {
+	if errors.Is(err, errPublicationRecordConflict) {
+		return status.Errorf(codes.Aborted, "%s: %v", message, err)
+	}
+	return status.Errorf(codes.Internal, "%s: %v", message, err)
 }
 
 func activeAndRemovingIdentities(records map[string]publicationRecord) (active, removing []NodeIdentity) {

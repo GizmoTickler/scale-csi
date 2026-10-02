@@ -37,7 +37,7 @@ func (c *blockingListClient) DatasetQueryByParent(ctx context.Context, parent st
 func newListWalkDriverWithRecordsInKubernetes(client truenas.ClientInterface) *Driver {
 	d := newListWalkDriver(client)
 	d.publicationStore = importingPublicationStore{
-		kube:   kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "list-walk"},
+		kube:   newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "list-walk"),
 		legacy: zfsPublicationStore{client: client},
 	}
 	return d

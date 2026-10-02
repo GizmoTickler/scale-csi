@@ -67,12 +67,9 @@ func (w *startupLockWatch) wasTouched(key string) bool {
 func (d *Driver) beginStartupLockWatch() *startupLockWatch {
 	watch := &startupLockWatch{touched: make(map[string]struct{})}
 	d.startupLockWatch.Store(watch)
-	d.operationLock.Range(func(key, _ interface{}) bool {
-		if name, ok := key.(string); ok {
-			watch.touch(name)
-		}
-		return true
-	})
+	for _, key := range d.heldOperationLocks() {
+		watch.touch(key)
+	}
 	return watch
 }
 

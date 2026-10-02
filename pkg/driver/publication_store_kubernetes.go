@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,7 +36,6 @@ const (
 	labelVolumePublicationInst = "scale-csi.io/instance"
 	labelVolumePublicationDS   = "scale-csi.io/dataset"
 	labelVolumePublicationNode = "scale-csi.io/node"
-	volumePublicationConflicts = 3
 )
 
 var labelValuePattern = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$`)
@@ -107,6 +108,106 @@ type kubernetesPublicationStore struct {
 	client    dynamic.Interface
 	namespace string
 	instance  string
+	// versions carries each object's resourceVersion from the read under the
+	// volume lock to the write that follows it. Nil (a store built without
+	// newKubernetesPublicationStore) reads the object before each write.
+	versions *publicationVersions
+}
+
+func newKubernetesPublicationStore(client dynamic.Interface, namespace, instance string) kubernetesPublicationStore {
+	return kubernetesPublicationStore{client: client, namespace: namespace, instance: instance, versions: newPublicationVersions()}
+}
+
+// errPublicationRecordConflict reports a record write that found the object
+// changed since the locked read it was decided on: another process wrote or
+// removed it. The write is not made; the caller fails and is retried, and the
+// retry decides again from a fresh read.
+var errPublicationRecordConflict = errors.New("publication record changed since it was read")
+
+// publicationVersions remembers, per dataset, the resourceVersion of each of
+// its VolumePublications as this process last read or wrote them. A dataset
+// present here was read: an object name absent from its entry was observed
+// absent, and its write is a create.
+type publicationVersions struct {
+	mu        sync.Mutex
+	byDataset map[string]map[string]string
+}
+
+func newPublicationVersions() *publicationVersions {
+	return &publicationVersions{byDataset: make(map[string]map[string]string)}
+}
+
+// observe replaces datasetName's versions with a read of its objects.
+func (v *publicationVersions) observe(datasetName string, objects []*unstructured.Unstructured) {
+	if v == nil {
+		return
+	}
+	versions := make(map[string]string, len(objects))
+	for _, object := range objects {
+		versions[object.GetName()] = object.GetResourceVersion()
+	}
+	v.mu.Lock()
+	v.byDataset[datasetName] = versions
+	v.mu.Unlock()
+}
+
+// lookup is name's resourceVersion: observed is false if datasetName was
+// never read, exists false if name was observed absent.
+func (v *publicationVersions) lookup(datasetName, name string) (resourceVersion string, observed, exists bool) {
+	if v == nil {
+		return "", false, false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	versions, observed := v.byDataset[datasetName]
+	if !observed {
+		return "", false, false
+	}
+	resourceVersion, exists = versions[name]
+	return resourceVersion, true, exists
+}
+
+func (v *publicationVersions) set(datasetName, name, resourceVersion string) {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if versions, observed := v.byDataset[datasetName]; observed {
+		versions[name] = resourceVersion
+	}
+}
+
+func (v *publicationVersions) drop(datasetName, name string) {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if versions, observed := v.byDataset[datasetName]; observed {
+		delete(versions, name)
+	}
+}
+
+// observed is whether datasetName has been read.
+func (v *publicationVersions) observed(datasetName string) bool {
+	if v == nil {
+		return false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	_, observed := v.byDataset[datasetName]
+	return observed
+}
+
+// forget drops datasetName: its next write reads the object first.
+func (v *publicationVersions) forget(datasetName string) {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	delete(v.byDataset, datasetName)
+	v.mu.Unlock()
 }
 
 func (s kubernetesPublicationStore) objectName(datasetName, key string) string {
@@ -117,17 +218,43 @@ func (s kubernetesPublicationStore) resource() dynamic.ResourceInterface {
 	return s.client.Resource(volumePublicationGVR).Namespace(s.namespace)
 }
 
+// records reads the dataset's records for a caller that only reports or
+// judges them. It leaves the versions alone: a read made without the volume
+// lock (a ListVolumes page, the startup diff, a quarantine check) could
+// otherwise record a foreign write as seen, which the next locked write
+// would then overwrite, or record a version older than one this process has
+// since written, which the next locked write would then fail on.
 func (s kubernetesPublicationStore) records(ctx context.Context, datasetName string, _ *truenas.Dataset) (map[string]publicationRecord, error) {
+	records, _, err := s.list(ctx, datasetName)
+	return records, err
+}
+
+// lockedRecords is records for a caller holding the volume lock, deciding a
+// write: the versions it reads are what the write is compared against.
+func (s kubernetesPublicationStore) lockedRecords(ctx context.Context, datasetName string, _ *truenas.Dataset) (map[string]publicationRecord, error) {
+	records, objects, err := s.list(ctx, datasetName)
+	if err != nil {
+		return nil, err
+	}
+	s.versions.observe(datasetName, objects)
+	return records, nil
+}
+
+func (s kubernetesPublicationStore) list(ctx context.Context, datasetName string) (map[string]publicationRecord, []*unstructured.Unstructured, error) {
 	list, err := s.resource().List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s,%s=%s",
 		labelVolumePublicationInst, shortHash(s.instance), labelVolumePublicationDS, shortHash(datasetName))})
 	if err != nil {
-		return nil, fmt.Errorf("list publication records for %s: %w", datasetName, err)
+		return nil, nil, fmt.Errorf("list publication records for %s: %w", datasetName, err)
 	}
 	objects := make([]*unstructured.Unstructured, len(list.Items))
 	for i := range list.Items {
 		objects[i] = &list.Items[i]
 	}
-	return s.recordsOf(datasetName, objects)
+	records, err := s.recordsOf(datasetName, objects)
+	if err != nil {
+		return nil, nil, err
+	}
+	return records, objects, nil
 }
 
 // recordsOf validates the dataset's objects, from the API or the cache, as
@@ -197,38 +324,80 @@ func (s kubernetesPublicationStore) object(datasetName, key string, record publi
 	return object, nil
 }
 
-// store creates or replaces the record. Callers hold the volume lock; a
-// conflict means another process wrote the same object, and the caller's
-// record (decided under the lock) replaces it, as a ZFS property write did.
+// store creates or replaces the record as a compare-and-set against the read
+// the caller made under the volume lock (lockedRecords): an object that read saw is
+// updated at the resourceVersion it saw, one it saw absent is created. That is
+// one request per write. A dataset this process has not read is read first.
+// A conflict (the object changed, appeared or went since the read) is
+// reported as errPublicationRecordConflict and never overwritten.
 func (s kubernetesPublicationStore) store(ctx context.Context, datasetName string, _ *truenas.Dataset, key string, record publicationRecord) error {
 	desired, err := s.object(datasetName, key, record)
 	if err != nil {
 		return err
 	}
-	for attempt := 0; ; attempt++ {
-		current, err := s.resource().Get(ctx, desired.GetName(), metav1.GetOptions{})
+	name := desired.GetName()
+	resourceVersion, observed, exists := s.versions.lookup(datasetName, name)
+	if !observed {
+		current, getErr := s.resource().Get(ctx, name, metav1.GetOptions{})
 		switch {
-		case apierrors.IsNotFound(err):
-			_, err = s.resource().Create(ctx, desired, metav1.CreateOptions{})
-		case err == nil:
-			desired.SetResourceVersion(current.GetResourceVersion())
-			_, err = s.resource().Update(ctx, desired, metav1.UpdateOptions{})
-		}
-		if err == nil {
-			return nil
-		}
-		if (!apierrors.IsConflict(err) && !apierrors.IsAlreadyExists(err)) || attempt+1 >= volumePublicationConflicts {
-			return fmt.Errorf("store publication record %s for %s: %w", desired.GetName(), datasetName, err)
+		case apierrors.IsNotFound(getErr):
+		case getErr != nil:
+			return fmt.Errorf("store publication record %s for %s: %w", name, datasetName, getErr)
+		default:
+			resourceVersion, exists = current.GetResourceVersion(), true
 		}
 	}
+	var stored *unstructured.Unstructured
+	if exists {
+		desired.SetResourceVersion(resourceVersion)
+		stored, err = s.resource().Update(ctx, desired, metav1.UpdateOptions{})
+	} else {
+		stored, err = s.resource().Create(ctx, desired, metav1.CreateOptions{})
+	}
+	if err != nil {
+		if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) || (exists && apierrors.IsNotFound(err)) {
+			s.versions.forget(datasetName)
+			return fmt.Errorf("store publication record %s for %s: %w: %w", name, datasetName, errPublicationRecordConflict, err)
+		}
+		return fmt.Errorf("store publication record %s for %s: %w", name, datasetName, err)
+	}
+	s.versions.set(datasetName, name, stored.GetResourceVersion())
+	return nil
 }
 
+// remove deletes the records. An object whose version the locked read (or
+// this process's last write) saw is deleted only at that version: one
+// changed since is reported as errPublicationRecordConflict and kept. One
+// the read saw absent is not deleted: if it exists now it was created since,
+// and that is reported the same way. One of a dataset never read is deleted
+// as it is.
 func (s kubernetesPublicationStore) remove(ctx context.Context, datasetName string, _ *truenas.Dataset, keys []string) error {
 	for _, key := range keys {
 		name := s.objectName(datasetName, key)
-		if err := s.resource().Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		options := metav1.DeleteOptions{}
+		resourceVersion, observed, exists := s.versions.lookup(datasetName, name)
+		switch {
+		case exists && resourceVersion != "":
+			options.Preconditions = &metav1.Preconditions{ResourceVersion: &resourceVersion}
+		case observed && !exists:
+			_, err := s.resource().Get(ctx, name, metav1.GetOptions{})
+			switch {
+			case apierrors.IsNotFound(err):
+				continue
+			case err != nil:
+				return fmt.Errorf("remove publication record %s for %s: %w", name, datasetName, err)
+			}
+			s.versions.forget(datasetName)
+			return fmt.Errorf("remove publication record %s for %s: %w: created since it was read", name, datasetName, errPublicationRecordConflict)
+		}
+		if err := s.resource().Delete(ctx, name, options); err != nil && !apierrors.IsNotFound(err) {
+			if apierrors.IsConflict(err) {
+				s.versions.forget(datasetName)
+				return fmt.Errorf("remove publication record %s for %s: %w: %w", name, datasetName, errPublicationRecordConflict, err)
+			}
 			return fmt.Errorf("remove publication record %s for %s: %w", name, datasetName, err)
 		}
+		s.versions.drop(datasetName, name)
 	}
 	return nil
 }
@@ -239,6 +408,7 @@ func (s kubernetesPublicationStore) instanceSelector() string {
 
 // forget deletes every record of the dataset.
 func (s kubernetesPublicationStore) forget(ctx context.Context, datasetName string) error {
+	defer s.versions.forget(datasetName)
 	list, err := s.resource().List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s,%s=%s",
 		s.instanceSelector(), labelVolumePublicationDS, shortHash(datasetName))})
 	if err != nil {

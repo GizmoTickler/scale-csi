@@ -15,7 +15,7 @@ func importTestDriver(t *testing.T) (*Driver, *truenas.MockClient, importingPubl
 	t.Helper()
 	d, client := newReconcileTestDriver(t, false, nil, nil)
 	store := importingPublicationStore{
-		kube:   kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "one"},
+		kube:   newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "one"),
 		legacy: zfsPublicationStore{client: client},
 	}
 	d.publicationStore = store

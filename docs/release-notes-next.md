@@ -1,6 +1,73 @@
-# Release notes — v1.17.0 (next)
+# Release notes — next (v1.23.0 draft)
 
-## v1.22.0 (draft) — a restart of seconds, a drain that does not wait for it
+## v1.23.0 (draft) — snapshots and publishes no longer turn each other away
+
+Nothing to configure. Three changes to how the controller schedules its own
+work, and one fix to ListVolumes.
+
+The numbers below are not measured on hardware. They come from the same
+in-process model as v1.22.0 (the TrueNAS mock with per-call latencies
+calibrated on nas01, writes served one at a time, strict fencing, NVMe-oF
+with four portals, records in Kubernetes), driving a 30-move drain through a
+model of the attacher at 300 volumes. Medians of three runs.
+
+| 30-move drain at 300 volumes | v1.22.0 | v1.23.0 |
+|---|---|---|
+| A snapshot of each moving volume at the same time: snapshots Aborted | 90 | 0 |
+| ... snapshot completion, median / slowest | 18.0 s / 21.2 s | 12.6 s / 18.1 s |
+| ... drain | 19.7 s | 21.1 s |
+| Under a burst of 12 background writers: drain | 23.7 s | 22.1 s |
+| Kubernetes requests for the drain's records | 210 | 150 |
+| No contention: drain; restart at 1,000 volumes | 18.2 s; 3.1 s | 18.2 s; 3.1 s |
+
+With snapshots the drain itself takes 1.4 s longer: the snapshot writes now
+share the appliance with it instead of failing and running after it.
+
+- **Volume lock modes.** ControllerPublishVolume and ControllerUnpublishVolume
+  hold their volume's lock attach-class; CreateSnapshot, DeleteSnapshot and a
+  volume clone's source hold it data-class. The two classes run alongside
+  each other, so a snapshot of a volume no longer fails Aborted because the
+  volume is being published, or the other way round. Everything else is
+  unchanged: two publishes or unpublishes of one volume are still serialised
+  (strict fencing decides each grant from what the previous one left), two
+  snapshot operations on one volume still are, and DeleteVolume,
+  ControllerExpandVolume, ModifyVolume, CreateVolume, promote and the
+  background reconcilers still hold a volume's lock exclusively. While the
+  startup worker waits for a volume's lock, no new attach or data holder is
+  let in ahead of it. The debug endpoint names a shared hold's modes, as
+  `volume:x(attach+data)`.
+- **A publish waits briefly for its volume.** A publish or unpublish that
+  finds its volume's lock held by a conflicting operation now waits up to
+  8 seconds for it before returning Aborted, instead of returning Aborted at
+  once and leaving the attacher to back off for longer than the conflict
+  lasted. Only one publish or unpublish waits per volume: any further one
+  returns Aborted at once, so an RWX volume with many attachments in flight
+  cannot hold every attacher worker. The cost: when ten or more attaches of
+  one RWX volume arrive together, all but the running one and the one
+  waiting get Aborted and come back after the attacher's backoff. The node's identity (its CSINode and
+  Node) is read after the lock is taken.
+- **Reads ahead of write bursts.** Of the TrueNAS request slots
+  (`truenas.maxConcurrentRequests`, 10 by default), writes now hold at most
+  4, so the reads a publish or unpublish starts with are sent at once
+  however many writes are queued on the appliance. Priority still decides
+  among the requests whose kind has a free slot: a publish's write takes the
+  next write slot ahead of background writes. A call that backs off between
+  retries of a connection failure no longer holds a slot while it waits.
+- **VolumePublication writes are a compare-and-set.** A record write or
+  removal carries the resourceVersion of the read the controller made under
+  the volume lock to decide it (the reads that only report records, such as
+  ListVolumes and the startup diff, never set it): one request per write
+  instead of two (a first publish 3 → 2 requests, an unpublish 4 → 3). A
+  write or removal that finds the object changed, created or removed since
+  that read is no longer retried over the other writer's record: the publish
+  or unpublish returns Aborted ("publication record changed since it was
+  read"), and its retry decides again from a fresh read.
+- **ListVolumes.** A continuation page could report a volume this controller
+  had deleted after the walk began, if the walk's cached view expired while
+  the page re-read its datasets (records in Kubernetes only). Every page now
+  keeps the deletes it filters on until its entries are built.
+
+## v1.22.0 — a restart of seconds, a drain that does not wait for it
 
 Nothing to configure. Startup with strict fencing, a drain that overlaps a
 controller restart, and ListVolumes all cost less.
@@ -61,8 +128,8 @@ read: the client caches the port after that.
   later page reports a volume's capacity as the walk's first page listed it,
   so a volume expanded mid-walk shows its new size on the next walk. And a
   zvol whose volsize cannot be read is reported with capacity 0 (unknown)
-  instead of the pool's free space. A volume deleted while a walk is in
-  flight is left out of it, as before.
+  instead of the pool's free space. A volume this controller deletes while a
+  walk is in flight is left out of it, as before.
 - **Concurrent listings share one read.** The startup readers that list every
   managed dataset at about the same time (the stale-record sweep, the orphan
   reconcile, the publication import, the unlock reconciler, ListVolumes) now

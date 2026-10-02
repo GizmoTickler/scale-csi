@@ -111,8 +111,9 @@ type Driver struct {
 	// Kubernetes event recorder
 	eventRecorder *EventRecorder
 
-	// Operation lock to prevent concurrent operations on same volume
-	operationLock sync.Map
+	// Per-key operation locks (operation_lock.go): a volume's lock is held
+	// exclusively, or in the compatible attach and data modes.
+	operationLocks operationLockTable
 
 	// NOTE (GF2-fix3/B1-a): there is deliberately NO Driver-level cache of the NAS
 	// civil timezone. The round-2 implementation kept one with its own one-hour
@@ -988,68 +989,6 @@ func requestWithoutSecrets(req interface{}) interface{} {
 		reflected.Clear(secrets)
 	}
 	return cloned
-}
-
-// acquireOperationLock acquires a lock for the given operation key.
-// Returns false if the lock is already held. The held value is a channel the
-// release closes, so a caller that may wait (acquireOperationLockWait) learns
-// of the release without polling.
-func (d *Driver) acquireOperationLock(key string) bool {
-	if _, held := d.operationLock.Load(key); held {
-		return false
-	}
-	if _, loaded := d.operationLock.LoadOrStore(key, make(chan struct{})); loaded {
-		return false
-	}
-	d.operationLockTaken(key)
-	return true
-}
-
-// operationLockTaken tells a running startup diff that key's lock was taken
-// (startupLockWatch).
-func (d *Driver) operationLockTaken(key string) {
-	if watch := d.startupLockWatch.Load(); watch != nil {
-		watch.touch(key)
-	}
-}
-
-// acquireOperationLockWait is acquireOperationLock that waits up to wait for
-// a held lock to be released. It returns false if the lock is still held
-// when wait runs out or ctx ends.
-func (d *Driver) acquireOperationLockWait(ctx context.Context, key string, wait time.Duration) bool {
-	if d.acquireOperationLock(key) {
-		return true
-	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	for {
-		released := make(chan struct{})
-		actual, loaded := d.operationLock.LoadOrStore(key, released)
-		if !loaded {
-			d.operationLockTaken(key)
-			return true
-		}
-		held, ok := actual.(chan struct{})
-		if !ok {
-			return false
-		}
-		select {
-		case <-held:
-		case <-timer.C:
-			return false
-		case <-ctx.Done():
-			return false
-		}
-	}
-}
-
-// releaseOperationLock releases the lock for the given operation key.
-func (d *Driver) releaseOperationLock(key string) {
-	if held, ok := d.operationLock.LoadAndDelete(key); ok {
-		if released, isChannel := held.(chan struct{}); isChannel {
-			close(released)
-		}
-	}
 }
 
 // GetTrueNASClient returns the TrueNAS API client.

@@ -25,7 +25,7 @@ func init() {
 			return store.(publicationStore)
 		}
 		store, _ := testStores.LoadOrStore(d, importingPublicationStore{
-			kube:   kubernetesPublicationStore{client: newFakeVolumePublicationClient(), namespace: "scale-csi", instance: "suite"},
+			kube:   newKubernetesPublicationStore(newFakeVolumePublicationClient(), "scale-csi", "suite"),
 			legacy: zfsPublicationStore{client: d.truenasClient},
 		})
 		return store.(publicationStore)
