@@ -34,12 +34,17 @@ func nodePluginContainer(t *testing.T, rendered string) manifest {
 	return nil
 }
 
-func TestChartNodeImplementationDefaultIsUnchanged(t *testing.T) {
+// The Rust node agent is the default since v1.21.0; node.implementation=go
+// still selects the Go node plugin.
+func TestChartNodeImplementationDefaultIsRust(t *testing.T) {
 	base := withArgs(rustNodeArgs[:4], nvmeofOnArgs...)
-	if got, want := helmTemplate(t, withArgs(base, "--set", "node.implementation=go")...), helmTemplate(t, base...); got != want {
-		t.Error("node.implementation=go must render exactly the default")
+	if got, want := helmTemplate(t, withArgs(base, "--set", "node.implementation=rust")...), helmTemplate(t, base...); got != want {
+		t.Error("node.implementation=rust must render exactly the default")
 	}
-	if _, set := nodePluginContainer(t, helmTemplate(t))["command"]; set {
+	if got := renderJSON(t, nodePluginContainer(t, helmTemplate(t))["command"]); got != `["/usr/local/bin/scale-csi-node"]` {
+		t.Errorf("the default node plugin is the Rust agent, got command %s", got)
+	}
+	if _, set := nodePluginContainer(t, helmTemplate(t, "--set", "node.implementation=go"))["command"]; set {
 		t.Error("the Go node plugin runs the image's entrypoint")
 	}
 }
@@ -62,7 +67,7 @@ func TestChartNodeImplementationRustServesNFS(t *testing.T) {
 	for name, args := range map[string][]string{
 		"nfs only":           withArgs(nfsOnly, "--set", "node.implementation=rust"),
 		"nfs and nvmeof":     withArgs(rustNodeArgs, "--set", "nfs.enabled=true", "--set", "node.implementation=rust"),
-		"nfs only, a canary": withArgs(nfsOnly, "--set", "node.rustNodes={k8s-2}"),
+		"nfs only, a canary": withArgs(nfsOnly, "--set", "node.implementation=go", "--set", "node.rustNodes={k8s-2}"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			rendered := helmTemplate(t, args...)
@@ -111,7 +116,7 @@ func TestChartNodeImplementationRustServesISCSI(t *testing.T) {
 		"with NVMe-oF": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.implementation=rust"),
 		"alone": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nvmeof.enabled=false",
 			"--set", "node.implementation=rust"),
-		"on canary nodes": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.rustNodes={k8s-2}"),
+		"on canary nodes": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.implementation=go", "--set", "node.rustNodes={k8s-2}"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			rendered := helmTemplate(t, args...)
@@ -156,7 +161,7 @@ func nodeDaemonSets(t *testing.T, rendered string) map[string]manifest {
 // nodes, which the Go DaemonSet avoids; the two never select each other's
 // pods' scheduling, and nvmeublkd keeps running everywhere.
 func TestChartNodeRustNodesCanariesTheAgent(t *testing.T) {
-	rendered := helmTemplate(t, withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}")...)
+	rendered := helmTemplate(t, withArgs(rustNodeArgs, "--set", "node.implementation=go", "--set", "node.rustNodes={k8s-2}")...)
 	sets := nodeDaemonSets(t, rendered)
 	goSet, rustSet := sets["scale-csi-node"], sets["scale-csi-node-rust"]
 	if goSet == nil || rustSet == nil || len(sets) != 2 {
@@ -198,7 +203,7 @@ func TestChartNodeRustNodesCanariesTheAgent(t *testing.T) {
 
 	for name, args := range map[string][]string{
 		"with node.implementation=rust": withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.implementation=rust"),
-		"with node.affinity":            withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.affinity.podAntiAffinity.x=y"),
+		"with node.affinity":            withArgs(rustNodeArgs, "--set", "node.implementation=go", "--set", "node.rustNodes={k8s-2}", "--set", "node.affinity.podAntiAffinity.x=y"),
 	} {
 		t.Run("refused "+name, func(t *testing.T) { helmTemplateExpectError(t, args...) })
 	}

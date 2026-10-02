@@ -1,5 +1,28 @@
 # Release notes — v1.17.0 (next)
 
+## v1.21.0 — the Rust node agent is the default
+
+`node.implementation` now defaults to `rust`: the node DaemonSet runs the Rust
+node agent (`scale-csi-node`) instead of the Go node plugin, from the same
+image. It serves NVMe-oF (kernel initiator and nvmeublkd), iSCSI and NFS, and
+has run every node of the maintainers' cluster since 2026-10-02 after a canary
+from v1.15.0.
+
+### Upgrade
+
+- **Upgrading switches the node plugin to Rust.** The DaemonSet's pods are
+  replaced one node at a time; the agent adopts every volume the Go plugin
+  staged (staging mounts, NVMe-oF and iSCSI sessions, NFS mounts) with no
+  volume work, and the pods using them keep running.
+- **To stay on the Go node plugin,** set `node.implementation: go` before
+  upgrading. Switching back later is the same: each plugin adopts what the
+  other staged.
+- **`node.rustNodes`** (a Rust canary in a Go cluster) now needs
+  `node.implementation: go` set explicitly; with the Rust default it is
+  refused, as it always was with `implementation: rust`.
+- NFS over a storage network with fencing on needs
+  `nfs.nodeIdentityNetworks`, the same as with the Go plugin (see v1.18.0).
+
 ## v1.20.0 — kernel NVMe-oF waits for the current /dev node
 
 - **Kernel NVMe-oF: a stage right after a handover waits for the current /dev

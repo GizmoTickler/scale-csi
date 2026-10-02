@@ -211,14 +211,16 @@ controller:
 node:
   enabled: true
 
-  # Which node plugin the DaemonSet runs, from the same image: go (scale-csi)
-  # or rust (scale-csi-node, the Rust node agent). The Rust agent serves
-  # NVMe-oF (kernel initiator and nvmeublkd), iSCSI and NFS.
-  implementation: go
+  # Which node plugin the DaemonSet runs, from the same image: rust
+  # (scale-csi-node, the Rust node agent; the default since v1.21.0) or go
+  # (scale-csi, the Go node plugin). Both serve NVMe-oF (kernel initiator and
+  # nvmeublkd), iSCSI and NFS, and each adopts what the other staged, so
+  # switching needs no volume work.
+  implementation: rust
 
-  # A canary of the Rust agent in a Go cluster: node names (kubernetes.io/
-  # hostname) that run it in a second DaemonSet, <fullname>-node-rust, while
-  # the Go DaemonSet avoids them. Leave
+  # With implementation: go, a canary of the Rust agent: node names
+  # (kubernetes.io/hostname) that run it in a second DaemonSet,
+  # <fullname>-node-rust, while the Go DaemonSet avoids them. Leave
   # node.affinity empty with it. Empty: one DaemonSet on every node.
   rustNodes: []
 
