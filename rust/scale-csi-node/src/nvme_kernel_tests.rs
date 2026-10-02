@@ -602,3 +602,40 @@ async fn a_kernel_publish_checks_raw_block_ownership() {
     let err = crate::publish::node_publish(&n.state, &other, None).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
+
+/// The handover race: the other plugin disconnected the subsystem, this one
+/// connects it again, and sysfs already names the namespace while its /dev
+/// node still carries the previous namespace's number for a few stats. A whole
+/// stage (block, filesystem, multipath) waits for the current node instead of
+/// handing the stale one to the staging link, blkid or mkfs (ENXIO).
+#[tokio::test]
+async fn a_stage_right_after_a_handover_waits_for_the_current_node() {
+    for (config, hint, capability) in [
+        (SINGLE, None, block()),
+        (SINGLE, None, filesystem()),
+        (MULTI, Some(HINT), filesystem()),
+    ] {
+        let n = kernel_node(config);
+        n.host.0.lock().unwrap().kernel.as_mut().unwrap().stale_polls = 2;
+        let is_block = capability.access_type == block().access_type;
+        node_stage(&n.state, &stage_request(&n, capability, hint), None)
+            .await
+            .unwrap();
+        let left: u32 = n.host.0.lock().unwrap().kernel.as_ref().unwrap().stale.values().sum();
+        assert_eq!(
+            left, 0,
+            "{config:?} block={is_block}: the wait must poll past the stale node"
+        );
+        let dev = device(&n);
+        if is_block {
+            assert_eq!(
+                std::fs::read_link(n.path("staging/globalmount"))
+                    .unwrap()
+                    .to_string_lossy(),
+                dev
+            );
+        } else {
+            assert!(n.host.calls().contains(&format!("mkfs.ext4 -F {dev}")), "{config:?}");
+        }
+    }
+}

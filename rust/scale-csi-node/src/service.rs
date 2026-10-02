@@ -125,6 +125,7 @@ impl State {
                 timeout: nvme_timeout,
                 sysfs: PathBuf::from("/sys"),
                 dev: PathBuf::from("/dev"),
+                device_number: Arc::new(block_device_number),
             },
             nvme_sessions: None,
             host: Host::default(),

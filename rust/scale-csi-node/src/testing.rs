@@ -87,11 +87,17 @@ pub fn fake_device_number(name: &str) -> u64 {
         .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
 }
 
+/// The sysfs `dev` file ("MAJ:MIN") of a fake device (FakeHost::device_number).
+pub fn sysfs_dev(name: &str) -> String {
+    let number = fake_device_number(name);
+    format!("{}:{}\n", libc::major(number), libc::minor(number))
+}
+
 impl FakeHost {
     /// A fake device number: a bind target reports its device's; a device
     /// path (symlinks resolved, as stat(2) does) reports one derived from its
-    /// name, or a stale one while the fake iSCSI initiator still models the
-    /// previous disk's node under that name.
+    /// name, or a stale one while the fake iSCSI or kernel NVMe initiator
+    /// still models the previous disk's node under that name.
     pub fn device_number(&self, path: &str) -> Option<u64> {
         let mut host = self.0.lock().unwrap();
         let device = match host.mounts.get(path) {
@@ -110,7 +116,11 @@ impl FakeHost {
         if !is_device {
             return None;
         }
-        if let Some(stale) = host.iscsi.as_mut().and_then(|f| f.stale.get_mut(name))
+        let stale = match host.iscsi.as_mut().and_then(|f| f.stale.get_mut(name)) {
+            Some(stale) => Some(stale),
+            None => host.kernel.as_mut().and_then(|k| k.stale.get_mut(name)),
+        };
+        if let Some(stale) = stale
             && *stale > 0
         {
             *stale -= 1;
@@ -518,6 +528,14 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
         timeout: std::time::Duration::from_secs(30),
         sysfs: dir.path().join("sys"),
         dev: daemon.dev_dir.path().to_path_buf(),
+        // stat(2) fails on a missing node; the host's fake numbers the rest.
+        device_number: {
+            let numbers = host.clone();
+            Arc::new(move |path: &str| {
+                std::fs::metadata(path)?;
+                Ok(numbers.device_number(path))
+            })
+        },
     };
     state.nvme_sessions =
         Some(crate::session_registry::SessionRegistry::at(dir.path().join("sessions/nvmeof")).unwrap());
@@ -603,6 +621,12 @@ pub struct FakeKernel {
     pub refuse_disconnect: bool,
     /// Written on `ns-rescan`: (file, content), e.g. a grown size.
     pub on_rescan: Option<(PathBuf, String)>,
+    /// For this many stats after a connect, a new subsystem's namespace /dev
+    /// node reports a stale device number: the node the previous namespace of
+    /// that name left behind, before devtmpfs/udev catch up.
+    pub stale_polls: u32,
+    /// Device name -> stats left that report the stale number.
+    pub stale: BTreeMap<String, u32>,
     next_subsystem: u32,
     next_controller: u32,
 }
@@ -619,6 +643,8 @@ impl FakeKernel {
             unreachable: Vec::new(),
             refuse_disconnect: false,
             on_rescan: None,
+            stale_polls: 0,
+            stale: BTreeMap::new(),
             next_subsystem: 0,
             next_controller: 0,
         }
@@ -658,10 +684,16 @@ impl FakeKernel {
             let index = self.next_subsystem;
             self.next_subsystem += 1;
             let dir = self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}"));
-            std::fs::create_dir_all(dir.join(format!("nvme{index}n1"))).unwrap();
+            // The native multipath head, nvme<subsystem instance>n1.
+            let namespace = format!("nvme{index}n1");
+            std::fs::create_dir_all(dir.join(&namespace)).unwrap();
+            std::fs::write(dir.join(&namespace).join("dev"), sysfs_dev(&namespace)).unwrap();
             std::fs::write(dir.join("subsysnqn"), format!("{nqn}\n")).unwrap();
             std::fs::write(dir.join("iopolicy"), "numa").unwrap();
-            std::fs::write(self.dev.join(format!("nvme{index}n1")), b"").unwrap();
+            std::fs::write(self.dev.join(&namespace), b"").unwrap();
+            if self.stale_polls > 0 {
+                self.stale.insert(namespace, self.stale_polls);
+            }
             self.subsystems.insert(nqn.to_string(), (index, Vec::new()));
         }
         let entry = self.subsystems.get_mut(nqn).unwrap();
