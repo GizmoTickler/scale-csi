@@ -2161,8 +2161,8 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	defer d.releaseOperationLock(lockKey)
 	// Strict fencing at startup: converge this volume first if startup has not
 	// yet (startup_gate.go). The dataset is read below, after it.
-	if err := d.startupPublishGate(ctx, volumeID); err != nil {
-		return nil, err
+	if gateErr := d.startupPublishGate(ctx, volumeID); gateErr != nil {
+		return nil, gateErr
 	}
 
 	datasetName, err := d.datasetForID(volumeID)

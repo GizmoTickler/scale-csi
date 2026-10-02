@@ -130,7 +130,7 @@ func newDiffFixture(t *testing.T, n int) *diffFixture {
 func (f *diffFixture) perVolume() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []string
+	out := make([]string, 0, len(f.vaGets))
 	for name := range f.vaGets {
 		out = append(out, name[len("va-"):])
 	}
@@ -151,7 +151,7 @@ func (f *diffFixture) allowedNQNs(t *testing.T, volumeID string) []string {
 	t.Helper()
 	associations, err := f.client.MockClient.NVMeoFHostSubsysListBySubsystem(context.Background(), f.subsystemOf(t, volumeID).ID)
 	require.NoError(t, err)
-	var nqns []string
+	nqns := make([]string, 0, len(associations))
 	for _, association := range associations {
 		nqns = append(nqns, association.HostNQN)
 	}
@@ -191,31 +191,37 @@ func TestStartupDiffSendsDivergentVolumesToThePerVolumePath(t *testing.T) {
 	blocked := map[string]bool{"foreign host allowed": true, "stale extra record": true}
 	cases := map[string]func(t *testing.T, f *diffFixture){
 		"foreign host allowed": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			host, err := f.client.MockClient.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:intruder")
 			require.NoError(t, err)
 			_, err = f.client.MockClient.NVMeoFHostSubsysCreate(ctx, host.ID, f.subsystemOf(t, "diff-1").ID)
 			require.NoError(t, err)
 		},
 		"attached node not allowed": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			associations, err := f.client.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, f.subsystemOf(t, "diff-1").ID)
 			require.NoError(t, err)
 			require.NoError(t, f.client.MockClient.NVMeoFHostSubsysDelete(ctx, associations[0].ID))
 		},
 		"subsystem open to any host": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			_, err := f.client.MockClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, f.subsystemOf(t, "diff-1").ID, true)
 			require.NoError(t, err)
 		},
 		"port link missing": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			links, err := f.client.MockClient.NVMeoFPortSubsysListBySubsystem(ctx, f.subsystemOf(t, "diff-1").ID)
 			require.NoError(t, err)
 			require.NoError(t, f.client.MockClient.NVMeoFPortSubsysDelete(ctx, links[0].ID))
 		},
 		"record missing": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			ds, err := f.client.MockClient.DatasetGet(ctx, "pool/parent/diff-1")
 			require.NoError(t, err)
 			require.NoError(t, f.d.publications().remove(ctx, ds.Name, ds, []string{publicationPropertyKey("k8s-1")}))
 		},
 		"stale extra record": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			ds, err := f.client.MockClient.DatasetGet(ctx, "pool/parent/diff-1")
 			require.NoError(t, err)
 			extra, err := newPublicationRecord(diffNodeIdentity("k8s-3"), 1, false)
@@ -224,9 +230,11 @@ func TestStartupDiffSendsDivergentVolumesToThePerVolumePath(t *testing.T) {
 			require.NoError(t, f.d.publications().store(ctx, ds.Name, ds, publicationPropertyKey("k8s-3"), extra))
 		},
 		"stored namespace ID stale": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			require.NoError(t, f.client.MockClient.DatasetSetUserProperty(ctx, "pool/parent/diff-1", PropNVMeoFNamespaceID, "999999"))
 		},
 		"record under the stale-record sweep": func(t *testing.T, f *diffFixture) {
+			t.Helper()
 			f.d.stalePublicationRecordsSeen.Store(stalePublicationObservationKey("pool/parent/diff-1", publicationPropertyKey("k8s-1")), struct{}{})
 		},
 	}
@@ -312,7 +320,7 @@ func TestStartupDiffResolvesUnexpandedHostAssociations(t *testing.T) {
 	require.NoError(t, err)
 	_, err = f.client.MockClient.NVMeoFHostSubsysCreate(ctx, host.ID, f.subsystemOf(t, "diff-0").ID)
 	require.NoError(t, err)
-	f.client.MockClient.EmptyNVMeHostNQN = true
+	f.client.EmptyNVMeHostNQN = true
 	f.perVolume()
 	f.client.resetCalls()
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"sort"
 	"strings"
@@ -1076,18 +1077,8 @@ func cloneDatasets(datasets []*truenas.Dataset) []*truenas.Dataset {
 			continue
 		}
 		clone := *dataset
-		if dataset.UserProperties != nil {
-			clone.UserProperties = make(map[string]truenas.UserProperty, len(dataset.UserProperties))
-			for key, value := range dataset.UserProperties {
-				clone.UserProperties[key] = value
-			}
-		}
-		if dataset.LegacyCSIProperties != nil {
-			clone.LegacyCSIProperties = make(map[string]truenas.UserProperty, len(dataset.LegacyCSIProperties))
-			for key, value := range dataset.LegacyCSIProperties {
-				clone.LegacyCSIProperties[key] = value
-			}
-		}
+		clone.UserProperties = maps.Clone(dataset.UserProperties)
+		clone.LegacyCSIProperties = maps.Clone(dataset.LegacyCSIProperties)
 		out[i] = &clone
 	}
 	return out

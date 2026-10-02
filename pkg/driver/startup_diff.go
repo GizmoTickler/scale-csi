@@ -181,12 +181,13 @@ func (d *Driver) readStartupDiffFleet(ctx context.Context, candidates []string) 
 		portSubsystems []*truenas.NVMeoFPortSubsys
 		hostSubsystems []*truenas.NVMeoFHostSubsys
 	)
-	reads := []func() error{
+	reads := make([]func() error, 0, 4+len(parts))
+	reads = append(reads,
 		func() (err error) { namespaces, err = d.truenasClient.NVMeoFNamespaceList(ctx); return err },
 		func() (err error) { portSubsystems, err = d.truenasClient.NVMeoFPortSubsysList(ctx); return err },
 		func() (err error) { subsystems, err = d.truenasClient.NVMeoFSubsystemList(ctx); return err },
 		func() (err error) { hostSubsystems, err = d.truenasClient.NVMeoFHostSubsysList(ctx); return err },
-	}
+	)
 	for i := range parts {
 		reads = append(reads, func() (err error) {
 			datasetParts[i], err = d.datasetGetByNamesWithin(ctx, parts[i])

@@ -33,7 +33,7 @@ func (c *gatedListingClient) DatasetQueryByParent(ctx context.Context, parent st
 	return c.MockClient.DatasetQueryByParent(ctx, parent)
 }
 
-// DatasetList honours a cancelled context, as the real client does.
+// DatasetList honors a canceled context, as the real client does.
 func (c *gatedListingClient) DatasetList(ctx context.Context, parent string, limit, offset int) ([]*truenas.Dataset, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -104,7 +104,7 @@ func TestConcurrentManagedListingsShareOneRead(t *testing.T) {
 	}
 }
 
-// A caller whose listing was cancelled under it runs its own.
+// A caller whose listing was canceled under it runs its own.
 func TestManagedListingJoinerOutlivesACancelledLeader(t *testing.T) {
 	d, client := newGatedListingDriver(t)
 	leaderCtx, cancel := context.WithCancel(context.Background())
