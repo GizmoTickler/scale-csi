@@ -379,6 +379,28 @@ func (d *Driver) revokeStalePublicationRecord(
 	detected publicationRecord,
 	recordCount int,
 ) (bool, error) {
+	revoked, err := d.revokeStalePublicationRecordLocked(ctx, datasetName, volumeID, propertyKey, detected, recordCount)
+	if revoked {
+		// (C11 fix) This revoke may be exactly what a quarantined startup fencing
+		// volume (quarantineStaleStartupFencingVolume) was waiting on: that
+		// carve-out exists BECAUSE this same stale record made the volume's own
+		// publication fail validatePublicationCompatibility. Revoking it removes
+		// that block, but nothing else re-evaluates the volume: the startup
+		// reconcile goroutine (if still running) is idling on its signal, not
+		// polling. The signal names this volume, and only this volume is re-run.
+		// It is sent after the volume lock is released, so the re-run never
+		// finds the lock still held by this revoke.
+		d.requestStartupAttachmentReconcile(datasetName)
+	}
+	return revoked, err
+}
+
+func (d *Driver) revokeStalePublicationRecordLocked(
+	ctx context.Context,
+	datasetName, volumeID, propertyKey string,
+	detected publicationRecord,
+	recordCount int,
+) (bool, error) {
 	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return false, fmt.Errorf("volume operation is in progress")
@@ -418,18 +440,5 @@ func (d *Driver) revokeStalePublicationRecord(
 	if err := d.unpublishFencedVolume(ctx, dataset, datasetName, shareType, nodeID, nil); err != nil {
 		return false, fmt.Errorf("revoke backend grant and publication record: %w", err)
 	}
-	// (C11 fix) This revoke may be exactly what a quarantined startup fencing
-	// volume (quarantineStaleStartupFencingVolume) was waiting on: that carve-out
-	// exists BECAUSE this same stale record made the volume's own publication
-	// fail validatePublicationCompatibility. Revoking it removes that block, but
-	// nothing else re-evaluates the volume — the startup reconcile goroutine (if
-	// still running; reconcileStalePublicationRecords only calls this when
-	// fencing is enabled, same gate that goroutine runs under) is idling on
-	// startupAttachmentReconcileSignal, not polling. Signal it unconditionally:
-	// the write is dropped harmlessly if that goroutine already exited (fully
-	// converged, nothing quarantined) and merely schedules one extra, cheap pass
-	// if this particular revoke did not concern a quarantined volume. The
-	// signal names this volume, and only this volume is re-run.
-	d.requestStartupAttachmentReconcile(datasetName)
 	return true, nil
 }

@@ -24,6 +24,56 @@ var (
 	startupReconcileMaxBackoff     = time.Minute
 )
 
+// startupQuarantineRecheckInterval is how often a loop with quarantined
+// volumes re-runs them without a signal. A quarantine is normally released by
+// the stale-record revoke's signal, but the record can also go another way
+// (an operator, or a revoke that found it already gone) and nothing would
+// ever re-run the volume. A var so tests can shorten it.
+var startupQuarantineRecheckInterval = 2 * time.Minute
+
+// errStartupVolumeBusy is a volume a pass skipped because a live CSI operation
+// held its lock. That operation converges the volume itself.
+var errStartupVolumeBusy = errors.New("live CSI operation is in progress")
+
+// startupErrOnlyBusy is whether every error in a pass's (joined, wrapped)
+// error is errStartupVolumeBusy.
+func startupErrOnlyBusy(err error) bool {
+	for err != nil {
+		if err == errStartupVolumeBusy { //nolint:errorlint // the leaf itself, not a wrapper of it
+			return true
+		}
+		switch e := err.(type) { //nolint:errorlint // walks the tree errors.Is would, but needs every leaf
+		case interface{ Unwrap() []error }:
+			errs := e.Unwrap()
+			if len(errs) == 0 {
+				return false
+			}
+			for _, leaf := range errs {
+				if !startupErrOnlyBusy(leaf) {
+					return false
+				}
+			}
+			return true
+		case interface{ Unwrap() error }:
+			err = e.Unwrap()
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// startupQuarantinedDatasets is the datasets of every quarantined volume.
+func (d *Driver) startupQuarantinedDatasets() []string {
+	d.startupReconcileTargetsMu.Lock()
+	defer d.startupReconcileTargetsMu.Unlock()
+	datasets := make([]string, 0, len(d.startupQuarantined))
+	for _, datasetName := range d.startupQuarantined {
+		datasets = append(datasets, datasetName)
+	}
+	return datasets
+}
+
 type startupPublication struct {
 	identity NodeIdentity
 	nodeID   string // the node's id as its CSINode advertises it; "" if it advertises none
@@ -376,7 +426,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	}
 	lockKey := volumeLockKey(volume.volumeID)
 	if !d.acquireOperationLock(lockKey) {
-		return fmt.Errorf("startup reconcile volume %s: live CSI operation is in progress", volume.volumeID)
+		return fmt.Errorf("startup reconcile volume %s: %w", volume.volumeID, errStartupVolumeBusy)
 	}
 	defer d.releaseOperationLock(lockKey)
 
@@ -828,6 +878,12 @@ func (d *Driver) startStartupAttachmentReconcile() {
 	d.startupReconcileStateMu.Unlock()
 	go func() {
 		defer d.startupReconcileWg.Done()
+		defer func() {
+			d.startupReconcileTargetsMu.Lock()
+			d.startupReconcileExited = true
+			d.startupReconcilePending = nil
+			d.startupReconcileTargetsMu.Unlock()
+		}()
 		backoff := startupReconcileInitialBackoff
 		waitForSignal := false
 		// full is true until a full pass has converged; after that, each
@@ -844,11 +900,26 @@ func (d *Driver) startStartupAttachmentReconcile() {
 				// (revokeStalePublicationRecord) signals this channel, allowing
 				// retry without a permanent cluster-wide polling and backend-write
 				// loop.
+				// While a volume is quarantined, it is also re-run on a timer:
+				// the stale record blocking it may go without a signal.
+				var recheck <-chan time.Time
+				var recheckTimer *time.Timer
+				if d.startupQuarantineCount() > 0 {
+					recheckTimer = time.NewTimer(startupQuarantineRecheckInterval)
+					recheck = recheckTimer.C
+				}
 				select {
 				case <-signal:
 					backoff = startupReconcileInitialBackoff
 					waitForSignal = false
+				case <-recheck:
+					waitForSignal = false
 				case <-ctx.Done():
+				}
+				if recheckTimer != nil {
+					recheckTimer.Stop()
+				}
+				if ctx.Err() != nil {
 					return
 				}
 			}
@@ -858,6 +929,11 @@ func (d *Driver) startStartupAttachmentReconcile() {
 					targets = make(map[string]struct{}, len(pending))
 				}
 				for datasetName := range pending {
+					targets[datasetName] = struct{}{}
+				}
+				// Every targeted pass also re-runs the quarantined volumes
+				// (rare and few), so none waits on a signal naming it alone.
+				for _, datasetName := range d.startupQuarantinedDatasets() {
 					targets[datasetName] = struct{}{}
 				}
 				if len(targets) == 0 {
@@ -904,7 +980,10 @@ func (d *Driver) startStartupAttachmentReconcile() {
 			if ctx.Err() != nil {
 				return
 			}
-			if d.config.Fencing.Mode == FencingModeStrict {
+			// A targeted pass that only met busy volumes keeps readiness: the
+			// live operations holding them converge those volumes themselves,
+			// and dropping readiness would gate every CSI call in the cluster.
+			if d.config.Fencing.Mode == FencingModeStrict && (full || !startupErrOnlyBusy(err)) {
 				d.ready.Store(false)
 			}
 			klog.Warningf("Background startup fencing reconciliation incomplete; retrying in %v: %v", backoff, err)
@@ -940,6 +1019,10 @@ func (d *Driver) startupAttachmentReconcileSignal() <-chan struct{} {
 // is dropped harmlessly if the loop has already exited.
 func (d *Driver) requestStartupAttachmentReconcile(datasetName string) {
 	d.startupReconcileTargetsMu.Lock()
+	if d.startupReconcileExited {
+		d.startupReconcileTargetsMu.Unlock()
+		return
+	}
 	if d.startupReconcilePending == nil {
 		d.startupReconcilePending = make(map[string]struct{})
 	}

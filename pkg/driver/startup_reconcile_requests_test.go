@@ -289,7 +289,7 @@ func TestStartupRevokeSignalReRunsOnlyItsVolume(t *testing.T) {
 	require.Eventually(t, func() bool { return converged("q1") }, 3*time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool { return d.startupQuarantineCount() == 1 }, 3*time.Second, 10*time.Millisecond)
 	assert.Equal(t, 1, gets.get("va-settled"), "a converged volume is not re-run by another volume's signal")
-	assert.Equal(t, 1, gets.get("va-q2"), "a quarantined volume is not re-run by another volume's signal")
+	assert.Equal(t, 2, gets.get("va-q2"), "a targeted pass also re-runs the quarantined volumes")
 	assert.Equal(t, float64(1), testutil.ToFloat64(startupFencingUnconvergedVolumes.WithLabelValues("q2")),
 		"q2 is still quarantined")
 	assert.False(t, converged("q2"))
