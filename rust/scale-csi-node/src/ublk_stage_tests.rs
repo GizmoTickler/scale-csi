@@ -489,20 +489,10 @@ async fn a_staged_filesystem_requested_as_block_is_already_exists() {
 
 #[tokio::test]
 async fn other_paths_are_refused_before_anything_changes() {
-    for (name, extra) in [
-        (
-            "iscsi",
-            vec![("node_attach_driver", "iscsi"), ("iqn", "iqn.2005-10.org.example:x")],
-        ),
-        (
-            "nfs",
-            vec![
-                ("node_attach_driver", "nfs"),
-                ("server", "192.0.2.1"),
-                ("share", "/mnt/x"),
-            ],
-        ),
-    ] {
+    for (name, extra) in [(
+        "iscsi",
+        vec![("node_attach_driver", "iscsi"), ("iqn", "iqn.2005-10.org.example:x")],
+    )] {
         let n = ublk_node();
         n.daemon.state.lock().unwrap().forbidden = true;
         let err = node_stage(

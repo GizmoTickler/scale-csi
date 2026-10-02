@@ -11,7 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Instant;
 
-use log::{debug, info, warn};
+use log::{debug, info};
 use tonic::Status;
 
 use crate::capability::{self, AccessType, ShareType, Signature, mount_sources_equal, normalize_mount_source};
@@ -21,7 +21,7 @@ use crate::events::node_volume_ref;
 use crate::locks::{go_clean, node_target_key, node_volume_key};
 use crate::records::MountRecord;
 use crate::service::State;
-use crate::stage::remove_all;
+use crate::stage::{cleanup_mount_point, unmount_fully};
 use crate::ublk_client::is_ublk_device;
 use crate::ublk_stage;
 
@@ -61,7 +61,7 @@ fn likely_csi_publication_target(target: &str) -> bool {
 
 /// The source a publication must show: the staged device (raw block), the
 /// staging mount's source (filesystem). Without a staging path only a legacy
-/// NFS direct mount publishes, which this agent does not serve.
+/// NFS direct mount publishes: its `server:share`.
 async fn expected_source(
     state: &State,
     req: &csi::NodePublishVolumeRequest,
@@ -93,9 +93,7 @@ async fn expected_source(
         return Ok(normalize_mount_source(&info.source));
     }
     match capability::attach_driver(&req.volume_context, &state.driver_name) {
-        ShareType::Nfs => Err(Status::failed_precondition(
-            "an NFS volume published without a staging path, which the Rust node agent does not serve yet",
-        )),
+        ShareType::Nfs => capability::stage_source_identity(ShareType::Nfs, &req.volume_context),
         _ => Err(Status::failed_precondition("staging path required for block volumes")),
     }
 }
@@ -279,11 +277,14 @@ async fn validate_raw_block_ownership(
             ublk_stage::validate_raw_block_ownership(state, volume_id, device, deadline).await
         }
         ShareType::Nvmeof => crate::nvme_kernel::validate_raw_block_ownership(state, volume_id, device),
+        ShareType::Iscsi if state.config.iscsi_enabled => {
+            crate::iscsi_stage::validate_raw_block_ownership(state, volume_id, device).await
+        }
+        ShareType::Iscsi => Err(Status::failed_precondition(format!(
+            "raw block device {device} is an iSCSI device on an install without iSCSI, which the Rust node agent does not serve"
+        ))),
         // NFS never publishes a raw block volume.
         ShareType::Nfs => Ok(()),
-        _ => Err(Status::failed_precondition(format!(
-            "raw block device {device} is a kernel device, which the Rust node agent does not serve yet"
-        ))),
     }
 }
 
@@ -385,6 +386,18 @@ pub async fn node_publish(
             .bind_mount(&device, target, &options, deadline)
             .await
             .map_err(|e| mount_failed(Status::internal(format!("failed to bind mount block device: {e:#}"))))?;
+    } else if staging.is_empty() {
+        // A legacy direct mount (no staging): only NFS gets here, mounted
+        // straight at the target with "ro" and the request's flags as its
+        // mount options (Go NodePublishVolume's direct branch).
+        let mut options: Vec<String> = if req.readonly { vec!["ro".into()] } else { Vec::new() };
+        let mut direct = volume_capability.clone();
+        if let Some(csi::volume_capability::AccessType::Mount(m)) = &mut direct.access_type {
+            options.extend(m.mount_flags.iter().cloned());
+            m.mount_flags = options;
+        }
+        let context = crate::stage::with_publish_hint(&req.volume_context, &req.publish_context, "addresses");
+        crate::nfs::stage(state, &context, target, Some(&direct), event.as_ref(), deadline).await?;
     } else {
         // The request's flags as given (not de-duplicated), after "ro".
         let mut options: Vec<String> = if req.readonly { vec!["ro".into()] } else { Vec::new() };
@@ -429,26 +442,8 @@ pub async fn node_unpublish(
         .try_lock(node_target_key(target))
         .ok_or_else(|| Status::aborted("target path operation already in progress"))?;
 
-    if let Err(unmount) = state.mounter.unmount(target, deadline).await {
-        warn!("Failed to unmount target path: {unmount:#}");
-        match state.mounter.is_mounted(target, deadline).await {
-            Err(check) => {
-                warn!("Failed to check mount status after unmount failure: {check:#}");
-                return Err(Status::internal(format!(
-                    "failed to unmount target path and cannot verify mount status: {unmount:#}"
-                )));
-            }
-            Ok(true) => {
-                return Err(Status::internal(format!(
-                    "failed to unmount target path (still mounted): {unmount:#}"
-                )));
-            }
-            Ok(false) => info!("Target path {target} is not mounted, proceeding with cleanup"),
-        }
-    }
-    if let Err(e) = remove_all(target) {
-        warn!("Failed to remove target path: {e}");
-    }
+    unmount_fully(state, target, "target path", deadline).await?;
+    cleanup_mount_point(target, "target path")?;
     state.records.delete_publication(target);
     debug!("Volume {volume_id} unpublished successfully");
     Ok(())

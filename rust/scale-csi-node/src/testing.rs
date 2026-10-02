@@ -26,11 +26,27 @@ pub struct HostState {
     pub mountinfo: Option<PathBuf>,
     /// Commands (by prefix of "program args") that fail with exit 32.
     pub failing: Vec<String>,
+    /// Targets with a second mount stacked underneath: one `umount` lifts the
+    /// top one and the target stays mounted.
+    pub stacked: Vec<String>,
     /// A fake kernel NVMe initiator, when set.
     pub kernel: Option<FakeKernel>,
+    /// A fake iSCSI initiator, when set.
+    pub iscsi: Option<crate::iscsi_testing::FakeIscsi>,
     /// device -> filesystem
     pub filesystems: HashMap<String, String>,
+    /// The NFS version an NFS mount negotiates (shown as `vers=`); 4.2 when
+    /// unset. A version 3 mount shows as `nfs`, any other as `nfs4`.
+    pub nfs_version: Option<String>,
+    /// The RPC's deadline is spent once a command with this prefix has run:
+    /// any later command bounded by the deadline is refused, as the real
+    /// runner refuses one whose deadline has passed.
+    pub deadline_spent_after: Option<String>,
+    deadline_spent: bool,
     pub calls: Vec<String>,
+    /// Paths looked at directly through `Host::lstat` and `Host::read_link`:
+    /// "lstat <path>", "readlink <path>".
+    pub path_probes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -65,11 +81,19 @@ impl HostState {
     }
 }
 
+/// The fake device number of a device name.
+pub fn fake_device_number(name: &str) -> u64 {
+    name.bytes()
+        .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
+}
+
 impl FakeHost {
     /// A fake device number: a bind target reports its device's; a device
-    /// path reports one derived from its name.
+    /// path (symlinks resolved, as stat(2) does) reports one derived from its
+    /// name, or a stale one while the fake iSCSI initiator still models the
+    /// previous disk's node under that name.
     pub fn device_number(&self, path: &str) -> Option<u64> {
-        let host = self.0.lock().unwrap();
+        let mut host = self.0.lock().unwrap();
         let device = match host.mounts.get(path) {
             // As a hung server would: the agent must never stat one.
             Some((_, fs, _)) if fs.starts_with("nfs") => panic!("stat of the network mount {path}"),
@@ -78,14 +102,21 @@ impl FakeHost {
                 .and_then(|s| s.strip_suffix(']'))
                 .unwrap_or(source)
                 .to_string(),
-            _ => path.to_string(),
+            _ => std::fs::canonicalize(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned()),
         };
         let name = std::path::Path::new(&device).file_name()?.to_str()?;
-        let is_device = name.starts_with("ublkb") || name.starts_with("nvme") || name.starts_with("sd");
-        is_device.then(|| {
-            name.bytes()
-                .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
-        })
+        let is_device =
+            name.starts_with("ublkb") || name.starts_with("nvme") || name.starts_with("sd") || name.starts_with("dm-");
+        if !is_device {
+            return None;
+        }
+        if let Some(stale) = host.iscsi.as_mut().and_then(|f| f.stale.get_mut(name))
+            && *stale > 0
+        {
+            *stale -= 1;
+            return Some(fake_device_number(name) ^ 0xff);
+        }
+        Some(fake_device_number(name))
     }
 
     pub fn mount(&self, target: &str, source: &str, fs: &str) {
@@ -103,6 +134,18 @@ impl FakeHost {
         self.0.lock().unwrap().calls.clone()
     }
 
+    /// The path probes (`Host::lstat`, `Host::read_link`) that named `path`.
+    pub fn probes_of(&self, path: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .path_probes
+            .iter()
+            .filter(|p| p.split_once(' ').is_some_and(|(_, probed)| probed == path))
+            .cloned()
+            .collect()
+    }
+
     pub fn is_mounted(&self, target: &str) -> bool {
         self.0.lock().unwrap().mounts.contains_key(target)
     }
@@ -110,10 +153,23 @@ impl FakeHost {
 
 #[tonic::async_trait]
 impl Runner for FakeHost {
-    async fn run(&self, program: &str, args: &[&str], _: Limits) -> std::io::Result<Output> {
+    async fn run(&self, program: &str, args: &[&str], limits: Limits) -> std::io::Result<Output> {
         let mut host = self.0.lock().unwrap();
         let call = format!("{program} {}", args.join(" "));
         host.calls.push(call.clone());
+        if host.deadline_spent && limits.rpc_deadline.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("deadline passed before running {program}"),
+            ));
+        }
+        if host
+            .deadline_spent_after
+            .as_ref()
+            .is_some_and(|prefix| call.starts_with(prefix.as_str()))
+        {
+            host.deadline_spent = true;
+        }
         if host.failing.iter().any(|prefix| call.starts_with(prefix.as_str())) {
             return Ok(Output {
                 code: Some(32),
@@ -197,6 +253,17 @@ impl Runner for FakeHost {
                     Some((src, fs, _)) if bound => (src.clone(), fs.clone(), "rw".to_string()),
                     // As findmnt shows it: devtmpfs with the node's path as root.
                     _ if bound => (format!("udev[{source}]"), "devtmpfs".to_string(), "rw".to_string()),
+                    // As the kernel shows an NFS mount: its negotiated version.
+                    _ if fs == "nfs" => {
+                        let version = host.nfs_version.clone().unwrap_or_else(|| "4.2".into());
+                        let fs = if version.starts_with('3') { "nfs" } else { "nfs4" };
+                        let ro = args
+                            .iter()
+                            .position(|a| *a == "-o")
+                            .is_some_and(|i| args[i + 1].split(',').any(|o| o == "ro"));
+                        let mode = if ro { "ro" } else { "rw" };
+                        (source.to_string(), fs.to_string(), format!("{mode},vers={version}"))
+                    }
                     _ => (source.to_string(), fs, "rw".to_string()),
                 };
                 host.mounts.insert(target.into(), entry);
@@ -204,12 +271,18 @@ impl Runner for FakeHost {
                 output(0, "")
             }
             ("umount", [target]) => {
+                if let Some(i) = host.stacked.iter().position(|t| t == target) {
+                    host.stacked.remove(i);
+                    return Ok(output(0, ""));
+                }
                 host.mounts.remove(*target);
                 host.sync_mountinfo();
                 output(0, "")
             }
             ("resize2fs" | "xfs_growfs" | "btrfs", _) => output(0, ""),
             ("nvme", _) if host.kernel.is_some() => host.kernel.as_mut().unwrap().run(args),
+            ("iscsiadm", _) if host.iscsi.is_some() => host.iscsi.as_mut().unwrap().run(args),
+            ("multipathd", _) if host.iscsi.is_some() => host.iscsi.as_mut().unwrap().run_multipathd(args),
             _ => output(127, ""),
         })
     }
@@ -422,6 +495,21 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
         device_number: {
             let numbers = host.clone();
             Arc::new(move |path: &str| Ok(numbers.device_number(path)))
+        },
+        // The real calls, logged in HostState::path_probes.
+        lstat: {
+            let probes = host.clone();
+            Arc::new(move |path: &str| {
+                probes.0.lock().unwrap().path_probes.push(format!("lstat {path}"));
+                std::fs::symlink_metadata(path)
+            })
+        },
+        read_link: {
+            let probes = host.clone();
+            Arc::new(move |path: &str| {
+                probes.0.lock().unwrap().path_probes.push(format!("readlink {path}"));
+                std::fs::read_link(path)
+            })
         },
     };
     let nvme_runner: Arc<dyn Runner> = host.clone();

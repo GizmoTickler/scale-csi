@@ -36,11 +36,6 @@ async fn run() -> Result<()> {
         bail!("-config is required");
     }
     let config = config::load(&args.config)?;
-    if config.nfs_enabled || config.iscsi_enabled {
-        bail!(
-            "this install enables NFS or iSCSI, which the Rust node agent does not serve yet; run the Go node plugin"
-        );
-    }
     // The flag wins only when it is not the default; an empty config value takes it.
     let driver_name = if args.driver_name != config::DEFAULT_DRIVER_NAME || config.driver.is_empty() {
         args.driver_name.clone()
@@ -55,14 +50,26 @@ async fn run() -> Result<()> {
         hostname().context("-node-id is required for node mode")?
     };
 
-    let discovered = discovery::discover(&node_name, &discovery::Sources::host(config.command_timeouts.nvme())).await;
+    let identity_networks =
+        discovery::parse_identity_networks(&config.nfs.node_identity_networks).map_err(anyhow::Error::msg)?;
+    let discovered = discovery::discover(
+        &node_name,
+        &discovery::Sources::host(config.command_timeouts.nvme()),
+        &identity_networks,
+    )
+    .await;
     let protocols = Protocols {
         nfs: config.nfs_enabled,
         iscsi: config.iscsi_enabled,
         nvmeof: config.nvmeof.enabled,
     };
-    let node_id = node_id::encode(&node_id::for_enabled_protocols(discovered, protocols))
-        .context("encode this node's identity")?;
+    let identity = node_id::for_enabled_protocols(discovered, protocols);
+    let node_id = node_id::encode(&identity).context("encode this node's identity")?;
+    for ip in discovery::dropped_ips(&identity, &identity_networks, &node_id) {
+        warn!(
+            "nfs.nodeIdentityNetworks address {ip} does not fit in CSI's 256-byte node_id and is left out: the controller cannot grant it, so NFS mounts from it will be refused"
+        );
+    }
     info!(
         "scale-csi-node {} driver={driver_name} node={node_name} node_id={node_id}",
         env!("CARGO_PKG_VERSION")

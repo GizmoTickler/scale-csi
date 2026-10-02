@@ -28,8 +28,14 @@ name="$(basename "$0")"
 if [ -n "$FAKE_NODE_COMMAND_LOG" ]; then
 	printf '%s %s\n' "$name" "$*" >> "$FAKE_NODE_COMMAND_LOG"
 fi
+for arg in "$@"; do final="$arg"; done
 case "$name" in
 	findmnt)
+		# After a umount the mount point is gone, unless a test stacks a
+		# second mount underneath (FAKE_NODE_STACKED_MOUNT).
+		if [ "$1" = "--mountpoint" ] && [ -e "$2.fake-unmounted" ] && [ -z "$FAKE_NODE_STACKED_MOUNT" ]; then
+			exit 1
+		fi
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ] && [ -f "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			case " $* " in
 				*" SOURCE,FSTYPE,OPTIONS "*)
@@ -73,6 +79,7 @@ case "$name" in
 		exit 97
 		;;
 	mount)
+		rm -f "$final.fake-unmounted"
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			: > "$FAKE_NODE_MOUNT_STATE_FILE"
 			previous=""
@@ -103,6 +110,7 @@ case "$name" in
 		exit 0
 		;;
 	umount)
+		: > "$final.fake-unmounted" 2>/dev/null || true
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			rm -f "$FAKE_NODE_MOUNT_STATE_FILE"
 			rm -f "$FAKE_NODE_MOUNT_STATE_FILE.info"

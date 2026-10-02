@@ -89,6 +89,184 @@ appliance; strict fencing, NVMe-oF.
     and `midclt call zfs.resource.snapshot.query '{"paths":["<pool>"],"recursive":false,"properties":null}'`
     both succeed.
 
+## v1.18.0 — the Rust node agent serves iSCSI and NFS
+
+### The Rust node agent serves iSCSI
+
+`scale-csi-node`, the opt-in Rust node plugin, now serves iSCSI volumes as well
+as NVMe-oF. An iSCSI-only install (NVMe-oF off) may run the agent.
+
+- **Same commands, same host access.** The agent runs `iscsiadm` through the
+  image's wrapper (nsenter into the host), as the Go plugin does, with the same
+  arguments: a static node record (`-o new`), CHAP on the record, `--login`,
+  and a SendTargets discovery (cached and serialized per portal) only when the
+  target is not found. Logins per portal are limited by
+  `resilience.rateLimiting.maxConcurrentLogins`; `commandTimeouts.iscsi`,
+  `iscsi.deviceWaitTimeout`, `iscsi.nameSuffix` and
+  `node.sessionCleanupDelay` mean what they mean for the Go plugin.
+- **CHAP.** The volume's `chap` mode and the node-stage secret are validated as
+  the Go plugin validates them, before any login. The method and user names go
+  to `iscsiadm`; the passwords are written straight into the node record files
+  (0600) and never appear on any command line or in the log. A rejected secret
+  is `Unauthenticated` and is not retried; a record that cannot be written fails
+  the stage (`ISCSICHAPFailed`).
+- **Multipath.** With a `portals` hint of two or more IP portals and
+  dm-multipath on the node, the agent logs in through every portal, drops a
+  path that reaches another LUN, and stages the dm map of the LUN's WWID (or,
+  when no map appears within 5 s, the primary path alone). Without multipathd it
+  stays on the primary portal and says so (`ISCSIMultipathUnavailable`). A
+  replay tops up the paths of a staged map.
+- **Unstage and session GC.** Unstage logs out every session of the volume's
+  target, found through the mounted device or by the target name derived from
+  the volume ID (never through a raw-block link's device name, which can be
+  stale after a reboot); a session that will not log out fails the unstage so
+  kubelet retries. Session GC logs out a session only when it goes through the
+  configured portal, its target is one the driver names for a volume, and no
+  staged volume has used it for the grace period; an in-use disk whose identity
+  cannot be read skips the pass.
+- **Interchangeable with the Go plugin.** The staging layout (a link to the
+  disk or dm map for raw block, a mount for a filesystem) and the node records
+  are the same, and iSCSI keeps no other state on the node, so a volume staged
+  by one plugin is published, expanded and unstaged by the other.
+- **Events and metrics** keep the Go plugin's names: `ISCSILoginFailed`,
+  `ISCSIPathDegraded`, `ISCSIMultipathUnavailable`, `ISCSICHAPFailed`,
+  `MountFailed`; `scale_csi_iscsi_sessions_total`,
+  `scale_csi_iscsi_path_connect_total` and the `iscsi` transport of
+  `scale_csi_node_connect_total` and `scale_csi_gc_sessions_disconnected_total`.
+
+### Differences from the Go plugin
+
+- The agent stages, unstages and expands iSCSI volumes only where the
+  configuration enables iSCSI; on an install without it an iSCSI volume is
+  refused as before, and `iscsiadm` never runs.
+- A device wait also ends at the caller's deadline (the Go plugin waits out
+  its full device timeout).
+- After a reboot, a raw-block staging link that names another volume's disk
+  (SCSI disk names are handed out again in login order) or a disk with no iSCSI
+  session is re-staged, as the agent already did for ublk; the Go plugin
+  answers AlreadyExists until the link is removed by hand. The other disk and
+  its session are never touched, and a record naming another volume on the
+  path keeps the refusal.
+
+### Upgrade
+
+Nothing changes unless `node.implementation` or `node.rustNodes` is set. To
+try the agent on an iSCSI install, canary it with `node.rustNodes` first;
+removing the setting hands the nodes back to the Go plugin with no volume work.
+
+### NFS over a storage network with fencing on
+
+With `fencing.mode` `strict` (or `additive` on an export that already lists
+hosts), the controller grants an NFS export to the publishing node's identity
+IPs. Those were the node's `status.hostIP`, its Kubernetes address. A node that
+reaches the NAS over a separate storage network (its own subnet and interface,
+for example a NAS at 192.168.201.10 reached from the node's 192.168.201.x
+interface) presents its address on that network instead, which was not in the
+export's hosts, and the NAS refused the mount (NFSv4.1/4.2 returned `ENOENT`).
+
+- **The fix.** `nfs.nodeIdentityNetworks` lists the storage networks, as CIDRs
+  or single IPs (at most 16). At startup each node plugin, Go and Rust, adds its
+  interface addresses inside those networks to the IPs of its node ID, beside
+  its `status.hostIP`. The controller then grants them like any identity IP.
+  Link-local addresses are never used; IPv4 and IPv6 networks are both
+  accepted; an IPv4-mapped IPv6 network is refused (write the IPv4 form).
+- **Enable it.** Set `nfs.nodeIdentityNetworks: [192.168.201.0/24]` (every
+  fabric subnet the nodes mount from, including each `nfs.addresses` subnet with
+  trunking). If `nfs.shareAllowedNetworks` is set, it must cover these networks
+  too, or the controller still leaves the addresses out (it logs a warning at
+  start). List only storage subnets: a pod or CNI range would make node IDs
+  change with CNI addresses. On an IPv6 fabric with SLAAC privacy addresses,
+  list the node's stable address rather than the /64.
+- **Upgrade effect.** Unset, the default, nothing changes: every node ID is
+  byte-identical to the previous release's and the interfaces are not read. Setting it changes
+  the node ID of every node with an address in a listed network. kubelet
+  re-registers the plugin with the new ID when the node plugin restarts (the
+  chart rolls the DaemonSet on a ConfigMap change); the Kubernetes Node does not
+  restart. An export picks up a node's new address on that volume's next
+  publish to the node, so a volume that must move its mounts to the fabric
+  needs its pods rescheduled. The `server` of existing volumes is fixed at
+  creation: pointing `nfs.server` at the fabric address affects new volumes.
+  Rolling back to a release without the key: remove it first (the ConfigMap is
+  strict-parsed), and the node IDs return to their old value.
+- **The 256-byte limit.** The node ID still packs IPs in canonical order and
+  drops what does not fit. A storage-network address that is dropped is named in
+  a warning at node start; a typical node (name, NQN, IQN, one Kubernetes and a
+  couple of fabric addresses) fits with room to spare.
+
+### The Rust node agent serves NFS
+
+`scale-csi-node` now serves NFS volumes, with the Go node plugin's behaviour:
+
+- the same mount, `mount -t nfs -o nfsvers=4,<StorageClass mount options>`,
+  with `nconnect=` from `nfs.nconnect` and `max_connect=` for trunking replacing
+  theirs, at the same staging path, so a volume staged by either plugin is
+  taken over by the other;
+- NFSv4.1+ session trunking from the publish context's `addresses`, with the
+  same fallback without `max_connect`, the 4.1 check, the probe mounts and their
+  cleanup on unstage;
+- the legacy direct publish without a staging path;
+- the same errors, events (`NFSMountFailed`, `NFSTrunkingDegraded`,
+  `NFSTrunkingUnavailable`, `MountFailed`), metrics (`node_connect_total` with
+  `transport="nfs"`, `nfs_trunk_connect_total`), stats (bytes and inodes, after
+  a mount-table check that never touches a hung mount) and expansion (nothing to
+  do on the node);
+- an NFS unmount that fails falls back to a lazy unmount, as before.
+
+With iSCSI and NFS ported, the agent serves NVMe-oF, iSCSI and NFS in any
+combination; the chart refuses `node.implementation: rust` or
+`node.rustNodes` only when no protocol is enabled.
+
+Unstaging an NFS volume never stats its mount point on one of the agent's
+async workers: the share is found from findmnt, then from mountinfo, and any
+remaining call on the path runs on a blocking thread with the mount timeout.
+On a dead hard mount such a call blocks in the kernel, and each stuck volume
+used to hold one worker until the agent stopped answering for every protocol.
+
+### Fixed in both node plugins
+
+- **Unstage and unpublish never delete through a mount.** One `umount` lifts
+  only the top of a stack of mounts, and both plugins then removed the path
+  recursively, which on a share or filesystem still mounted underneath deletes
+  the volume's data (two plugins staging during a handover can stack mounts).
+  Both now check that nothing is mounted after the unmount (Internal
+  otherwise, so kubelet retries and the next unmount lifts the next mount) and
+  remove the mount point without recursing. That check runs on its own budget
+  (the mount timeout), so an unmount that succeeded but used up the RPC's
+  deadline no longer fails the call.
+- **A non-empty directory after the unmount fails the call.** Both plugins
+  follow Kubernetes mount-utils `CleanupMountPoint`: an absent path is fine, a
+  file (a raw-block publish target) is removed, an empty directory is removed,
+  and a directory that still has files in it once nothing is mounted fails
+  unstage or unpublish with Internal ("staging path X is not empty after
+  unmount; its contents (on the node's disk, not the volume) are left in place
+  and must be removed by hand"). Before, both plugins logged a warning and
+  reported success, and kubelet's own removal of the directory then failed
+  with ENOTEMPTY on every retry. Nothing is ever deleted recursively: remove the
+  files by hand and kubelet's next retry finishes.
+- **iSCSI multipath expansion.** A dm-multipath map grows only when multipathd
+  resizes it, and only to its smallest path. Expansion rescanned the session of
+  one path and waited for a size that never came, so the PVC stayed in
+  `FileSystemResizePending`. Both plugins now rescan every path's session, then
+  run `multipathd resize map <name>` through a new host wrapper
+  (`/usr/local/bin/multipathd`, as for `iscsiadm`; the node's multipath-tools
+  must provide `multipathd`). multipathd exiting non-zero, or answering
+  `fail`, fails the expansion with Internal. Only a dm-multipath map (dm UUID
+  `mpath-<wwid>`) is expanded this way; any other device-mapper device, such
+  as a kpartx partition or an LVM volume, takes the single-device rescan. A
+  dm device whose UUID cannot be read fails the expansion with Internal rather
+  than being guessed at; one with no UUID file is not a map.
+- **An iSCSI stage right after a handover no longer fails in blkid.** When one
+  plugin unstaged a volume and the other staged it at once (logout, then login
+  to the same target), the device wait found the new disk in sysfs and took
+  `/dev/<name>` as soon as it existed. That node could still be the previous
+  disk's, because devtmpfs and udev remove it a little later, so the stage
+  failed with `blkid: error: /dev/sdb: No such device or address`. Both plugins
+  now accept a device only when its `/dev` node is a block device whose number
+  matches the kernel's (`/sys/class/block/<name>/dev`) and keep polling until
+  then, within the existing device timeout. The same check applies to the
+  portal-scoped lookup, the IQN fallback and the dm-multipath map
+  (`/dev/mapper/<name>` or `/dev/dm-N` against the map's own number).
+
 ## v1.16.0 — publication records in Kubernetes
 
 A publication record says "this volume is published to this node, with this

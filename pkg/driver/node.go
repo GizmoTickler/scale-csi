@@ -47,6 +47,8 @@ var (
 	nodeUnmount                 = util.UnmountWithContext
 	nodeCheckISCSIMultipath     = util.CheckISCSIDeviceMultipathOwnership
 	nodeISCSIRescan             = util.ISCSIRescanSessionWithContext
+	nodeMultipathPaths          = util.MultipathPaths
+	nodeMultipathResize         = util.MultipathResizeMapWithContext
 	nodeNVMeRescan              = util.NVMeRescanWithContext
 	nodeDeviceSizePollTimeout   = 5 * time.Second
 	nodeDeviceSizePollInterval  = 200 * time.Millisecond
@@ -878,25 +880,13 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	} else {
 		// For filesystem mode, unmount and remove directory
-		if err := util.UnmountWithContext(ctx, stagingPath); err != nil {
-			klog.Warningf("Failed to unmount staging path: %v", err)
-			// Check if still mounted before attempting removal to prevent data corruption
-			mounted, checkErr := util.IsMountedWithContext(ctx, stagingPath)
-			if checkErr != nil {
-				klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-				// If we can't verify mount status, don't risk removing a mounted path
-				return nil, status.Errorf(codes.Internal, "failed to unmount staging path and cannot verify mount status: %v", err)
-			}
-			if mounted {
-				return nil, status.Errorf(codes.Internal, "failed to unmount staging path (still mounted): %v", err)
-			}
-			// Not mounted, safe to continue with cleanup
-			klog.Infof("Staging path %s is not mounted, proceeding with cleanup", stagingPath)
+		if err := unmountFully(ctx, stagingPath, "staging path"); err != nil {
+			return nil, err
 		}
 
-		// Clean up staging directory (only reached if unmount succeeded or path was not mounted)
-		if err := os.RemoveAll(stagingPath); err != nil {
-			klog.Warningf("Failed to remove staging directory: %v", err)
+		// Clean up the empty mount point (only reached once nothing is mounted there)
+		if err := cleanupMountPoint(stagingPath, "staging path"); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1305,23 +1295,13 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	defer d.releaseOperationLock(targetLockKey)
 
 	// Unmount target path
-	if err := util.UnmountWithContext(ctx, targetPath); err != nil {
-		klog.Warningf("Failed to unmount target path: %v", err)
-		// Check if still mounted before attempting removal
-		mounted, checkErr := util.IsMountedWithContext(ctx, targetPath)
-		if checkErr != nil {
-			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-			return nil, status.Errorf(codes.Internal, "failed to unmount target path and cannot verify mount status: %v", err)
-		}
-		if mounted {
-			return nil, status.Errorf(codes.Internal, "failed to unmount target path (still mounted): %v", err)
-		}
-		klog.Infof("Target path %s is not mounted, proceeding with cleanup", targetPath)
+	if err := unmountFully(ctx, targetPath, "target path"); err != nil {
+		return nil, err
 	}
 
-	// Remove target path (only reached if unmount succeeded or path was not mounted)
-	if err := os.RemoveAll(targetPath); err != nil {
-		klog.Warningf("Failed to remove target path: %v", err)
+	// Remove the empty mount point (only reached once nothing is mounted there)
+	if err := cleanupMountPoint(targetPath, "target path"); err != nil {
+		return nil, err
 	}
 	d.deletePublicationRecord(targetPath)
 
@@ -1504,12 +1484,8 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 		switch shareType {
 		case ShareTypeISCSI:
-			portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
-			if infoErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
-			}
-			if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+			if rescanErr := rescanISCSIDevice(ctx, devicePath); rescanErr != nil {
+				return nil, rescanErr
 			}
 		case ShareTypeNVMeoF:
 			if rescanErr := nodeNVMeRescan(ctx, devicePath); rescanErr != nil {
@@ -1590,6 +1566,52 @@ func (d *Driver) validateRawBlockDeviceOwnership(ctx context.Context, volumeID, 
 
 func sessionTargetMatchesExpected(actual, expected string) bool {
 	return actual == expected || strings.HasSuffix(actual, ":"+expected)
+}
+
+// rescanISCSIDevice rescans the session behind devicePath. A dm-multipath map
+// has one session per path: every path is rescanned, then multipathd resizes
+// the map, which never grows on its own nor while one path is still small.
+func rescanISCSIDevice(ctx context.Context, devicePath string) error {
+	mapName, paths, isMap, err := nodeMultipathPaths(devicePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to inspect %s: %v", devicePath, err)
+	}
+	if !isMap {
+		portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
+		if infoErr != nil {
+			return status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
+		}
+		if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
+			return status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+		}
+		return nil
+	}
+	type target struct{ portal, iqn string }
+	var targets []target
+	seen := map[target]bool{}
+	for _, path := range paths {
+		portal, iqn, infoErr := nodeGetISCSIInfo(path)
+		if infoErr != nil {
+			klog.Warningf("Multipath map %s: path %s has no iSCSI session to rescan: %v", mapName, path, infoErr)
+			continue
+		}
+		if t := (target{portal, iqn}); !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return status.Errorf(codes.Internal, "failed to identify an iSCSI session for multipath map %s (%s)", mapName, devicePath)
+	}
+	for _, t := range targets {
+		if rescanErr := nodeISCSIRescan(ctx, t.portal, t.iqn); rescanErr != nil {
+			return status.Errorf(codes.Internal, "failed to rescan iSCSI path %s of %s: %v", t.portal, devicePath, rescanErr)
+		}
+	}
+	if resizeErr := nodeMultipathResize(ctx, mapName); resizeErr != nil {
+		return status.Errorf(codes.Internal, "failed to resize multipath map %s: %v", mapName, resizeErr)
+	}
+	return nil
 }
 
 func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capacityBytes int64) (int64, error) {
@@ -3036,4 +3058,74 @@ func createSymlinkAtomic(target, linkPath string) error {
 	}
 
 	return nil
+}
+
+// unmountFully unmounts path and proves nothing is left mounted there before
+// it may be removed. One umount lifts only the top of a stack of mounts, and
+// what is underneath may be a live share or filesystem. what names the path in
+// errors ("staging path", "target path").
+func unmountFully(ctx context.Context, path, what string) error {
+	unmountErr := util.UnmountWithContext(ctx, path)
+	if unmountErr != nil {
+		klog.Warningf("Failed to unmount %s: %v", what, unmountErr)
+	}
+	// The check runs on its own short budget: a slow unmount that succeeded
+	// may have spent the RPC's deadline, and an unanswered check would fail
+	// the call although nothing is mounted any more.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), util.GetConfig().MountTimeout)
+	defer cancel()
+	mounted, checkErr := util.IsMountedWithContext(checkCtx, path)
+	switch {
+	case checkErr != nil && unmountErr != nil:
+		klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
+		return status.Errorf(codes.Internal, "failed to unmount %s and cannot verify mount status: %v", what, unmountErr)
+	case checkErr != nil:
+		return status.Errorf(codes.Internal, "cannot verify that %s %s is unmounted: %v", what, path, checkErr)
+	case mounted && unmountErr != nil:
+		return status.Errorf(codes.Internal, "failed to unmount %s (still mounted): %v", what, unmountErr)
+	case mounted:
+		return status.Errorf(codes.Internal, "%s %s is still mounted after unmount: another mount is stacked underneath; retrying unmounts it", what, path)
+	case unmountErr != nil:
+		klog.Infof("%s %s is not mounted, proceeding with cleanup", what, path)
+	}
+	return nil
+}
+
+// errMountPointNotEmpty is a directory that still holds files once nothing is
+// mounted on it.
+var errMountPointNotEmpty = errors.New("directory is not empty")
+
+// removeMountPoint removes an unmounted mount point without descending into
+// it (mount-utils CleanupMountPoint): absent is fine, a directory goes only
+// when empty, a file (a raw-block bind target) goes. A directory with files
+// in it is errMountPointNotEmpty. Never recursive: what is under a mount point
+// may be a volume's data.
+func removeMountPoint(path string) error {
+	err := os.Remove(path)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("%w: %w", errMountPointNotEmpty, err)
+	}
+	return err
+}
+
+// cleanupMountPoint removes an unmounted mount point. A directory that still
+// has files in it fails the call: reporting success would leave kubelet's own
+// teardown failing with ENOTEMPTY forever, and the files are not ours to
+// delete. what names the path ("staging path", "target path").
+func cleanupMountPoint(path, what string) error {
+	err := removeMountPoint(path)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errMountPointNotEmpty):
+		return status.Errorf(codes.Internal,
+			"%s %s is not empty after unmount; its contents (on the node's disk, not the volume) are left in place and must be removed by hand",
+			what, path)
+	default:
+		klog.Warningf("Failed to remove %s %s: %v", what, path, err)
+		return nil
+	}
 }

@@ -1,6 +1,7 @@
 //! Node session GC and NVMe-oF controller tunables (`pkg/driver/driver.go`
-//! startSessionGC, gcSessions, gcNVMeoFSessions, pruneSessionRegistry;
-//! `nvme_tunables.go`).
+//! startSessionGC, gcSessions, gcISCSISessions, gcNVMeoFSessions,
+//! pruneSessionRegistry; `nvme_tunables.go`). iSCSI's rules are in
+//! [`gc_iscsi`].
 //!
 //! A kernel NVMe-oF session is disconnected only when every one of these holds:
 //! it reaches one of this install's portals, this plugin recorded connecting it,
@@ -34,7 +35,7 @@ use crate::service::State;
 /// Orphaned sessions by NQN, with when each was first seen orphaned. In memory:
 /// a restart restarts every grace period.
 #[derive(Default)]
-pub struct Orphans(Mutex<HashMap<String, Instant>>);
+pub struct Orphans(pub(crate) Mutex<HashMap<String, Instant>>);
 
 /// The kubelet directory from a socket at `<kubelet>/plugins/<name>/csi.sock`.
 pub fn kubelet_dir_of(socket: &Path) -> Option<PathBuf> {
@@ -96,9 +97,9 @@ fn whole_disk(state: &State, device: &str) -> String {
     }
 }
 
-/// The NQNs of every staged NVMe-oF volume, or `None` when the set cannot be
-/// trusted (the scan failed, or an NVMe device's identity is unreadable).
-async fn expected_nqns(state: &State) -> Option<HashSet<String>> {
+/// Every in-use block device: mounted, or linked under kubelet's staging
+/// directory (Go getInUseBlockDevices); `None` when either scan failed.
+async fn in_use_devices(state: &State) -> Option<HashSet<String>> {
     let mut devices: HashSet<String> = match state.mounter.block_device_mounts(&state.host.dev_dir, None).await {
         Ok(mounts) => mounts.into_keys().collect(),
         Err(e) => {
@@ -113,6 +114,13 @@ async fn expected_nqns(state: &State) -> Option<HashSet<String>> {
             return None;
         }
     }
+    Some(devices)
+}
+
+/// The NQNs of every staged NVMe-oF volume, or `None` when the set cannot be
+/// trusted (the scan failed, or an NVMe device's identity is unreadable).
+async fn expected_nqns(state: &State) -> Option<HashSet<String>> {
+    let devices = in_use_devices(state).await?;
     let mut expected = HashSet::new();
     let mut failed = 0;
     for device in devices {
@@ -266,6 +274,101 @@ pub async fn gc_nvmeof(state: &State, stop: &watch::Receiver<bool>) {
             Err(e) => warn!("Session GC: list session registry: {e:#}"),
         }
     }
+}
+
+/// The configured portal's iSCSI sessions, listed (and counted in the gauge).
+async fn observe_iscsi(state: &State) -> Option<Vec<crate::iscsi::Session>> {
+    match state.iscsi.list_sessions(None).await {
+        Ok(sessions) => {
+            state.metrics.set_iscsi_sessions(sessions.len());
+            Some(sessions)
+        }
+        Err(e) => {
+            warn!("Session metrics: failed to list iSCSI sessions: {e:#}");
+            None
+        }
+    }
+}
+
+/// One iSCSI GC pass (Go gcISCSISessions): a session is logged out only when it
+/// goes through the configured portal, its target is one this driver names, no
+/// staged volume uses it, and that stayed so for the grace period. An in-use
+/// device that may be iSCSI and cannot be identified skips the pass.
+pub async fn gc_iscsi(state: &State, stop: &watch::Receiver<bool>) {
+    let gc = &state.config.session_gc;
+    let grace = gc.grace_period();
+    let portal = state.config.iscsi.target_portal.clone();
+    let Some(sessions) = observe_iscsi(state).await else {
+        return;
+    };
+    if sessions.is_empty() {
+        return;
+    }
+    let Some(devices) = in_use_devices(state).await else {
+        info!("Session GC: skipping iSCSI GC due to unreliable expected-session lookup");
+        return;
+    };
+    let mut devices: Vec<String> = devices.into_iter().collect();
+    devices.sort();
+    let Some(expected) = crate::iscsi_stage::expected_targets(state, &devices, &sessions) else {
+        info!("Session GC: skipping iSCSI GC due to unreliable expected-session lookup");
+        return;
+    };
+    let now = Instant::now();
+    let mut orphaned: HashSet<String> = HashSet::new();
+    for session in &sessions {
+        if *stop.borrow() {
+            debug!("Session GC: stopping iSCSI cleanup after cancellation");
+            return;
+        }
+        if !crate::iscsi_stage::gc_in_scope(state, session) {
+            continue;
+        }
+        let iqn = session.iqn.as_str();
+        if expected.contains(iqn) {
+            state.iscsi_orphans.0.lock().unwrap().remove(iqn);
+            continue;
+        }
+        orphaned.insert(iqn.to_string());
+        let first_seen = {
+            let mut seen = state.iscsi_orphans.0.lock().unwrap();
+            match seen.get(iqn) {
+                Some(first) => Some(*first),
+                None => {
+                    seen.insert(iqn.to_string(), now);
+                    None
+                }
+            }
+        };
+        let Some(first_seen) = first_seen else {
+            info!("Session GC: found newly orphaned iSCSI session: {iqn} (will disconnect after {grace:?})");
+            continue;
+        };
+        let orphaned_for = now.duration_since(first_seen);
+        if orphaned_for < grace {
+            debug!("Session GC: orphaned session {iqn} within grace period ({orphaned_for:?} < {grace:?})");
+            continue;
+        }
+        info!("Session GC: orphaned iSCSI session {iqn} exceeded grace period ({orphaned_for:?})");
+        if gc.dry_run {
+            info!("Session GC: [DRY RUN] would disconnect orphaned session: {iqn}");
+            continue;
+        }
+        match state.iscsi.logout(&portal, iqn).await {
+            Ok(()) => {
+                info!("Session GC: disconnected orphaned iSCSI session: {iqn}");
+                state.metrics.record_gc_disconnect("iscsi");
+                state.iscsi_orphans.0.lock().unwrap().remove(iqn);
+            }
+            Err(e) => warn!("Session GC: failed to disconnect orphaned session {iqn}: {e:#}"),
+        }
+    }
+    state
+        .iscsi_orphans
+        .0
+        .lock()
+        .unwrap()
+        .retain(|iqn, _| orphaned.contains(iqn));
 }
 
 /// Session gauges only: no cleanup.
@@ -427,9 +530,23 @@ pub async fn reconcile_tunables(state: &State) {
     }
 }
 
-/// One tick: NVMe-oF GC (or only its gauge), then the tunables.
+/// One tick: iSCSI GC, NVMe-oF GC (or only their gauges), then the tunables.
 pub async fn pass(state: &State, cleanup: bool, stop: &watch::Receiver<bool>) {
     let gc = &state.config.session_gc;
+    // iSCSI is listed only where it is enabled: an NVMe-oF-only node never
+    // runs iscsiadm.
+    if state.config.iscsi_enabled {
+        let iscsi =
+            cleanup && gc.enabled && gc.iscsi_enabled.unwrap_or(true) && !state.config.iscsi.target_portal.is_empty();
+        if iscsi {
+            gc_iscsi(state, stop).await;
+        } else {
+            observe_iscsi(state).await;
+        }
+    }
+    if *stop.borrow() {
+        return;
+    }
     let nvmeof =
         cleanup && gc.enabled && gc.nvmeof_enabled.unwrap_or(true) && !state.config.nvmeof.transport_address.is_empty();
     if nvmeof {

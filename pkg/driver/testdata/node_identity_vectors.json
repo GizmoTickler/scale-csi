@@ -448,5 +448,652 @@
       "node_id": "",
       "error": true
     }
+  ],
+  "identity_ips": [
+    {
+      "case": "default: NODE_IP only, interfaces never read",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ]
+      },
+      "interfaces_listed": false,
+      "ips": [
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "default: no NODE_IP falls back to every interface",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "10.244.1.7",
+        "192.168.201.21",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BAQK9AEHBATAqMkVBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "default: NODE_IPS list",
+      "input": {
+        "node_ip": "198.51.100.11",
+        "node_ips": "2001:db8::1, 198.51.100.12,bogus",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ]
+      },
+      "interfaces_listed": false,
+      "ips": [
+        "198.51.100.11",
+        "198.51.100.12",
+        "2001:db8::1"
+      ],
+      "node_id": "sc1.AQEFazhzLTEEBMYzZAsEBMYzZAwFECABDbgAAAAAAAAAAAAAAAE",
+      "dropped": []
+    },
+    {
+      "case": "a fabric network adds the fabric address",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/24"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "192.168.201.21",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATAqMkVBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "a network that matches nothing changes nothing",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.250.0/24"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "two fabrics and ipv6, link-local never",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "192.168.202.21",
+          "fd00:201::21",
+          "2001:db8::5",
+          "fe80::21",
+          "10.244.1.7"
+        ],
+        "networks": [
+          "192.168.201.0/24",
+          "192.168.202.0/24",
+          "fd00:201::/64",
+          "fe80::/10"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "192.168.201.21",
+        "192.168.202.21",
+        "198.51.100.11",
+        "fd00:201::21"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATAqMkVBATAqMoVBATGM2QLBRD9AAIBAAAAAAAAAAAAAAAh",
+      "dropped": []
+    },
+    {
+      "case": "link-local networks add nothing",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1",
+          "169.254.3.3"
+        ],
+        "networks": [
+          "169.254.0.0/16",
+          "fe80::/10"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "a bare ip matches only itself",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "192.168.201.21",
+          "192.168.201.22"
+        ],
+        "networks": [
+          "192.168.201.21"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "192.168.201.21",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATAqMkVBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "a mapped interface address is ipv4",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "::ffff:192.168.201.30"
+        ],
+        "networks": [
+          "192.168.201.0/24"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "192.168.201.30",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATAqMkeBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "an ipv6 network holds no ipv4",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "::/0"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "an ipv4 network holds no ipv6",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "192.168.202.21",
+          "fd00:201::21",
+          "2001:db8::5",
+          "fe80::21",
+          "10.244.1.7"
+        ],
+        "networks": [
+          "0.0.0.0/0"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "10.244.1.7",
+        "192.168.201.21",
+        "192.168.202.21",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BAQK9AEHBATAqMkVBATAqMoVBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "host bits and surrounding space are accepted",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          " 192.168.201.99/24 ",
+          "10.0.0.0/08"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "10.244.1.7",
+        "192.168.201.21",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BAQK9AEHBATAqMkVBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "no NODE_IP with a network: every interface once",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/24"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "10.244.1.7",
+        "192.168.201.21",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BAQK9AEHBATAqMkVBATGM2QL",
+      "dropped": []
+    },
+    {
+      "case": "the node ip inside the network is kept once",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "192.168.201.21",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/24"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "192.168.201.21"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATAqMkV",
+      "dropped": []
+    },
+    {
+      "case": "the 256-byte limit drops fabric addresses",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "iscsi_iqn": "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.101",
+          "192.168.201.102",
+          "192.168.201.103",
+          "192.168.201.104",
+          "192.168.201.105",
+          "192.168.201.106",
+          "192.168.201.107",
+          "192.168.201.108",
+          "192.168.201.109",
+          "192.168.201.110",
+          "192.168.201.111",
+          "192.168.201.112"
+        ],
+        "networks": [
+          "192.168.201.0/24"
+        ]
+      },
+      "interfaces_listed": true,
+      "ips": [
+        "192.168.201.101",
+        "192.168.201.102",
+        "192.168.201.103",
+        "192.168.201.104",
+        "192.168.201.105",
+        "192.168.201.106",
+        "192.168.201.107",
+        "192.168.201.108",
+        "192.168.201.109",
+        "192.168.201.110",
+        "192.168.201.111",
+        "192.168.201.112",
+        "198.51.100.11"
+      ],
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4AyZpcW4uMjAwNC0xMC5jb20udWJ1bnR1OjAxOjVmMWQzYTljMmI3ZQQEwKjJZQQEwKjJZgQEwKjJZwQEwKjJaAQEwKjJaQQEwKjJagQEwKjJawQEwKjJbAQEwKjJbQQEwKjJbgQEwKjJbw",
+      "dropped": [
+        "192.168.201.112"
+      ]
+    },
+    {
+      "case": "prefix too long",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/33"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "ipv6 prefix too long",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "fd00::/129"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "not a prefix",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/24x"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "a signed prefix",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/+24"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "an empty prefix",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.0/"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "a mapped ipv6 network",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "::ffff:192.168.201.0/120"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "a zone",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "fe80::1%eth0"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "a cidr with a zone",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "fe80::%eth0/64"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "a hostname",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "nas01.example"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "an empty entry",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          " "
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "leading zeros in an ipv4 address",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "192.168.201.021"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    },
+    {
+      "case": "too many networks",
+      "input": {
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "node_ip": "198.51.100.11",
+        "interfaces": [
+          "198.51.100.11",
+          "192.168.201.21",
+          "10.244.1.7",
+          "127.0.0.1",
+          "fe80::1"
+        ],
+        "networks": [
+          "10.0.0.0/16",
+          "10.1.0.0/16",
+          "10.2.0.0/16",
+          "10.3.0.0/16",
+          "10.4.0.0/16",
+          "10.5.0.0/16",
+          "10.6.0.0/16",
+          "10.7.0.0/16",
+          "10.8.0.0/16",
+          "10.9.0.0/16",
+          "10.10.0.0/16",
+          "10.11.0.0/16",
+          "10.12.0.0/16",
+          "10.13.0.0/16",
+          "10.14.0.0/16",
+          "10.15.0.0/16",
+          "10.16.0.0/16"
+        ]
+      },
+      "error": true,
+      "interfaces_listed": false,
+      "ips": [],
+      "dropped": []
+    }
   ]
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestISCSIConnectUsesStaticNodeRecordFastPath(t *testing.T) {
@@ -378,6 +379,9 @@ func TestFindDeviceForSessionUsesOwningHostOnly(t *testing.T) {
 	require.NoError(t, os.MkdirAll(devRoot, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "sdb"), nil, 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "sdz"), nil, 0o600))
+	writeSysfsDev(t, filepath.Join(sysClassRoot, "block", "sdb"), unix.Mkdev(8, 16))
+	writeSysfsDev(t, filepath.Join(sysClassRoot, "block", "sdz"), unix.Mkdev(65, 160))
+	fixedBlockDeviceNumbers(t, map[string]uint64{"sdb": unix.Mkdev(8, 16), "sdz": unix.Mkdev(65, 160)})
 
 	devicePath, err := findDeviceForSessionInPaths("session12", 0, sysClassRoot, devRoot)
 	require.NoError(t, err)
@@ -924,14 +928,17 @@ func TestFindISCSIDeviceForPortalSelectsExactSession(t *testing.T) {
 	sysClassRoot := filepath.Join(root, "sys", "class")
 	devRoot := filepath.Join(root, "dev")
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-multipath"
+	fixedBlockDeviceNumbers(t, map[string]uint64{"sda": unix.Mkdev(8, 0), "sdb": unix.Mkdev(8, 16)})
 	for _, fixture := range []struct {
 		sessionID string
 		host      string
 		device    string
+		number    uint64
 	}{
-		{sessionID: "11", host: "6", device: "sda"},
-		{sessionID: "12", host: "7", device: "sdb"},
+		{sessionID: "11", host: "6", device: "sda", number: unix.Mkdev(8, 0)},
+		{sessionID: "12", host: "7", device: "sdb", number: unix.Mkdev(8, 16)},
 	} {
+		writeSysfsDev(t, filepath.Join(sysClassRoot, "block", fixture.device), fixture.number)
 		require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "iscsi_host", "host"+fixture.host, "device", "session"+fixture.sessionID), 0o750))
 		require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "scsi_device", fixture.host+":0:0:0", "device", "block", fixture.device), 0o750))
 		require.NoError(t, os.MkdirAll(devRoot, 0o750))
@@ -986,6 +993,8 @@ func TestFindISCSIMultipathDeviceAndResolveSessionFromFakeSysfs(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(dmRoot, "slaves", "sda"), 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "dm", "uuid"), []byte("mpath-"+wwid+"\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "dm", "name"), []byte(wwid+"\n"), 0o600))
+	writeSysfsDev(t, dmRoot, unix.Mkdev(253, 2))
+	fixedBlockDeviceNumbers(t, map[string]uint64{"dm-2": unix.Mkdev(253, 2)})
 	require.NoError(t, os.MkdirAll(filepath.Join(devRoot, "mapper"), 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "dm-2"), nil, 0o600))
 	require.NoError(t, os.Symlink("../dm-2", filepath.Join(devRoot, "mapper", wwid)))
@@ -1049,8 +1058,11 @@ func TestT10SCSIWWIDNormalizationFlowsThroughDeviceAndMapLookups(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dmRoot, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "uuid"), []byte("mpath-"+normalizedWWID+"\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "name"), []byte("t10-map\n"), 0o600))
+	writeSysfsDev(t, filepath.Dir(dmRoot), unix.Mkdev(253, 5))
+	fixedBlockDeviceNumbers(t, map[string]uint64{"dm-5": unix.Mkdev(253, 5)})
 	require.NoError(t, os.MkdirAll(filepath.Join(devRoot, "mapper"), 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "mapper", "t10-map"), nil, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "dm-5"), nil, 0o600))
+	require.NoError(t, os.Symlink("../dm-5", filepath.Join(devRoot, "mapper", "t10-map")))
 	mapDevice, err := findISCSIMultipathDeviceInPaths(rawWWID, sysBlockRoot, devRoot)
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(devRoot, "mapper", "t10-map"), mapDevice)

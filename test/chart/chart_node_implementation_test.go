@@ -9,7 +9,7 @@ import (
 
 // node.implementation selects the node plugin binary in the one image. The
 // default render is unchanged; rust swaps the container command and is refused
-// where the Rust agent does not serve the install's protocols yet.
+// where the install enables no protocol the Rust agent serves.
 
 var rustNodeArgs = []string{
 	"--set", "nfs.enabled=false", "--set", "iscsi.enabled=false",
@@ -56,6 +56,28 @@ func TestChartNodeImplementationRustRunsTheAgent(t *testing.T) {
 	}
 }
 
+// NFS is served, alone or beside NVMe-oF, for every node or as a canary.
+func TestChartNodeImplementationRustServesNFS(t *testing.T) {
+	nfsOnly := []string{"--set", "nfs.enabled=true", "--set", "iscsi.enabled=false", "--set", "nvmeof.enabled=false"}
+	for name, args := range map[string][]string{
+		"nfs only":           withArgs(nfsOnly, "--set", "node.implementation=rust"),
+		"nfs and nvmeof":     withArgs(rustNodeArgs, "--set", "nfs.enabled=true", "--set", "node.implementation=rust"),
+		"nfs only, a canary": withArgs(nfsOnly, "--set", "node.rustNodes={k8s-2}"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rendered := helmTemplate(t, args...)
+			for setName, set := range nodeDaemonSets(t, rendered) {
+				if strings.HasSuffix(setName, "-node-rust") || !strings.Contains(name, "canary") {
+					container, _ := namedEntry(t, podSpecOf(t, set, setName)["containers"], "scale-csi")
+					if got, want := container["command"], []any{"/usr/local/bin/scale-csi-node"}; !reflect.DeepEqual(got, want) {
+						t.Errorf("%s: command = %v, want %v", setName, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
 // The kernel initiator as the default data path is served.
 func TestChartNodeImplementationRustServesTheKernelPath(t *testing.T) {
 	helmTemplate(t, withArgs(rustNodeArgs, "--set", "nvmeof.dataPath=kernel", "--set", "node.implementation=rust")...)
@@ -67,9 +89,7 @@ func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 		args   []string
 		reason string
 	}{
-		{"NFS on", withArgs(rustNodeArgs, "--set", "nfs.enabled=true"), "serves NVMe-oF only"},
-		{"iSCSI on", withArgs(rustNodeArgs, "--set", "iscsi.enabled=true"), "serves NVMe-oF only"},
-		{"NVMe-oF off", withArgs(rustNodeArgs, "--set", "nvmeof.enabled=false"), "nvmeof.enabled=true"},
+		{"every protocol off", withArgs(rustNodeArgs, "--set", "nvmeof.enabled=false"), "needs a protocol"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,6 +102,40 @@ func TestChartNodeImplementationRustRefusesWhatItDoesNotServe(t *testing.T) {
 	if out := helmTemplateExpectError(t, "--set", "node.implementation=python"); !strings.Contains(out, "implementation") {
 		t.Errorf("the schema must refuse an unknown implementation:\n%s", out)
 	}
+}
+
+// iSCSI is served: with NVMe-oF, alone, and on canary nodes. Only NFS is
+// still refused.
+func TestChartNodeImplementationRustServesISCSI(t *testing.T) {
+	for name, args := range map[string][]string{
+		"with NVMe-oF": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.implementation=rust"),
+		"alone": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nvmeof.enabled=false",
+			"--set", "node.implementation=rust"),
+		"on canary nodes": withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "node.rustNodes={k8s-2}"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rendered := helmTemplate(t, args...)
+			found := false
+			for _, set := range nodeDaemonSets(t, rendered) {
+				container, _ := namedEntry(t, podSpecOf(t, set, "node DaemonSet")["containers"], "scale-csi")
+				if reflect.DeepEqual(container["command"], []any{"/usr/local/bin/scale-csi-node"}) {
+					found = true
+					mounts := renderJSON(t, container["volumeMounts"])
+					for _, path := range []string{`"/etc/iscsi"`, `"/var/lib/iscsi"`, `"/host"`} {
+						if !strings.Contains(mounts, path) {
+							t.Errorf("the agent needs %s for iSCSI: %s", path, mounts)
+						}
+					}
+				}
+			}
+			if !found {
+				t.Error("no DaemonSet runs the Rust agent")
+			}
+		})
+	}
+	// Every protocol at once is served too.
+	helmTemplate(t, withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nfs.enabled=true",
+		"--set", "node.implementation=rust")...)
 }
 
 // nodeDaemonSets returns the rendered node plugin DaemonSets by name.
@@ -145,7 +199,6 @@ func TestChartNodeRustNodesCanariesTheAgent(t *testing.T) {
 	for name, args := range map[string][]string{
 		"with node.implementation=rust": withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.implementation=rust"),
 		"with node.affinity":            withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.affinity.podAntiAffinity.x=y"),
-		"with NFS":                      withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "nfs.enabled=true"),
 	} {
 		t.Run("refused "+name, func(t *testing.T) { helmTemplateExpectError(t, args...) })
 	}

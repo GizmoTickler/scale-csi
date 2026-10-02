@@ -2523,7 +2523,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 		}
 		return nil, errors.New("no such file")
 	}
-	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	identity := discoverNodeIdentity(ctx, "worker-sentinel", nil)
 	require.Empty(t, identity.ISCSIIQN, "discovery must blank the sentinel out of the IQN field")
 	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision as a distinct signal")
 	nodeID, err := encodeNodeIdentity(identity)
@@ -2606,7 +2606,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 		}
 		return nil, errors.New("no such file")
 	}
-	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	identity := discoverNodeIdentity(ctx, "worker-sentinel", nil)
 	require.Empty(t, identity.ISCSIIQN, "discovery must blank the sentinel out of the IQN field")
 	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision")
 	encodedCurrent, err := encodeNodeIdentity(identity)
@@ -2689,7 +2689,7 @@ func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T
 		}
 		return nil, errors.New("no such file")
 	}
-	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	identity := discoverNodeIdentity(ctx, "worker-sentinel", nil)
 	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision")
 	nodeID, err := encodeNodeIdentity(identity)
 	require.NoError(t, err)
