@@ -67,7 +67,7 @@ share the appliance with it instead of failing and running after it.
   the page re-read its datasets (records in Kubernetes only). Every page now
   keeps the deletes it filters on until its entries are built.
 
-## v1.22.0 (draft) — a restart of seconds, a drain that does not wait for it
+## v1.22.0 — a restart of seconds, a drain that does not wait for it
 
 Nothing to configure. Startup with strict fencing, a drain that overlaps a
 controller restart, and ListVolumes all cost less.
