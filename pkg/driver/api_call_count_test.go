@@ -972,7 +972,9 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		}},
 		// NFS deletion validates the cached share ID's export-path backreference
 		// before the dependency guards and destructive calls.
-		{name: "DeleteVolume NFS", want: 8, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		{name: "DeleteVolume NFS", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-nfs", "nfs"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -981,17 +983,21 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		}},
 		// iSCSI deletion validates target, extent, and association backreferences
 		// before cleanup, then retains the two dataset dependency guards.
-		{name: "DeleteVolume iSCSI", want: 12, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		{name: "DeleteVolume iSCSI", want: 11, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi"})
 			require.NoError(t, err)
 		}},
-		// Twelve calls: identical to the non-CHAP iSCSI delete. The shared CHAP auth
+		// Identical to the non-CHAP iSCSI delete. The shared CHAP auth
 		// peer is intentionally NOT deleted per-volume (other volumes of the
 		// StorageClass reference it), so DeleteVolume adds +0 CHAP round trips.
-		{name: "DeleteVolume iSCSI CHAP", want: 12, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		{name: "DeleteVolume iSCSI CHAP", want: 11, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("delete-iscsi-chap"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -1070,7 +1076,9 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		//   +1 DatasetGet. The corroboration record is now VERIFIED with a
 		//     source-bearing re-read before the task is destroyed (B1-e), because
 		//     an assumed write is exactly what wedges a retry forever.
-		{name: "DeleteVolume NFS scheduled", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		{name: "DeleteVolume NFS scheduled", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			_, err := d.CreateVolume(context.Background(), req)

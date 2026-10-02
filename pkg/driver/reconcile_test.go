@@ -162,6 +162,9 @@ func TestReconcileOrphansGuardedDeleteRefusesDependentVolume(t *testing.T) {
 	old := time.Now().Add(-48 * time.Hour)
 	addReconcileDataset(client, "a-source", old, true, 100)
 	clone := addReconcileDataset(client, "z-clone", old, true, 100)
+	// The clone's origin snapshot exists on the source, as it must in ZFS.
+	_, snapErr := client.SnapshotCreate(context.Background(), "pool/parent/a-source", "dependency", nil)
+	require.NoError(t, snapErr)
 	clone.Origin = truenas.DatasetProperty{
 		Parsed: "pool/parent/a-source@dependency", Rawvalue: "pool/parent/a-source@dependency",
 	}

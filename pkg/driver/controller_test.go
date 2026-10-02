@@ -951,7 +951,9 @@ func TestDeleteVolumeHappyPathListsSnapshotsOnce(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, mockClient.datasetGetCalls)
 	assert.Equal(t, 1, mockClient.snapshotListCalls)
-	assert.Equal(t, 1, mockClient.dependentCloneQueries)
+	// A volume with no snapshots of its own cannot have a dependent clone, so
+	// the parent-wide origin scan is not run (Batch 4.1).
+	assert.Equal(t, 0, mockClient.dependentCloneQueries)
 }
 
 func TestDeleteVolumeWithManagedSnapshotFailsBeforeShareDeletion(t *testing.T) {
@@ -1007,6 +1009,10 @@ func TestDeleteVolumeWithDatasetOriginCloneFailsBeforeShareDeletion(t *testing.T
 		Name: "pool/external/clone", Type: "FILESYSTEM",
 	})
 	assert.NoError(t, err)
+	// ZFS keeps a cloned snapshot until its last clone is gone, so the clone's
+	// origin snapshot exists on the source.
+	_, err = client.SnapshotCreate(ctx, source.Name, "external-snapshot", nil)
+	assert.NoError(t, err)
 	client.Datasets[clone.Name].Origin = truenas.DatasetProperty{
 		Value:  "pool/parent/source-origin@external-snapshot",
 		Parsed: "pool/parent/source-origin@external-snapshot",
@@ -1014,6 +1020,7 @@ func TestDeleteVolumeWithDatasetOriginCloneFailsBeforeShareDeletion(t *testing.T
 
 	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "source-origin"})
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), "dependent clones")
 	assert.False(t, client.shareDeleteAttempted)
 	remaining, shareErr := client.NFSShareGet(ctx, share.ID)
 	assert.NoError(t, shareErr)
