@@ -30,7 +30,7 @@ that read Events see no difference between the two:
 No chart change: the node ClusterRole already allows creating and patching
 Events.
 
-## v1.18.0 (draft)
+## v1.18.0 — the Rust node agent serves iSCSI and NFS
 
 ### The Rust node agent serves iSCSI
 
