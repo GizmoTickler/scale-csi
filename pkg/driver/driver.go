@@ -142,7 +142,7 @@ type Driver struct {
 	snapshotPageCacheTime time.Time
 
 	// managedListingMu guards managedListing, the managed-dataset listing in
-	// flight that concurrent callers share (listAllManagedDatasetsSince).
+	// flight that concurrent callers share (listAllManagedDatasets).
 	managedListingMu sync.Mutex
 	managedListing   *managedListingCall
 
@@ -260,6 +260,9 @@ type Driver struct {
 	// reconcile loop has returned: later re-run requests are dropped instead of
 	// collecting in startupReconcilePending with nothing left to take them.
 	startupReconcileExited bool
+	// startupLockWatch, while the startup diff reads, records every volume
+	// lock held or taken (startup_diff.go).
+	startupLockWatch atomic.Pointer[startupLockWatch]
 	// startupGateMu guards the per-volume publish gate (startup_gate.go):
 	// whether a pass has taken its VolumeAttachment snapshot, and the volumes
 	// that snapshot saw attached that have not converged since.
@@ -982,8 +985,19 @@ func (d *Driver) acquireOperationLock(key string) bool {
 	if _, held := d.operationLock.Load(key); held {
 		return false
 	}
-	_, loaded := d.operationLock.LoadOrStore(key, make(chan struct{}))
-	return !loaded
+	if _, loaded := d.operationLock.LoadOrStore(key, make(chan struct{})); loaded {
+		return false
+	}
+	d.operationLockTaken(key)
+	return true
+}
+
+// operationLockTaken tells a running startup diff that key's lock was taken
+// (startupLockWatch).
+func (d *Driver) operationLockTaken(key string) {
+	if watch := d.startupLockWatch.Load(); watch != nil {
+		watch.touch(key)
+	}
 }
 
 // acquireOperationLockWait is acquireOperationLock that waits up to wait for
@@ -999,6 +1013,7 @@ func (d *Driver) acquireOperationLockWait(ctx context.Context, key string, wait 
 		released := make(chan struct{})
 		actual, loaded := d.operationLock.LoadOrStore(key, released)
 		if !loaded {
+			d.operationLockTaken(key)
 			return true
 		}
 		held, ok := actual.(chan struct{})

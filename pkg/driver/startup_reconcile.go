@@ -353,6 +353,23 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 	// Every volume this pass will converge holds its publishes in strict mode
 	// until it has (startupPublishGate); every other volume is free.
 	d.startupGateTrack(volumes, volumeIDs, targets == nil)
+	passVolumeCount := len(volumeIDs)
+	if targets == nil {
+		// Diff-first: a full pass converges on its own only the volumes the
+		// fleet-wide reads cannot show are already converged (startup_diff.go).
+		converged := d.startupDiffConverged(ctx, volumes, volumeIDs)
+		if len(converged) > 0 {
+			remaining := volumeIDs[:0:0]
+			for _, volumeID := range volumeIDs {
+				if _, done := converged[volumeID]; done {
+					d.startupGateSettle(volumeID, volumes[volumeID])
+					continue
+				}
+				remaining = append(remaining, volumeID)
+			}
+			volumeIDs = remaining
+		}
+	}
 	type volumeResult struct {
 		volumeID string
 		err      error
@@ -403,7 +420,7 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 		return failed, errors.Join(volumeErrors...)
 	}
 	klog.Infof("Startup fencing reconciliation converged: %d attached publication(s) across %d volume(s)",
-		attachmentCount, len(volumeIDs))
+		attachmentCount, passVolumeCount)
 	return nil, nil
 }
 
