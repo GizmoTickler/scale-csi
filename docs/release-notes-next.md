@@ -193,7 +193,9 @@ used to hold one worker until the agent stopped answering for every protocol.
   must provide `multipathd`). multipathd exiting non-zero, or answering
   `fail`, fails the expansion with Internal. Only a dm-multipath map (dm UUID
   `mpath-<wwid>`) is expanded this way; any other device-mapper device, such
-  as a kpartx partition or an LVM volume, takes the single-device rescan.
+  as a kpartx partition or an LVM volume, takes the single-device rescan. A
+  dm device whose UUID cannot be read fails the expansion with Internal rather
+  than being guessed at; one with no UUID file is not a map.
 
 ## v1.16.0 — publication records in Kubernetes
 
