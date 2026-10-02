@@ -25,14 +25,8 @@ use crate::records::Records;
 use crate::session_registry::SessionRegistry;
 use crate::ublk_client::{self, Daemon};
 
-/// A path's device number, when it is a block device.
-pub type BlockDeviceNumber = Arc<dyn Fn(&str) -> std::io::Result<Option<u64>> + Send + Sync>;
-
-pub(crate) fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let meta = std::fs::metadata(path)?;
-    Ok(meta.file_type().is_block_device().then(|| meta.rdev()))
-}
+pub use crate::blockdev::BlockDeviceNumber;
+use crate::blockdev::block_device_number;
 
 /// lstat(2) of a path the node looks at directly (never one that may be a
 /// network mount: on a dead server it blocks).
@@ -131,6 +125,7 @@ impl State {
                 timeout: nvme_timeout,
                 sysfs: PathBuf::from("/sys"),
                 dev: PathBuf::from("/dev"),
+                device_number: Arc::new(block_device_number),
             },
             nvme_sessions: None,
             host: Host::default(),

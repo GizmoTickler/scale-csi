@@ -32,10 +32,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 
+use crate::blockdev::{self, BlockDeviceNumber, block_device_number};
 use crate::exec::{Limits, Output};
 use crate::mount::Runner;
 use crate::nvme_addresses::join_host_port;
-use crate::service::{BlockDeviceNumber, block_device_number};
 
 /// `ISCSI_ERR_SESS_EXISTS`: a `--login` whose session already exists.
 pub const EXIT_SESSION_EXISTS: i32 = 15;
@@ -1219,27 +1219,10 @@ impl Iscsi {
         bail!("device for session {number} not found")
     }
 
-    /// Whether `device` is a block device node with the number the kernel
-    /// gives the disk (`sysfs_dev` holds `MAJ:MIN`). Right after a logout and
-    /// a new login to the same target, sysfs already names the new disk while
-    /// /dev can still hold the previous disk's node of that name (devtmpfs and
-    /// udev removal lag), or a stale node with no fresh one yet; opening it
-    /// fails with ENXIO/ENODEV, so a device wait keeps polling until the node
-    /// matches. One stat and one small sysfs read.
+    /// Whether `device` is the current node for the disk whose sysfs `dev`
+    /// file is `sysfs_dev` (see `blockdev::is_current_node`).
     fn is_current_node(&self, device: &Path, sysfs_dev: &Path) -> bool {
-        let Ok(Some(number)) = (self.device_number)(&device.to_string_lossy()) else {
-            return false;
-        };
-        let Ok(want) = std::fs::read_to_string(sysfs_dev) else {
-            return false;
-        };
-        let Some((major, minor)) = want.trim().split_once(':') else {
-            return false;
-        };
-        match (major.parse::<u32>(), minor.parse::<u32>()) {
-            (Ok(major), Ok(minor)) => libc::major(number) == major && libc::minor(number) == minor,
-            _ => false,
-        }
+        blockdev::is_current_node(&self.device_number, device, sysfs_dev)
     }
 
     /// The SCSI identifier dm-multipath keys its map by.

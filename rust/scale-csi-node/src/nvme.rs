@@ -13,6 +13,11 @@
 //!   with no NSID to choose by, picking one could hand a pod another volume.
 //!   (The Go node swallows that error inside its wait loop and times out after
 //!   the full device timeout; here it fails at once.)
+//! - a namespace's /dev node is taken only when it is a block device whose
+//!   number matches the namespace's own sysfs `dev` file: right after a
+//!   disconnect and a new connect (a handover between the plugins) /dev can
+//!   still hold the previous namespace's node of that name, and the wait keeps
+//!   polling until it is current.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +27,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::debug;
 use serde_json::Value;
 
+use crate::blockdev::{self, BlockDeviceNumber};
 use crate::exec::{Limits, Output};
 use crate::mount::Runner;
 
@@ -260,6 +266,8 @@ pub struct Nvme {
     pub timeout: Duration,
     pub sysfs: PathBuf,
     pub dev: PathBuf,
+    /// stat(2) of a block device's number (the tests supply their own).
+    pub device_number: BlockDeviceNumber,
 }
 
 fn failure(what: &str, out: &Output) -> anyhow::Error {
@@ -386,7 +394,15 @@ impl Nvme {
         Ok(())
     }
 
-    /// The subsystem's namespace device through sysfs.
+    /// Whether `device` is the current node for the namespace whose sysfs
+    /// directory is `sysfs_dir` (see `blockdev::is_current_node`).
+    fn is_current_node(&self, device: &Path, sysfs_dir: &Path) -> bool {
+        blockdev::is_current_node(&self.device_number, device, &sysfs_dir.join("dev"))
+    }
+
+    /// The subsystem's namespace device through sysfs: the native multipath
+    /// head (`nvmeXnY`, X the subsystem instance) directly under the
+    /// subsystem, or a namespace under one of its controllers.
     pub fn find_device_sysfs(&self, nqn: &str) -> Found {
         let root = self.sysfs.join("class/nvme-subsystem");
         for subsystem in glob_names(&root, |n| n.starts_with("nvme-subsys")) {
@@ -397,21 +413,32 @@ impl Nvme {
             if found.trim() != nqn {
                 continue;
             }
-            let mut names = glob_names(&dir, is_namespace_name);
+            // (name, its sysfs directory), the direct entry first.
+            let within = |parent: &Path| -> Vec<(String, PathBuf)> {
+                glob_names(parent, is_namespace_name)
+                    .into_iter()
+                    .map(|name| {
+                        let path = parent.join(&name);
+                        (name, path)
+                    })
+                    .collect()
+            };
+            let mut namespaces = within(&dir);
             for controller in glob_names(&dir, |n| n.starts_with("nvme") && controller_of(n).is_none()) {
-                names.extend(glob_names(&dir.join(controller), is_namespace_name));
+                namespaces.extend(within(&dir.join(controller)));
             }
-            names.sort();
-            names.dedup();
-            if names.len() > 1 {
+            namespaces.sort_by(|a, b| a.0.cmp(&b.0));
+            namespaces.dedup_by(|later, earlier| later.0 == earlier.0);
+            if namespaces.len() > 1 {
+                let names: Vec<&str> = namespaces.iter().map(|(name, _)| name.as_str()).collect();
                 return Found::Ambiguous(format!(
                     "NVMe subsystem {nqn} exposes multiple namespaces ({})",
                     names.join(", ")
                 ));
             }
-            if let Some(name) = names.first() {
+            if let Some((name, sysfs_dir)) = namespaces.first() {
                 let device = self.dev.join(name);
-                if device.exists() {
+                if self.is_current_node(&device, sysfs_dir) {
                     return Found::Device(device.to_string_lossy().into_owned());
                 }
             }
@@ -419,7 +446,8 @@ impl Nvme {
         Found::None
     }
 
-    /// The namespace behind a controller `nvme list-subsys` names.
+    /// The namespace behind a controller `nvme list-subsys` names, when its
+    /// /dev node is current.
     pub fn find_device_for_controller(&self, controller: &str) -> Found {
         let digits = controller.strip_prefix("nvme").unwrap_or_default();
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -435,8 +463,10 @@ impl Nvme {
                 names.join(", ")
             ));
         }
-        match names.first().map(|n| self.dev.join(n)) {
-            Some(device) if device.exists() => Found::Device(device.to_string_lossy().into_owned()),
+        match names.first() {
+            Some(name) if self.is_current_node(&self.dev.join(name), &dir.join(name)) => {
+                Found::Device(self.dev.join(name).to_string_lossy().into_owned())
+            }
             _ => Found::None,
         }
     }
@@ -539,7 +569,9 @@ impl Nvme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{fake_device_number, sysfs_dev};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Answers commands with scripted replies, in order; records the argv.
     /// (exit code, output, wedged)
@@ -579,11 +611,25 @@ mod tests {
     }
 
     fn nvme(script: &Arc<Script>, root: &Path) -> Nvme {
+        nvme_numbered(script, root, |name| Some(fake_device_number(name)))
+    }
+
+    /// An initiator whose stat(2) of an existing /dev node reports
+    /// `number(name)` (None: not a block device). Fixtures cannot mknod.
+    fn nvme_numbered(
+        script: &Arc<Script>,
+        root: &Path,
+        number: impl Fn(&str) -> Option<u64> + Send + Sync + 'static,
+    ) -> Nvme {
         Nvme {
             runner: script.clone(),
             timeout: Duration::from_secs(30),
             sysfs: root.join("sys"),
             dev: root.join("dev"),
+            device_number: Arc::new(move |path: &str| {
+                std::fs::metadata(path)?;
+                Ok(number(&Path::new(path).file_name().unwrap().to_string_lossy()))
+            }),
         }
     }
 
@@ -722,11 +768,13 @@ mod tests {
         // Namespace directly under the subsystem (fabrics).
         touch(&subsys("nvme-subsys0").join("subsysnqn"), "nqn.a\n");
         touch(&subsys("nvme-subsys0").join("nvme0n1/size"), "8");
+        touch(&subsys("nvme-subsys0").join("nvme0n1/dev"), &sysfs_dev("nvme0n1"));
         touch(&subsys("nvme-subsys0").join("nvme0c0n1/size"), "8");
         touch(&root.path().join("dev/nvme0n1"), "");
         // Under a controller directory (PCIe-style).
         touch(&subsys("nvme-subsys1").join("subsysnqn"), "nqn.b\n");
         touch(&subsys("nvme-subsys1").join("nvme1/nvme1n1/size"), "8");
+        touch(&subsys("nvme-subsys1").join("nvme1/nvme1n1/dev"), &sysfs_dev("nvme1n1"));
         touch(&root.path().join("dev/nvme1n1"), "");
         // Two namespaces: no NSID to choose by.
         touch(&subsys("nvme-subsys2").join("subsysnqn"), "nqn.c\n");
@@ -735,6 +783,7 @@ mod tests {
         // Listed in sysfs but no device node yet.
         touch(&subsys("nvme-subsys3").join("subsysnqn"), "nqn.d\n");
         touch(&subsys("nvme-subsys3").join("nvme3n1/size"), "8");
+        touch(&subsys("nvme-subsys3").join("nvme3n1/dev"), &sysfs_dev("nvme3n1"));
 
         let dev = |name: &str| root.path().join("dev").join(name).to_string_lossy().into_owned();
         assert_eq!(n.find_device_sysfs("nqn.a"), Found::Device(dev("nvme0n1")));
@@ -745,6 +794,10 @@ mod tests {
 
         // Through the controller list-subsys names.
         touch(&root.path().join("sys/class/nvme/nvme5/nvme5n1/size"), "8");
+        touch(
+            &root.path().join("sys/class/nvme/nvme5/nvme5n1/dev"),
+            &sysfs_dev("nvme5n1"),
+        );
         touch(&root.path().join("dev/nvme5n1"), "");
         let listed = vec![Subsystem {
             nqn: "nqn.e".into(),
@@ -857,6 +910,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // Not in sysfs; the refreshed list names its controller.
         touch(&root.path().join("sys/class/nvme/nvme4/nvme4n1/size"), "8");
+        touch(
+            &root.path().join("sys/class/nvme/nvme4/nvme4n1/dev"),
+            &sysfs_dev("nvme4n1"),
+        );
         touch(&root.path().join("dev/nvme4n1"), "");
         let script = Script::new(vec![(
             Some(0),
@@ -902,6 +959,133 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("timeout"), "{err:#}");
         assert_eq!(script.calls().len(), 1);
+    }
+
+    /// sysfs and /dev right after a connect: the namespace's sysfs dev file
+    /// carries the new number and /dev/nvme3n1 exists. As the native multipath
+    /// head directly under nvme-subsys3 (found through sysfs), or as a
+    /// namespace of controller nvme3 with no subsystem directory (found
+    /// through the controller list-subsys names). Returns the namespace's
+    /// sysfs directory.
+    fn connected(root: &Path, head: bool) -> PathBuf {
+        let dir = if head {
+            let subsys = root.join("sys/class/nvme-subsystem/nvme-subsys3");
+            touch(&subsys.join("subsysnqn"), "nqn.h\n");
+            subsys.join("nvme3n1")
+        } else {
+            root.join("sys/class/nvme/nvme3/nvme3n1")
+        };
+        touch(&dir.join("dev"), &sysfs_dev("nvme3n1"));
+        touch(&root.join("dev/nvme3n1"), "");
+        dir
+    }
+
+    fn listed() -> Vec<Subsystem> {
+        vec![Subsystem {
+            nqn: "nqn.h".into(),
+            paths: vec![NvmePath {
+                name: "nvme3".into(),
+                state: "live".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]
+    }
+
+    fn find(n: &Nvme, head: bool) -> Found {
+        if head {
+            n.find_device_sysfs("nqn.h")
+        } else {
+            n.find_device_from_subsystems("nqn.h", &listed())
+        }
+    }
+
+    /// The /dev node the previous connect's namespace left behind, a node that
+    /// is not a block device, or a namespace with no sysfs device number is
+    /// never the device.
+    #[test]
+    fn only_a_current_node_is_the_device() {
+        let fresh = fake_device_number("nvme3n1");
+        for head in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let sysfs_dir = connected(root.path(), head);
+            let script = Script::new(vec![]);
+
+            let stale = nvme_numbered(&script, root.path(), move |_| Some(fresh ^ 0xff));
+            assert_eq!(find(&stale, head), Found::None, "head={head}: a stale node");
+
+            let not_block = nvme_numbered(&script, root.path(), |_| None);
+            assert_eq!(find(&not_block, head), Found::None, "head={head}: not a block device");
+
+            let n = nvme(&script, root.path());
+            std::fs::remove_file(sysfs_dir.join("dev")).unwrap();
+            assert_eq!(find(&n, head), Found::None, "head={head}: no sysfs dev file");
+            touch(&sysfs_dir.join("dev"), "garbage\n");
+            assert_eq!(find(&n, head), Found::None, "head={head}: an unreadable sysfs dev file");
+
+            touch(&sysfs_dir.join("dev"), &sysfs_dev("nvme3n1"));
+            let device = root.path().join("dev/nvme3n1").to_string_lossy().into_owned();
+            assert_eq!(find(&n, head), Found::Device(device), "head={head}");
+        }
+    }
+
+    /// stat(2) reports the stale number for the first `stale` stats, then the
+    /// current one, counting every stat.
+    fn stale_then_fresh(root: &Path, stale: u32) -> (Nvme, Arc<AtomicU32>) {
+        let stats = Arc::new(AtomicU32::new(0));
+        let counted = stats.clone();
+        let n = nvme_numbered(&Script::new(vec![]), root, move |name| {
+            let fresh = fake_device_number(name);
+            Some(if counted.fetch_add(1, Ordering::SeqCst) < stale {
+                fresh ^ 0xff
+            } else {
+                fresh
+            })
+        });
+        (n, stats)
+    }
+
+    /// The handover race: the other plugin disconnected, this one connected,
+    /// and /dev/nvme3n1 is still the previous namespace's node for a few
+    /// polls. The wait returns only the current node.
+    #[tokio::test]
+    async fn the_device_wait_skips_a_stale_dev_node() {
+        for head in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            connected(root.path(), head);
+            let (n, stats) = stale_then_fresh(root.path(), 3);
+            let subsystems = if head { Vec::new() } else { listed() };
+            let got = n
+                .wait_for_device("nqn.h", Duration::from_secs(5), subsystems, false, None)
+                .await
+                .unwrap();
+            assert!(got.ends_with("dev/nvme3n1"), "head={head}: {got}");
+            assert_eq!(
+                stats.load(Ordering::SeqCst),
+                4,
+                "head={head}: polled past the stale node"
+            );
+        }
+    }
+
+    /// A node that never becomes current ends in the wait's own timeout.
+    #[tokio::test]
+    async fn the_device_wait_times_out_on_a_stale_dev_node() {
+        for head in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            connected(root.path(), head);
+            let (n, stats) = stale_then_fresh(root.path(), u32::MAX);
+            let subsystems = if head { Vec::new() } else { listed() };
+            let err = n
+                .wait_for_device("nqn.h", Duration::from_millis(150), subsystems, false, None)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "timeout waiting for device (nqn=nqn.h)", "head={head}");
+            assert!(
+                stats.load(Ordering::SeqCst) > 1,
+                "head={head}: re-checked until the timeout"
+            );
+        }
     }
 
     #[tokio::test]

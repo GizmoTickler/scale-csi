@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::blockdev::BlockDeviceNumber;
 use crate::exec::Output;
 use crate::iscsi::{Iscsi, same_portal, set_record_param, split_portal};
 use crate::mount::Runner;
-use crate::service::BlockDeviceNumber;
-use crate::testing::{HOST_NQN, Node, fake_device_number, node};
+pub use crate::testing::sysfs_dev;
+use crate::testing::{HOST_NQN, Node, node};
 
 pub const PORTAL: &str = "192.0.2.30:3260";
 pub const PORTAL_B: &str = "192.0.2.31:3260";
@@ -106,12 +107,6 @@ fn disk_name(n: u32) -> String {
         }
     }
     format!("sd{name}")
-}
-
-/// The sysfs `dev` file ("MAJ:MIN") of a fake device (FakeHost::device_number).
-pub fn sysfs_dev(name: &str) -> String {
-    let number = fake_device_number(name);
-    format!("{}:{}\n", libc::major(number), libc::minor(number))
 }
 
 fn write(path: &Path, content: &str) {
