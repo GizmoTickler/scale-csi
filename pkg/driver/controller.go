@@ -676,11 +676,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// would simply observe "already held" and abort a request that has no
 	// actual concurrency to serialize against.
 	if cloneSourceVolumeID != "" && cloneSourceVolumeID != volumeID {
+		// A data-class hold (operation_lock.go): the clone only reads the
+		// source and creates and destroys its own snapshot of it, so a publish
+		// or unpublish of the source goes on alongside.
 		sourceVolumeLockKey := volumeLockKey(cloneSourceVolumeID)
-		if !d.acquireOperationLock(sourceVolumeLockKey) {
+		if !d.acquireOperationLockMode(sourceVolumeLockKey, lockData) {
 			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 		}
-		defer d.releaseOperationLock(sourceVolumeLockKey)
+		defer d.releaseOperationLockMode(sourceVolumeLockKey, lockData)
 	}
 
 	// Lock on the sanitized volume ID so all operations use the same key space.
@@ -2154,11 +2157,14 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
+	// An attach-class hold (operation_lock.go): a snapshot of the volume goes
+	// on alongside; another publish or unpublish of it, or an exclusive
+	// operation, is waited for, up to attachLockWait.
 	lockKey := volumeLockKey(volumeID)
-	if !d.acquireOperationLock(lockKey) {
+	if !d.acquireOperationLockModeWait(ctx, lockKey, lockAttach, attachLockWait) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
-	defer d.releaseOperationLock(lockKey)
+	defer d.releaseOperationLockMode(lockKey, lockAttach)
 	// Strict fencing at startup: converge this volume first if startup has not
 	// yet (startup_gate.go). The dataset is read below, after it.
 	if gateErr := d.startupPublishGate(ctx, volumeID); gateErr != nil {
@@ -2248,11 +2254,12 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
+	// Attach-class, as ControllerPublishVolume.
 	lockKey := volumeLockKey(volumeID)
-	if !d.acquireOperationLock(lockKey) {
+	if !d.acquireOperationLockModeWait(ctx, lockKey, lockAttach, attachLockWait) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
-	defer d.releaseOperationLock(lockKey)
+	defer d.releaseOperationLockMode(lockKey, lockAttach)
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
@@ -2815,12 +2822,14 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 
 	// Always acquire the source-volume lock before the snapshot lock. This
 	// serializes snapshot creation with DeleteVolume and gives all creators a
-	// fixed lock order.
+	// fixed lock order. The hold is data-class (operation_lock.go): a publish
+	// or unpublish of the source goes on alongside, as the snapshot never
+	// touches its share, allowlist or records.
 	sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
-	if !d.acquireOperationLock(sourceVolumeLockKey) {
+	if !d.acquireOperationLockMode(sourceVolumeLockKey, lockData) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 	}
-	defer d.releaseOperationLock(sourceVolumeLockKey)
+	defer d.releaseOperationLockMode(sourceVolumeLockKey, lockData)
 
 	snapshotID := sanitizeVolumeID(name)
 	if _, err := d.datasetForID(snapshotID); err != nil {
@@ -3221,10 +3230,11 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	if strings.HasPrefix(snap.Dataset, parentPrefix) {
 		sourceVolumeID := path.Base(snap.Dataset)
 		sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
-		if !d.acquireOperationLock(sourceVolumeLockKey) {
+		// Data-class, as CreateSnapshot.
+		if !d.acquireOperationLockMode(sourceVolumeLockKey, lockData) {
 			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 		}
-		defer d.releaseOperationLock(sourceVolumeLockKey)
+		defer d.releaseOperationLockMode(sourceVolumeLockKey, lockData)
 	}
 	// The per-snapshot lock key derives from the SHORT name, not the raw handle
 	// string: CreateSnapshot locks "snapshot:"+shortName, and the same snapshot
