@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +25,11 @@ func notFoundAPIError(message string) *APIError {
 type MockClient struct {
 	mu                     sync.RWMutex
 	setUserPropertiesCalls int
+
+	// DisableResourceQuery models an appliance without zfs.resource.query for
+	// the dependent-clone origin scan, which then covers only the CSI parent
+	// (pool.dataset.query) instead of the whole pool.
+	DisableResourceQuery bool
 
 	// Mock data
 	Datasets           map[string]*Dataset
@@ -1162,12 +1168,25 @@ func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName 
 		return false, m.InjectError
 	}
 	originPrefix := datasetName + "@"
-	for _, dataset := range m.Datasets {
-		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
+	for name, dataset := range m.Datasets {
+		if m.originScanSees(datasetName, name) && strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// originScanSees mirrors the real client's origin-scan scope: the whole pool of
+// subject where zfs.resource.query is available (the default), else only the
+// CSI parent of subject (DisableResourceQuery models the pool.dataset.query
+// fallback).
+func (m *MockClient) originScanSees(subject, name string) bool {
+	datasetPath, _, _ := strings.Cut(subject, "@")
+	if m.DisableResourceQuery {
+		return strings.HasPrefix(name, path.Dir(datasetPath)+"/")
+	}
+	pool, _, _ := strings.Cut(datasetPath, "/")
+	return name == pool || strings.HasPrefix(name, pool+"/")
 }
 
 // DatasetPromote models pool.dataset.promote with FULL live fidelity (P3):
@@ -1245,7 +1264,8 @@ func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) err
 }
 
 // SnapshotDependentClones mirrors the real client's authoritative per-snapshot
-// dependent-clone query: it walks ALL datasets, not only driver-managed ones,
+// dependent-clone query: it walks every dataset in the client's scope (see
+// originScanSees), not only driver-managed ones,
 // so a test can seed an unmanaged sibling clone and see it counted.
 func (m *MockClient) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
 	m.mu.RLock()
@@ -1255,7 +1275,7 @@ func (m *MockClient) SnapshotDependentClones(ctx context.Context, snapshotID str
 	}
 	var clones []string
 	for name, dataset := range m.Datasets {
-		if datasetPropertyString(dataset.Origin) == snapshotID {
+		if m.originScanSees(snapshotID, name) && datasetPropertyString(dataset.Origin) == snapshotID {
 			clones = append(clones, name)
 		}
 	}
@@ -2104,7 +2124,7 @@ func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotI
 func (m *MockClient) snapshotClonesLocked(snapshotID string) []string {
 	var clones []string
 	for name, dataset := range m.Datasets {
-		if datasetPropertyString(dataset.Origin) == snapshotID {
+		if m.originScanSees(snapshotID, name) && datasetPropertyString(dataset.Origin) == snapshotID {
 			clones = append(clones, name)
 		}
 	}
