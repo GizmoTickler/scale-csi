@@ -39,6 +39,7 @@ type diffCountingClient struct {
 	*apiCallCountingClient
 	hook               func()
 	failHostSubsysList bool
+	extraHostSubsys    []*truenas.NVMeoFHostSubsys
 }
 
 func (c *diffCountingClient) NVMeoFHostSubsysList(ctx context.Context) ([]*truenas.NVMeoFHostSubsys, error) {
@@ -48,7 +49,8 @@ func (c *diffCountingClient) NVMeoFHostSubsysList(ctx context.Context) ([]*truen
 	if c.failHostSubsysList {
 		return nil, fmt.Errorf("injected host_subsys listing failure")
 	}
-	return c.apiCallCountingClient.NVMeoFHostSubsysList(ctx)
+	associations, err := c.apiCallCountingClient.NVMeoFHostSubsysList(ctx)
+	return append(associations, c.extraHostSubsys...), err
 }
 
 var diffNodes = []string{"k8s-0", "k8s-1", "k8s-2"}
@@ -339,6 +341,18 @@ func TestStartupDiffFallsBackWhenAFleetReadFails(t *testing.T) {
 	f := newDiffFixture(t, 3)
 	f.perVolume()
 	f.client.failHostSubsysList = true
+	require.NoError(t, f.d.reconcilePublishedAttachments(ctx))
+	assert.Equal(t, []string{"diff-0", "diff-1", "diff-2"}, f.perVolume())
+}
+
+// An association the diff cannot place on a subsystem could belong to any
+// volume: no allowlist can be judged exact, so every volume takes the
+// per-volume path.
+func TestStartupDiffAbandonsOnAnUnplaceableAssociation(t *testing.T) {
+	ctx := context.Background()
+	f := newDiffFixture(t, 3)
+	f.perVolume()
+	f.client.extraHostSubsys = []*truenas.NVMeoFHostSubsys{{ID: 999, HostID: 1, HostNQN: "nqn.2014-08.org.nvmexpress:uuid:intruder"}}
 	require.NoError(t, f.d.reconcilePublishedAttachments(ctx))
 	assert.Equal(t, []string{"diff-0", "diff-1", "diff-2"}, f.perVolume())
 }
