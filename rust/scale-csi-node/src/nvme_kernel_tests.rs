@@ -603,6 +603,33 @@ async fn a_kernel_publish_checks_raw_block_ownership() {
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
 
+/// A multipath head whose founding controller went away (another path still
+/// live) is still this volume's: its ownership is read through the block
+/// device, so a raw-block publish is not refused with an internal error.
+#[tokio::test]
+async fn a_raw_block_publish_survives_loss_of_the_founding_controller() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    {
+        let mut host = n.host.0.lock().unwrap();
+        let k = host.kernel.as_mut().unwrap();
+        k.add_live(NQN, "192.0.2.21");
+        k.lose_founding_controller(NQN);
+    }
+    assert!(!n.dir.path().join("sys/class/nvme/nvme0").exists());
+    let publish = csi::NodePublishVolumeRequest {
+        volume_id: VOLUME.into(),
+        staging_target_path: n.path("staging/globalmount"),
+        target_path: n.path("pods/p/volumeDevices/publish/pv"),
+        volume_capability: Some(block()),
+        volume_context: kernel_context(),
+        ..Default::default()
+    };
+    crate::publish::node_publish(&n.state, &publish, None).await.unwrap();
+}
+
 /// The handover race: the other plugin disconnected the subsystem, this one
 /// connects it again, and sysfs already names the namespace while its /dev
 /// node still carries the previous namespace's number for a few stats. A whole
