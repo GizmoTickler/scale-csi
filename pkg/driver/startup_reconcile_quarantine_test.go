@@ -53,15 +53,28 @@ func TestStartupQuarantineIsHealedByTheSweepWhenTheStaleRecordGoesWithoutASignal
 	require.NoError(t, d.publications().remove(ctx, dataset.Name, dataset, []string{publicationPropertyKey("worker-gone-1")}))
 	time.Sleep(100 * time.Millisecond)
 	require.Equal(t, 1, d.startupQuarantineCount(), "nothing re-runs the volume before the sweep")
-
-	sweep()
-	require.Eventually(t, func() bool { return d.startupQuarantineCount() == 0 }, 3*time.Second, 10*time.Millisecond,
-		"the sweep did not re-run the quarantined volume")
 	dataset, err = client.DatasetGet(ctx, "pool/parent/q1")
 	require.NoError(t, err)
-	records, err := storedPublicationRecords(d, dataset)
+	before, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
-	assert.Contains(t, records, publicationPropertyKey("worker-q1"))
+	require.NotContains(t, before, publicationPropertyKey("worker-q1"), "the quarantined volume's record is not written yet")
+
+	sweep()
+	// The re-run clears the quarantine before it writes the record, so wait
+	// for the record itself: it is the last thing the re-run does.
+	require.Eventually(t, func() bool {
+		dataset, err := client.DatasetGet(ctx, "pool/parent/q1")
+		if err != nil {
+			return false
+		}
+		records, err := storedPublicationRecords(d, dataset)
+		if err != nil {
+			return false
+		}
+		_, written := records[publicationPropertyKey("worker-q1")]
+		return written
+	}, 3*time.Second, 10*time.Millisecond, "the sweep did not re-run the quarantined volume")
+	assert.Zero(t, d.startupQuarantineCount())
 }
 
 // Once the loop has returned, a re-run request is dropped rather than kept in
