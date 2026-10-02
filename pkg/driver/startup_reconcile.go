@@ -559,7 +559,10 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 // VolumeAttachment the snapshot saw for this volume: one GET by name each. A
 // VA that is gone, or replaced by an object for another PV or node, no longer
 // claims anything; one being deleted or no longer Attached still claims its
-// node but is never (re)granted. Node identities come from the snapshot.
+// node but is never (re)granted. The node identity of each grant is re-read
+// here too (a GET of its CSINode and Node): the snapshot's can be a whole pass
+// old, and a node that re-registered since (a new address or NQN) would
+// otherwise have its current identity revoked and the old one granted.
 func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *startupFencingVolume) (*startupFencingVolume, error) {
 	result := &startupFencingVolume{
 		volumeID:         snapshot.volumeID,
@@ -568,6 +571,7 @@ func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *star
 		attachments:      snapshot.attachments,
 	}
 	attachments := d.eventRecorder.clientset.StorageV1().VolumeAttachments()
+	identities := make(map[string]startupNodeIdentityRead)
 	for i := range snapshot.attachments {
 		attachment := &snapshot.attachments[i]
 		current, err := attachments.Get(ctx, attachment.name, metav1.GetOptions{})
@@ -588,9 +592,54 @@ func (d *Driver) refreshStartupFencingVolume(ctx context.Context, snapshot *star
 		if !current.Status.Attached || !current.DeletionTimestamp.IsZero() {
 			continue
 		}
-		result.publications = append(result.publications, attachment.publication)
+		publication := attachment.publication
+		identity, nodeID, err := d.currentStartupNodeIdentity(ctx, attachment.nodeName, identities)
+		if err != nil {
+			return nil, err
+		}
+		publication.identity, publication.nodeID = identity, nodeID
+		result.publications = append(result.publications, publication)
 	}
 	return result, nil
+}
+
+type startupNodeIdentityRead struct {
+	identity NodeIdentity
+	nodeID   string
+}
+
+// currentStartupNodeIdentity is startupNodeIdentity and csiNodeID over the
+// node's CSINode and Node as they are now (absent is nil, as in a listing),
+// read once per node per refresh.
+func (d *Driver) currentStartupNodeIdentity(
+	ctx context.Context,
+	nodeName string,
+	seen map[string]startupNodeIdentityRead,
+) (NodeIdentity, string, error) {
+	if read, ok := seen[nodeName]; ok {
+		return read.identity, read.nodeID, nil
+	}
+	clientset := d.eventRecorder.clientset
+	csiNode, err := clientset.StorageV1().CSINodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		csiNode, err = nil, nil
+	}
+	if err != nil {
+		return NodeIdentity{}, "", fmt.Errorf("get CSINode %s: %w", nodeName, err)
+	}
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		node, err = nil, nil
+	}
+	if err != nil {
+		return NodeIdentity{}, "", fmt.Errorf("get Node %s: %w", nodeName, err)
+	}
+	read := startupNodeIdentityRead{
+		identity: startupNodeIdentity(d.name, nodeName, csiNode, node),
+		nodeID:   csiNodeID(d.name, csiNode),
+	}
+	seen[nodeName] = read
+	return read.identity, read.nodeID, nil
 }
 
 // confirmedStaleStartupRecord is stalePublishedRecordNode over a liveNodes set

@@ -108,8 +108,11 @@ func TestStartupReconcileRequestsPerVolume(t *testing.T) {
 	want := map[string]int{
 		"list persistentvolumes": 1, "list volumeattachments": 1, "list csinodes": 1, "list nodes": 1,
 		"get volumeattachments": volumes,
+		// The grant's node identity is re-read under the lock, never the
+		// snapshot's (TestStartupReconcileGrantsTheNodesCurrentIdentity).
+		"get csinodes": volumes, "get nodes": volumes,
 	}
-	assert.Equal(t, want, requests.take(), "4 cluster-wide lists per pass, then one GET per attachment (was 4 more lists per volume)")
+	assert.Equal(t, want, requests.take(), "4 cluster-wide lists per pass, then a VolumeAttachment, CSINode and Node GET per attachment (was 4 more lists per volume)")
 	assert.Equal(t, volumes, store.storeCount(), "the first pass writes each missing record")
 
 	// A restart: every record is already in place and unchanged.
