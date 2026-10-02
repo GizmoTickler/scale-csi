@@ -189,6 +189,17 @@ func (v *publicationVersions) drop(datasetName, name string) {
 	}
 }
 
+// observed is whether datasetName has been read.
+func (v *publicationVersions) observed(datasetName string) bool {
+	if v == nil {
+		return false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	_, observed := v.byDataset[datasetName]
+	return observed
+}
+
 // forget drops datasetName: its next write reads the object first.
 func (v *publicationVersions) forget(datasetName string) {
 	if v == nil {
@@ -357,13 +368,27 @@ func (s kubernetesPublicationStore) store(ctx context.Context, datasetName strin
 // remove deletes the records. An object whose version the locked read (or
 // this process's last write) saw is deleted only at that version: one
 // changed since is reported as errPublicationRecordConflict and kept. One
-// the read saw absent, or of a dataset never read, is deleted as it is.
+// the read saw absent is not deleted: if it exists now it was created since,
+// and that is reported the same way. One of a dataset never read is deleted
+// as it is.
 func (s kubernetesPublicationStore) remove(ctx context.Context, datasetName string, _ *truenas.Dataset, keys []string) error {
 	for _, key := range keys {
 		name := s.objectName(datasetName, key)
 		options := metav1.DeleteOptions{}
-		if resourceVersion, _, exists := s.versions.lookup(datasetName, name); exists && resourceVersion != "" {
+		resourceVersion, observed, exists := s.versions.lookup(datasetName, name)
+		switch {
+		case exists && resourceVersion != "":
 			options.Preconditions = &metav1.Preconditions{ResourceVersion: &resourceVersion}
+		case observed && !exists:
+			_, err := s.resource().Get(ctx, name, metav1.GetOptions{})
+			switch {
+			case apierrors.IsNotFound(err):
+				continue
+			case err != nil:
+				return fmt.Errorf("remove publication record %s for %s: %w", name, datasetName, err)
+			}
+			s.versions.forget(datasetName)
+			return fmt.Errorf("remove publication record %s for %s: %w: created since it was read", name, datasetName, errPublicationRecordConflict)
 		}
 		if err := s.resource().Delete(ctx, name, options); err != nil && !apierrors.IsNotFound(err) {
 			if apierrors.IsConflict(err) {

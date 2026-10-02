@@ -138,7 +138,7 @@ func newestPublicationRecord(records map[string]publicationRecord) time.Time {
 // store resolves and imports the volume's ZFS records before writing: the
 // write's own fresh time must not decide that resolution.
 func (s importingPublicationStore) store(ctx context.Context, datasetName string, ds *truenas.Dataset, key string, record publicationRecord) error {
-	if err := s.importLegacy(ctx, datasetName, ds, nil); err != nil {
+	if err := s.importLegacy(ctx, datasetName, ds, nil, true); err != nil {
 		return err
 	}
 	return s.kube.store(ctx, datasetName, ds, key, record)
@@ -149,7 +149,7 @@ func (s importingPublicationStore) remove(ctx context.Context, datasetName strin
 	for _, key := range keys {
 		removing[key] = true
 	}
-	if err := s.importLegacy(ctx, datasetName, ds, removing); err != nil {
+	if err := s.importLegacy(ctx, datasetName, ds, removing, true); err != nil {
 		return err
 	}
 	return s.kube.remove(ctx, datasetName, ds, keys)
@@ -163,12 +163,23 @@ func (s importingPublicationStore) forget(ctx context.Context, datasetName strin
 // those being removed), deletes the VolumePublications the resolution
 // dropped, then removes every ZFS record from the dataset. Callers hold the
 // volume lock.
-func (s importingPublicationStore) importLegacy(ctx context.Context, datasetName string, ds *truenas.Dataset, removing map[string]bool) error {
+//
+// forWrite is set when the import runs inside a store or remove: the caller
+// already decided its write on a locked read, and the import's own writes
+// and the caller's must compare against that read. Its read then does not
+// record versions (unless the dataset was never read), so a foreign write
+// made since the caller's read is reported as a conflict, not adopted. The
+// background import is its own decision and records them.
+func (s importingPublicationStore) importLegacy(ctx context.Context, datasetName string, ds *truenas.Dataset, removing map[string]bool, forWrite bool) error {
 	legacy, err := s.legacy.records(ctx, datasetName, ds)
 	if err != nil || len(legacy) == 0 {
 		return err
 	}
-	current, err := s.kube.lockedRecords(ctx, datasetName, ds)
+	read := s.kube.lockedRecords
+	if forWrite && s.kube.versions.observed(datasetName) {
+		read = s.kube.records
+	}
+	current, err := read(ctx, datasetName, ds)
 	if err != nil {
 		return err
 	}

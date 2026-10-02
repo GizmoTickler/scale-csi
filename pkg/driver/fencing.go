@@ -1009,6 +1009,10 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 		nodeID = blocking.Node
 	}
 	if revokeErr := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, nodeID, nil); revokeErr != nil {
+		if status.Code(revokeErr) == codes.Aborted {
+			// A record conflict: the CO's retry decides again from a fresh read.
+			return ds, records, revokeErr
+		}
 		return ds, records, status.Errorf(codes.Internal,
 			"revoke stale publication for node %s before granting node %s: %v", blocking.Node, requested.Node, revokeErr)
 	}
