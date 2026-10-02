@@ -21,8 +21,11 @@ type subsysFilterServer struct {
 	rejectFilter bool
 	// rejectCode is the error code of a rejection (default -32602, invalid
 	// params); any other code models a transient middleware failure.
-	rejectCode   int
-	ignoreFilter bool
+	rejectCode int
+	// rejectErrname, with rejectCode -32001, is the errno name middlewared
+	// stamps on the envelope.
+	rejectErrname string
+	ignoreFilter  bool
 }
 
 func (s *subsysFilterServer) calls(method string) []interface{} {
@@ -74,6 +77,14 @@ func (s *subsysFilterServer) start(t *testing.T) *Client {
 						code = -32602
 					}
 					resp.Error = &rpcError{Code: code, Message: "Invalid params"}
+					if code == -32001 && s.rejectErrname != "" {
+						// middlewared's envelope for an exception in the call:
+						// a datastore filter it cannot apply is a ValueError,
+						// reported as -32001 carrying EINVAL.
+						resp.Error = &rpcError{Code: code, Message: "Method call error", Data: map[string]interface{}{
+							"error": float64(22), "errname": s.rejectErrname, "reason": "invalid filter",
+						}}
+					}
 					break
 				}
 				var want float64 = -1
@@ -185,4 +196,21 @@ func TestNVMeoFAssociationListsKeepFilterAfterTransientError(t *testing.T) {
 	}
 	empty := []interface{}{}
 	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, subsysFilterFor(7), empty}, server.calls("nvmet.host_subsys.query"))
+}
+
+// A TrueNAS that cannot apply the nested filter raises in the datastore layer,
+// which middlewared reports as -32001 carrying EINVAL, not as -32602: that is
+// a rejection of the filter too, and is remembered.
+func TestNVMeoFAssociationListsRememberAnEINVALRejection(t *testing.T) {
+	ctx := context.Background()
+	server := &subsysFilterServer{rejectFilter: true, rejectCode: -32001, rejectErrname: "EINVAL"}
+	client := server.start(t)
+
+	for i := 0; i < 2; i++ {
+		hosts, err := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+		require.NoError(t, err)
+		require.Len(t, hosts, 1)
+	}
+	empty := []interface{}{}
+	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, empty}, server.calls("nvmet.host_subsys.query"))
 }

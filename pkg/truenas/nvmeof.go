@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	"k8s.io/klog/v2"
 )
@@ -232,6 +233,25 @@ func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
 	return hs, nil
 }
 
+// filterRejected is whether a filtered query's error rejects the filter
+// itself: -32602 (invalid params), or the -32001 envelope middlewared sends
+// when the datastore cannot apply it (a ValueError/KeyError, stamped EINVAL).
+// Anything else (too many concurrent calls, another errno) is transient.
+func filterRejected(apiErr *APIError) bool {
+	switch apiErr.Code {
+	case -32602:
+		return true
+	case -32001:
+		data, ok := apiErr.Data.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		errno, ok := envelopeErrno(data)
+		return ok && errno == syscall.EINVAL
+	}
+	return false
+}
+
 // subsysIDFilter is the server-side filter both association listings send.
 // NVMeoFHostSubsysFind already sends the same nested "subsys.id" filter.
 func subsysIDFilter(subsysID int) [][]interface{} {
@@ -243,8 +263,8 @@ func subsysIDFilter(subsysID int) [][]interface{} {
 // The filter is an optimisation only: callers still re-filter the rows
 // client-side, so a backend that ignores it returns the right answer. A
 // filtered call that fails with an API error (not a transport failure) is
-// retried once unfiltered. Only a rejection of the filter itself (-32602,
-// invalid params) is remembered so later calls skip the filtered attempt; a
+// retried once unfiltered. Only a rejection of the filter itself
+// (filterRejected) is remembered so later calls skip the filtered attempt; a
 // transient middleware error leaves the filter on for the next call.
 func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejected *atomic.Bool) (interface{}, error) {
 	if !rejected.Load() {
@@ -260,7 +280,7 @@ func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID i
 		if unfilteredErr != nil {
 			return nil, unfilteredErr
 		}
-		if apiErr.Code == -32602 && !rejected.Swap(true) {
+		if filterRejected(apiErr) && !rejected.Swap(true) {
 			klog.Warningf("%s rejected a subsys.id filter (%v); listing the whole table and filtering client-side from now on", method, err)
 		}
 		return result, nil
