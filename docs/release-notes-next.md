@@ -31,8 +31,22 @@ and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
   does not return the snapshot `clones` property through `pool.snapshot.query`
   or `zfs.resource.snapshot.query` (checked read-only on a live system: it is
   silently dropped, also for snapshots that do have clones), so the origin
-  scan stays the only authority. The scope is unchanged: a clone of another
-  volume's snapshot never blocks this volume's delete.
+  scan stays the only authority. A clone of another volume's snapshot never
+  blocks this volume's delete.
+- **Delete: a clone outside the CSI parent is now seen.** The origin scan
+  used to read only the datasets below the CSI parent, so a clone elsewhere
+  in the pool (a restore or backup target, an admin's `zfs clone`) was
+  missed: DeleteVolume deleted the share, ZFS then refused to destroy the
+  dataset, and the volume was left without a share. The scan (also used by
+  the tombstone reaper and promote) now reads every dataset of the pool with
+  one `zfs.resource.query` of the pool root, origin property only. Checked
+  read-only on a live TrueNAS 26.0 system: this sees the pool's internal
+  datasets that `pool.dataset.query` hides, among them a real clone whose
+  origin is in another parent, and costs about what the parent scan did (78
+  datasets in 0.39 s against 47 in 0.45 s). If the pool scan fails, the
+  delete fails and is retried; it never falls back to a narrower answer. On
+  an appliance without `zfs.resource.query` the scan stays parent-scoped,
+  with the old gap.
 - **Delete: the busy scans run when a delete fails, by default.**
   `zfs.observeBusyBeforeDelete` now takes a mode:
   - `on-failure` (the new default): the two observation-only scans
@@ -46,7 +60,10 @@ and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
   The default follows the record: over 30 days, 6,071 dataset deletes each
   ran both scans, and not one found an attachment or a process, or failed to
   answer. The `scale_csi_dataset_busy_observations_total` and
-  `..._errors_total` series now exist at zero from start-up.
+  `..._errors_total` series now exist at zero from start-up. A failure is
+  classified on its reason, not the dataset's name: a volume whose name
+  contains "snapshot" is still observed. `yes`/`no`/`on`/`off` are still
+  accepted as booleans.
 - **iSCSI: write and reload only when something changed.** A publish no
   longer re-stamps the target, extent and association IDs that are already
   set; the strict fence no longer rewrites an initiator group that already
@@ -57,6 +74,25 @@ and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
   if an earlier change is still owed a reload (its reload failed or never ran,
   or it predates this controller's start: the first iSCSI pass after a start
   reloads once). A create always reloads, and its ID stamp is always written.
+  A fence that revokes a node (an unpublish, a stale-grant revoke) always
+  reloads, even when it wrote nothing.
+
+  Two consequences:
+  - The record of what a reload covers is per controller process. It knows
+    nothing of changes another controller, or a previous process, wrote; the
+    first iSCSI pass after a start therefore reloads, and revokes always do.
+  - Out-of-band drift in what SCST has loaded (a target or initiator change
+    made outside the controller and not reloaded, or a reload done by hand
+    that failed) is no longer healed by every publish. A publish heals what it
+    compares (the target's groups, the initiator allowlist, the stored IDs)
+    and reloads when it writes; anything else is healed by the next
+    controller restart, whose first iSCSI pass reloads.
+
+### Other fixes
+
+- On TrueNAS 26.0, listing a volume's snapshots dropped a row that came back
+  without its dataset field; the dataset is now taken from the snapshot's
+  name. An empty listing reads as "no snapshots" to DeleteVolume.
 
 ### Rolling back to v1.23.0
 
