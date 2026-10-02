@@ -2156,6 +2156,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
 	defer d.releaseOperationLock(lockKey)
+	// Strict fencing at startup: converge this volume first if startup has not
+	// yet (startup_gate.go). The dataset is read below, after it.
+	if err := d.startupPublishGate(ctx, volumeID); err != nil {
+		return nil, err
+	}
 
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {

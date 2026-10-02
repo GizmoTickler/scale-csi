@@ -255,6 +255,12 @@ type Driver struct {
 	// reconcile loop has returned: later re-run requests are dropped instead of
 	// collecting in startupReconcilePending with nothing left to take them.
 	startupReconcileExited bool
+	// startupGateMu guards the per-volume publish gate (startup_gate.go):
+	// whether a pass has taken its VolumeAttachment snapshot, and the volumes
+	// that snapshot saw attached that have not converged since.
+	startupGateMu       sync.Mutex
+	startupGateSnapshot bool
+	startupGatePending  map[string]*startupFencingVolume
 
 	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
 	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
@@ -907,6 +913,12 @@ func (d *Driver) strictStartupControllerRPCBlocked(fullMethod string) bool {
 		return false
 	}
 	switch fullMethod {
+	case "/csi.v1.Controller/ControllerPublishVolume":
+		// Gated per volume inside the handler, under the volume lock
+		// (startupPublishGate): a volume that has converged, or that had no
+		// VolumeAttachment when startup took its snapshot, is published at
+		// once instead of waiting for every other volume.
+		return false
 	case "/csi.v1.Controller/ControllerGetCapabilities",
 		"/csi.v1.Controller/ValidateVolumeCapabilities",
 		"/csi.v1.Controller/GetCapacity",

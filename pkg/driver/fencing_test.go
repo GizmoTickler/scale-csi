@@ -3329,17 +3329,32 @@ func TestStrictStartupGateBlocksGrantRPCButKeepsProbeAndTeardownUsable(t *testin
 		return &csi.ControllerPublishVolumeResponse{}, nil
 	}
 
-	_, err := d.logInterceptor(context.Background(), &csi.ControllerPublishVolumeRequest{},
-		&grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ControllerPublishVolume"}, handler)
+	_, err := d.logInterceptor(context.Background(), &csi.CreateVolumeRequest{},
+		&grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/CreateVolume"}, handler)
 	require.Error(t, err)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
-	assert.False(t, handlerCalled, "strict startup must gate grants at the Unix-socket RPC boundary")
+	assert.False(t, handlerCalled, "strict startup must gate provisioning at the Unix-socket RPC boundary")
+
+	// ControllerPublishVolume is gated per volume inside the handler
+	// (startupPublishGate), so it passes the boundary...
+	_, err = d.logInterceptor(context.Background(), &csi.ControllerPublishVolumeRequest{},
+		&grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ControllerPublishVolume"}, handler)
+	require.NoError(t, err)
+	assert.True(t, handlerCalled)
+	// ...and the handler refuses it until startup has taken its snapshot.
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:a"})
+	require.NoError(t, err)
+	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId: "pvc-gated", NodeId: nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER}},
+	})
+	assert.Equal(t, codes.Unavailable, status.Code(err), "no snapshot yet: no publish")
 
 	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Identity/Probe"))
 	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/ControllerUnpublishVolume"),
 		"teardown must remain available to drain a transient duplicate VolumeAttachment")
 	d.ready.Store(true)
-	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/ControllerPublishVolume"))
+	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/CreateVolume"))
 }
 
 // FIX 4 regression: on a backend that omits the expanded hostnqn field, a

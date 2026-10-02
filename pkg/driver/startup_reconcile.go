@@ -350,6 +350,9 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 		ResetStartupFencingUnconvergedVolumes()
 		d.resetStartupQuarantine()
 	}
+	// Every volume this pass will converge holds its publishes in strict mode
+	// until it has (startupPublishGate); every other volume is free.
+	d.startupGateTrack(volumes, volumeIDs, targets == nil)
 	type volumeResult struct {
 		volumeID string
 		err      error
@@ -523,6 +526,23 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		return fmt.Errorf("startup reconcile volume %s: %w", volume.volumeID, errStartupVolumeBusy)
 	}
 	defer d.releaseOperationLock(lockKey)
+	if !d.startupGateStillPending(volume.volumeID) {
+		// A ControllerPublishVolume converged this volume under its lock after
+		// this pass took its snapshot (startupPublishGate).
+		return nil
+	}
+	if err := d.reconcileStartupFencingVolumeLocked(ctx, volume); err != nil {
+		return err
+	}
+	d.startupGateSettle(volume.volumeID, volume)
+	return nil
+}
+
+// reconcileStartupFencingVolumeLocked converges one volume's publication
+// records and backend fence from its snapshot attachments. The caller holds
+// the volume lock: a startup worker, or a ControllerPublishVolume of a volume
+// startup has not converged yet.
+func (d *Driver) reconcileStartupFencingVolumeLocked(ctx context.Context, volume *startupFencingVolume) error {
 	d.clearStartupQuarantineVolume(volume.volumeID)
 
 	// The initial list only schedules work. Rebuild the current attachment set
