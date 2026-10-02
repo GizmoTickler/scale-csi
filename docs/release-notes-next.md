@@ -30,7 +30,7 @@ that read Events see no difference between the two:
 No chart change: the node ClusterRole already allows creating and patching
 Events.
 
-## v1.18.0 (draft) — fewer TrueNAS calls on NVMe-oF, a cheaper restart
+## v1.19.0 — fewer TrueNAS calls on NVMe-oF, a cheaper restart
 
 Nothing to configure. The controller makes fewer calls to TrueNAS and to the
 Kubernetes API for the same work, and uses less memory. Counts below are the
