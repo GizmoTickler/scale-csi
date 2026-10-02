@@ -14,7 +14,7 @@ import (
 // canonicalization), costs no API call, and is replayed identically on the
 // already-exists path.
 func TestCreateVolumeRecordsNVMeoFDataPath(t *testing.T) {
-	const singlePathCalls = 11
+	const singlePathCalls = 9
 	tests := []struct {
 		name      string
 		param     *string

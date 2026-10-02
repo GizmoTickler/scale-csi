@@ -2105,8 +2105,8 @@ func TestDatasetResourceQueryTrueNAS26ShapeAndDetectionCache(t *testing.T) {
 				resp.Result = true
 			case datasetResourceQueryMethod:
 				options := req.Params[0].(map[string]interface{})
-				paths := options["paths"].([]interface{})
-				if len(paths) == 0 {
+				if _, read := options["get_user_properties"]; !read {
+					// Capability probe (scoped, no user properties): not a read.
 					probeCalls.Add(1)
 					resp.Result = []interface{}{}
 					break

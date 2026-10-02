@@ -102,14 +102,17 @@ func TestControllerPublishUnpublishGoldenAPICallCountsWithRecordsInKubernetes(t 
 		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("k-strict-nvme", node))
 		require.NoError(t, err)
 		// A first publish (not the cached republish the ZFS golden pins): the
-		// host is created, resolved and associated; no record write.
+		// host is created, resolved and associated; no record write. 8 calls
+		// (10 before the dead boundary list and the eager host lookup for the
+		// classification were dropped): classification list, one host lookup
+		// and create for the missing association, the create, the post-write list.
 		assertAPICallMethodMap(t, "strict NVMe-oF first publish", client, map[string]int{
 			"DatasetGet":                      1,
 			"NVMeoFNamespaceGet":              1,
 			"NVMeoFSubsystemGet":              1,
-			"NVMeoFHostFindByNQN":             2,
+			"NVMeoFHostFindByNQN":             1,
 			"NVMeoFHostCreate":                1,
-			"NVMeoFHostSubsysListBySubsystem": 3,
+			"NVMeoFHostSubsysListBySubsystem": 2,
 			"NVMeoFHostSubsysCreate":          1,
 		})
 	})
@@ -124,13 +127,13 @@ func TestControllerPublishUnpublishGoldenAPICallCountsWithRecordsInKubernetes(t 
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "k-strict-nvme-unpub", NodeId: node})
 		require.NoError(t, err)
-		// 9 on ZFS, minus the tombstone write and the record removal.
+		// 7 on ZFS, minus the tombstone write and the record removal: 5 (7
+		// before). A move (this plus a first publish elsewhere) is 13 calls.
 		assertAPICallMethodMap(t, "strict NVMe-oF unpublish", client, map[string]int{
 			"DatasetGet":                      1,
 			"NVMeoFNamespaceGet":              1,
 			"NVMeoFSubsystemGet":              1,
-			"NVMeoFHostSubsysListBySubsystem": 2,
-			"NVMeoFHostFindByNQN":             1,
+			"NVMeoFHostSubsysListBySubsystem": 1,
 			"NVMeoFHostSubsysDelete":          1,
 		})
 	})

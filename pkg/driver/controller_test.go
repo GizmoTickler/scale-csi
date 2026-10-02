@@ -923,7 +923,7 @@ func TestGetVolumeContextUsesProvidedDatasetWithoutQuery(t *testing.T) {
 		UserProperties: map[string]truenas.UserProperty{},
 	}
 
-	volumeContext, err := d.getVolumeContext(context.Background(), ds, ds.Name, ShareTypeNFS)
+	volumeContext, err := d.getVolumeContext(context.Background(), ds, ds.Name, ShareTypeNFS, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, "/mnt/pool/parent/vol-context", volumeContext["share"])
 	assert.Zero(t, mockClient.datasetGetCalls)

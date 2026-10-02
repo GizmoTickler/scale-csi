@@ -78,8 +78,8 @@ func TestSnapshotResourceQueryTrueNAS26FlatUserPropertiesAndDetectionCache(t *te
 				resp.Result = true
 			case snapshotResourceQueryMethod:
 				options := req.Params[0].(map[string]interface{})
-				paths := options["paths"].([]interface{})
-				if len(paths) == 0 {
+				if _, read := options["get_user_properties"]; !read {
+					// Capability probe (scoped, no user properties): not a read.
 					probeCalls.Add(1)
 					resp.Result = []interface{}{}
 					break
@@ -154,7 +154,7 @@ func TestSnapshotResourceQueryTrueNAS26RecursiveFilteringAndPagination(t *testin
 				resp.Result = true
 			case snapshotResourceQueryMethod:
 				options := req.Params[0].(map[string]interface{})
-				if len(options["paths"].([]interface{})) == 0 {
+				if _, read := options["get_user_properties"]; !read {
 					resp.Result = []interface{}{}
 					break
 				}
@@ -1168,7 +1168,7 @@ func TestSnapshotDelete_HasClones_TrueNAS26(t *testing.T) {
 				resp.Result = true
 			case snapshotResourceQueryMethod:
 				options := req.Params[0].(map[string]interface{})
-				if len(options["paths"].([]interface{})) == 0 {
+				if _, read := options["get_user_properties"]; !read {
 					resp.Result = []interface{}{} // detection probe
 					break
 				}
