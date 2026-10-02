@@ -1060,23 +1060,23 @@ func (m *BusyObservationMode) UnmarshalYAML(node *yaml.Node) error {
 		return fmt.Errorf("zfs.observeBusyBeforeDelete: expected true, false, %q, %q or %q",
 			BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever)
 	}
-	if node.Tag == "!!bool" {
-		var on bool
-		if err := node.Decode(&on); err != nil {
-			return fmt.Errorf("zfs.observeBusyBeforeDelete: %w", err)
-		}
-		if on {
-			*m = BusyObservationAlways
-		} else {
-			*m = BusyObservationNever
-		}
-		return nil
-	}
-	switch mode := BusyObservationMode(node.Value); mode {
-	case BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever:
+	switch mode := BusyObservationMode(node.Value); {
+	case node.Tag == "!!str" && (mode == BusyObservationAlways || mode == BusyObservationOnFailure || mode == BusyObservationNever):
 		*m = mode
 		return nil
 	default:
+		// Every boolean the earlier *bool field took: true/false, and the
+		// YAML 1.1 forms (yes/no/on/off, y/n) that yaml.v3 still decodes into
+		// a bool.
+		var on bool
+		if node.Decode(&on) == nil {
+			if on {
+				*m = BusyObservationAlways
+			} else {
+				*m = BusyObservationNever
+			}
+			return nil
+		}
 		return fmt.Errorf("zfs.observeBusyBeforeDelete: %q is not one of true, false, %q, %q, %q",
 			node.Value, BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever)
 	}

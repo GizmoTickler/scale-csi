@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -22,7 +23,7 @@ func (d *Driver) deleteDatasetWithBusyObservation(
 		d.observeDatasetBusy(ctx, datasetName, operation, "before")
 	}
 	err := d.truenasClient.DatasetDelete(ctx, datasetName, recursive, force)
-	if mode == BusyObservationOnFailure && busyObservationExplainsDeleteFailure(ctx, err) {
+	if mode == BusyObservationOnFailure && busyObservationExplainsDeleteFailure(ctx, datasetName, err) {
 		d.observeDatasetBusy(ctx, datasetName, operation, "after a failed")
 	}
 	return err
@@ -34,15 +35,21 @@ func (d *Driver) deleteDatasetWithBusyObservation(
 // a plain snapshot/children dependency refusal: that is the normal first
 // attempt for a volume with snapshots, and the scans cannot add to it. Every
 // other failure, a busy one or an unclassified one, is observed.
-func busyObservationExplainsDeleteFailure(ctx context.Context, err error) bool {
+//
+// The markers are matched against the failure's reason only: the dataset name
+// (quoted by ZFS, or as the caller passed it) is removed first, so a volume
+// named, say, "snapshot-restore" whose delete fails with an I/O error is still
+// observed.
+func busyObservationExplainsDeleteFailure(ctx context.Context, datasetName string, err error) bool {
 	if err == nil || truenas.IsNotFoundError(err) || ctx.Err() != nil {
 		return false
 	}
-	message := strings.ToLower(err.Error())
+	message := err.Error()
 	var apiErr *truenas.APIError
 	if errors.As(err, &apiErr) {
-		message = strings.ToLower(apiErr.FullError())
+		message = apiErr.FullError()
 	}
+	message = deleteFailureReason(message, datasetName)
 	if strings.Contains(message, "busy") || strings.Contains(message, "in use") {
 		return true
 	}
@@ -52,6 +59,19 @@ func busyObservationExplainsDeleteFailure(ctx context.Context, err error) bool {
 		}
 	}
 	return true
+}
+
+var quotedZFSName = regexp.MustCompile(`'[^']*'`)
+
+// deleteFailureReason lower-cases a delete failure and strips the names in it:
+// every single-quoted segment (ZFS quotes the dataset it could not destroy) and
+// any bare occurrence of the dataset's own name.
+func deleteFailureReason(message, datasetName string) string {
+	message = quotedZFSName.ReplaceAllString(message, "''")
+	if datasetName != "" {
+		message = strings.ReplaceAll(message, datasetName, "")
+	}
+	return strings.ToLower(message)
 }
 
 // observeDatasetBusy is observation-only by design: it never gates

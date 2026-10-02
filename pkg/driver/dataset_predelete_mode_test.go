@@ -28,7 +28,7 @@ func (c *failingDeleteClient) DatasetDelete(ctx context.Context, name string, re
 // otherwise; in always mode they run before the delete as before.
 func TestBusyObservationOnFailureRunsOnlyWhenTheDeleteFails(t *testing.T) {
 	ctx := context.Background()
-	busy := &truenas.APIError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{"reason": "[EBUSY] cannot destroy 'pool/parent/x': dataset is busy"}}
+	busy := &truenas.APIError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{"reason": "[EBUSY] cannot destroy 'pool/parent/snapshot-restore': dataset is busy"}}
 	for _, tc := range []struct {
 		name string
 		mode BusyObservationMode
@@ -41,6 +41,14 @@ func TestBusyObservationOnFailureRunsOnlyWhenTheDeleteFails(t *testing.T) {
 		{"on-failure, snapshot dependency", BusyObservationOnFailure, errors.New("dataset has dependent snapshots"), 0},
 		{"on-failure, already gone", BusyObservationOnFailure, &truenas.APIError{Code: 2, Message: "dataset does not exist (ENOENT)"}, 0},
 		{"on-failure, success", BusyObservationOnFailure, nil, 0},
+		// The dataset name is not the reason: a volume named "snapshot-..."
+		// failing with an I/O error is observed (quoted by ZFS, or bare).
+		{"on-failure, I/O error on a snapshot-named dataset", BusyObservationOnFailure,
+			errors.New("cannot destroy 'pool/parent/snapshot-restore': I/O error"), 1},
+		{"on-failure, bare snapshot-named dataset", BusyObservationOnFailure,
+			errors.New("failed to delete dataset pool/parent/snapshot-restore: I/O error"), 1},
+		{"on-failure, real dependency on a snapshot-named dataset", BusyObservationOnFailure,
+			errors.New("cannot destroy 'pool/parent/snapshot-restore': filesystem has dependent snapshots"), 0},
 		{"never, busy failure", BusyObservationNever, busy, 0},
 		{"always, busy failure", BusyObservationAlways, busy, 1},
 	} {
@@ -48,10 +56,11 @@ func TestBusyObservationOnFailureRunsOnlyWhenTheDeleteFails(t *testing.T) {
 			counting := newAPICallCountingClient()
 			client := &failingDeleteClient{apiCallCountingClient: counting, deleteErr: tc.err}
 			d := &Driver{config: &Config{ZFS: ZFSConfig{ObserveBusyBeforeDelete: tc.mode}}, truenasClient: client}
-			_, err := counting.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/x", Type: "VOLUME"})
+			const name = "pool/parent/snapshot-restore"
+			_, err := counting.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: name, Type: "VOLUME"})
 			require.NoError(t, err)
 			counting.resetCalls()
-			gotErr := d.deleteDatasetWithBusyObservation(ctx, "pool/parent/x", false, true, "DeleteVolume")
+			gotErr := d.deleteDatasetWithBusyObservation(ctx, name, false, true, "DeleteVolume")
 			assert.Equal(t, tc.err, gotErr, "the delete's own result is returned unchanged")
 			_, methods := counting.callSnapshot()
 			assert.Equal(t, tc.want, methods["DatasetAttachments"])
@@ -107,6 +116,13 @@ func TestObserveBusyBeforeDeleteConfigForms(t *testing.T) {
 		{"on-failure", BusyObservationOnFailure},
 		{`"on-failure"`, BusyObservationOnFailure},
 		{"never", BusyObservationNever},
+		// The YAML 1.1 booleans the earlier boolean field accepted.
+		{"yes", BusyObservationAlways},
+		{"on", BusyObservationAlways},
+		{"Yes", BusyObservationAlways},
+		{"no", BusyObservationNever},
+		{"off", BusyObservationNever},
+		{"OFF", BusyObservationNever},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
 			body := requiredTestConfig
