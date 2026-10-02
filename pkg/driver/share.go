@@ -121,6 +121,7 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	}
 	if initiatorID == 0 {
 		created, err := d.truenasClient.ISCSIInitiatorCreate(ctx, iscsiOwnedAllowAllInitiatorComment)
+		d.markISCSIChanged()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create allow-all iSCSI initiator group: %w", err)
 		}

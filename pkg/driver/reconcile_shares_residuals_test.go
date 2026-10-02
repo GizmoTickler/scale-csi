@@ -183,7 +183,7 @@ func TestDatasetBusyObservationFailureIsVisible(t *testing.T) {
 	processErrBefore := testutil.ToFloat64(datasetBusyObservationErrorsTotal.WithLabelValues("process"))
 
 	logged := captureDefaultVerbosityKlog(t, func() {
-		d.observeDatasetBusyBeforeDelete(ctx, "pool/parent/probe-volume", "DeleteVolume")
+		d.observeDatasetBusy(ctx, "pool/parent/probe-volume", "DeleteVolume", "before")
 	})
 
 	assert.Contains(t, logged, "Could not inspect dataset pool/parent/probe-volume attachments",
@@ -209,7 +209,7 @@ func TestDatasetBusyObservationQuietProbeMaterializesItsSeries(t *testing.T) {
 	}
 
 	datasetBusyObservationsTotal.Reset()
-	d.observeDatasetBusyBeforeDelete(ctx, "pool/parent/quiet-volume", "DeleteVolume")
+	d.observeDatasetBusy(ctx, "pool/parent/quiet-volume", "DeleteVolume", "before")
 
 	assert.Equal(t, 2, testutil.CollectAndCount(datasetBusyObservationsTotal, "scale_csi_dataset_busy_observations_total"),
 		"a successful, quiet probe must still materialize an observation series for BOTH kinds")

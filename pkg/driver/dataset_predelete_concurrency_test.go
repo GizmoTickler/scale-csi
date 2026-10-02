@@ -44,7 +44,7 @@ func TestObserveDatasetBusyBeforeDeleteRunsReadsConcurrently(t *testing.T) {
 	d := &Driver{truenasClient: client}
 
 	start := time.Now()
-	d.observeDatasetBusyBeforeDelete(context.Background(), "pool/parent/vol", "DeleteVolume")
+	d.observeDatasetBusy(context.Background(), "pool/parent/vol", "DeleteVolume", "before")
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("busy-observation reads ran sequentially (%v); they are independent and must overlap", elapsed)
 	}

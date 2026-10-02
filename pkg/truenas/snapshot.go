@@ -804,6 +804,14 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 		}
 		filtered := snapshots[:0]
 		for _, snap := range snapshots {
+			// A row without its dataset field is still this dataset's snapshot
+			// when its ID says so: an empty listing here would read as "no
+			// snapshots", which DeleteVolume trusts.
+			if snap.Dataset == "" {
+				if datasetPart, _, ok := strings.Cut(snap.ID, "@"); ok {
+					snap.Dataset = datasetPart
+				}
+			}
 			if snap.Dataset == dataset {
 				filtered = append(filtered, snap)
 			}

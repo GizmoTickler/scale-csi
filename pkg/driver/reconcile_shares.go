@@ -678,25 +678,33 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 		if mapping == nil {
 			continue
 		}
-		if delErr := d.truenasClient.ISCSITargetExtentDelete(ctx, mapping.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+		delErr := d.truenasClient.ISCSITargetExtentDelete(ctx, mapping.ID, true)
+		d.markISCSIChanged()
+		if delErr != nil && !truenas.IsNotFoundError(delErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target-extent %d: %w", mapping.ID, delErr))
 			return
 		}
 	}
 	if extent != nil {
-		if delErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+		delErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true)
+		d.markISCSIChanged()
+		if delErr != nil && !truenas.IsNotFoundError(delErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI extent %d: %w", extent.ID, delErr))
 			return
 		}
 	}
 	if target != nil {
-		if delErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+		delErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true)
+		d.markISCSIChanged()
+		if delErr != nil && !truenas.IsNotFoundError(delErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target %d: %w", target.ID, delErr))
 			return
 		}
 	}
 	if initiatorGroup != nil {
-		if delErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+		delErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID)
+		d.markISCSIChanged()
+		if delErr != nil && !truenas.IsNotFoundError(delErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI initiator group %d: %w", initiatorGroup.ID, delErr))
 			return
 		}

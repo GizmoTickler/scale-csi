@@ -1054,15 +1054,17 @@ func parseDatasetResource(data interface{}) (*Dataset, error) {
 	return ds, nil
 }
 
-// DatasetHasDependentClones reports whether any dataset in the same CSI parent was
-// cloned from a snapshot of datasetName. Snapshot clone projections are absent
-// on TrueNAS 26.0, but pool.dataset.query still exposes the origin property.
+// DatasetHasDependentClones reports whether any dataset was cloned from a
+// snapshot of datasetName. Snapshot clone projections are absent on TrueNAS
+// 26.0, so the answer comes from the datasets' origin property: across the
+// whole pool where the resource API is available (a clone can live anywhere in
+// its origin's pool), else across the CSI parent (see queryDatasetOrigins).
 func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
 	parent := path.Dir(datasetName)
 	if parent == "." || parent == "/" {
 		return false, fmt.Errorf("invalid dataset name %q", datasetName)
 	}
-	origins, err := c.queryDatasetOrigins(ctx, parent)
+	origins, err := c.queryDatasetOrigins(ctx, datasetName, parent)
 	if err != nil {
 		return false, err
 	}
@@ -1165,12 +1167,13 @@ func datasetPropertyInt64(property DatasetProperty) int64 {
 // (an admin's `zfs clone`, a replication/VolSync target, another driver
 // instance's volume) is still counted (GF2-fix/H3).
 //
-// Scope note, documented honestly: TrueNAS 26.0 exposes no `clones` property on
-// snapshots, so the only available authority is a dataset-origin query. It
-// covers the whole CSI PARENT subtree — every clone that can exist under the
-// driver's parent, managed or not. A clone living OUTSIDE the parent subtree is
-// invisible to every 26.0 API, so callers that mutate dependency structure
-// (promote) must treat that as a residual documented risk, not proven absence.
+// Scope note: TrueNAS 26.0 exposes no `clones` property on snapshots
+// (live-checked: requested, it is silently dropped), so the authority is a
+// dataset-origin query. Where zfs.resource.query is available it covers the
+// whole POOL, hidden internal datasets included, which is every place a clone
+// can live (ZFS clones never cross pools). Without it, pool.dataset.query
+// covers only the CSI PARENT subtree, and a clone outside the parent remains a
+// residual documented risk for callers that mutate dependency structure.
 func (c *Client) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
 	return c.snapshotDependentClones(ctx, snapshotID)
 }
@@ -1184,7 +1187,7 @@ func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string)
 	if !found || parent == "." || parent == "/" {
 		return nil, fmt.Errorf("invalid snapshot id %q", snapshotID)
 	}
-	origins, err := c.queryDatasetOrigins(ctx, parent)
+	origins, err := c.queryDatasetOrigins(ctx, datasetName, parent)
 	if err != nil {
 		return nil, err
 	}
@@ -1197,9 +1200,44 @@ func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string)
 	return clones, nil
 }
 
-// queryDatasetOrigins returns dataset name → origin (empty for non-clones) for
-// datasets below the configured CSI parent, using the projected origin property.
-func (c *Client) queryDatasetOrigins(ctx context.Context, parent string) (map[string]string, error) {
+// queryDatasetOrigins returns dataset name → origin (empty for non-clones).
+//
+// Where the dataset resource API is available it reads every dataset of
+// datasetName's POOL with only the origin property: one zfs.resource.query of
+// the pool root with get_children. Live-checked read-only on a TrueNAS 26.0
+// appliance: it returns the pool's internal datasets that pool.dataset.query
+// hides, among them a real clone whose origin is in another parent, at about
+// the cost of the parent-scoped pool.dataset.query it replaces (78 datasets in
+// 0.39 s against 47 in 0.45 s, most of it per-call overhead). pool.dataset.query
+// filtered on origin is not used: it hides those datasets, and it filters after
+// listing, so it costs the same. A failure here is returned (fail closed): a
+// narrower fallback could miss the very clone the caller asks about.
+//
+// The read stays the parent-scoped pool.dataset.query only when the resource
+// API is DETECTED absent (method not found). A capability probe that failed
+// transiently, or that this caller gave up waiting on, is not detection: the
+// scan then fails rather than quietly narrowing to the parent.
+func (c *Client) queryDatasetOrigins(ctx context.Context, datasetName, parent string) (map[string]string, error) {
+	available, detected := c.datasetResourceQueryStatus(ctx, datasetName)
+	if !detected {
+		return nil, fmt.Errorf("failed to query dataset origins: cannot tell whether the dataset resource API (zfs.resource.query) is available; refusing a parent-scoped scan that could miss a clone")
+	}
+	if available {
+		options := map[string]interface{}{
+			"paths":        resourceProbePaths(datasetName),
+			"get_children": true,
+			"properties":   []string{"origin"},
+		}
+		var raw []*rawDataset
+		if err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, options); err != nil {
+			return nil, fmt.Errorf("failed to query dataset origins: %w", err)
+		}
+		origins := make(map[string]string, len(raw))
+		for _, dataset := range rawDatasetsToDatasets(raw, true) {
+			origins[dataset.Name] = datasetPropertyString(dataset.Origin)
+		}
+		return origins, nil
+	}
 	filters := [][]interface{}{{"name", "^", strings.TrimSuffix(parent, "/") + "/"}}
 	options := map[string]interface{}{
 		"extra": map[string]interface{}{

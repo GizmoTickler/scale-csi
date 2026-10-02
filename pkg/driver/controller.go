@@ -1829,23 +1829,34 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// share. The share must be deleted before the dataset (extents block zvol
 	// deletion), so bailing after share deletion would leave a volume that
 	// still exists but is inaccessible, with no path that re-creates its share.
-	// The snapshot and dataset-origin checks each cost one query on every delete;
-	// the dependency-error fallback after DatasetDelete stays as a second line
-	// of defense.
-	hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
-	if cloneErr != nil {
-		return nil, status.Errorf(codes.Internal,
-			"failed to verify clone dependencies for volume %s before share deletion: %v", volumeID, cloneErr)
-	}
-	if hasDependentClones {
-		klog.Infof("Volume %s has a dependent clone, cannot delete", volumeID)
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"volume %s has dependent clones that must be deleted first", volumeID)
-	}
+	// The snapshot listing costs one query on every delete; the dependency-error
+	// fallback after DatasetDelete stays as a second line of defense.
 	snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
 	if snapErr != nil {
 		return nil, status.Errorf(codes.Internal,
 			"failed to verify snapshot dependencies for volume %s before share deletion: %v", volumeID, snapErr)
+	}
+	// The dependent-clone check is scoped to exactly this volume's own
+	// snapshots: a clone depends on this volume only through one of them. With
+	// none, there is nothing a clone can depend on, because ZFS keeps a cloned
+	// snapshot until its last clone is gone (a deferred destroy included), so
+	// the listing above already proves the answer and the parent-wide origin
+	// scan (one O(N) query) is skipped. TrueNAS 26.0 does not project the
+	// snapshot `clones` property through any API (live-checked: requested, it is
+	// silently dropped), so with snapshots present the origin scan remains the
+	// only authority. The same listing already decides the foreign-snapshot
+	// guard below, so this adds no new trust in it.
+	if len(snapshots) > 0 {
+		hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
+		if cloneErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"failed to verify clone dependencies for volume %s before share deletion: %v", volumeID, cloneErr)
+		}
+		if hasDependentClones {
+			klog.Infof("Volume %s has a dependent clone, cannot delete", volumeID)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"volume %s has dependent clones that must be deleted first", volumeID)
+		}
 	}
 	snapshots, snapErr = d.deleteOrphanedInternalCloneSourceSnapshots(ctx, snapshots)
 	if snapErr != nil {
@@ -1964,7 +1975,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		// Re-check dataset origins for a clone created after the up-front guard,
 		// then classify snapshots. This remains authoritative on TrueNAS 26.0,
 		// where snapshot clone projections are empty.
-		hasDependentClones, cloneErr = d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
+		hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
 		if cloneErr != nil {
 			return nil, status.Errorf(codes.Internal,
 				"failed to verify clone dependencies for volume %s: %v", volumeID, cloneErr)
