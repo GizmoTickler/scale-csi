@@ -243,3 +243,55 @@ func TestServiceReloadDebouncerChangeDuringReloadStaysOwed(t *testing.T) {
 	require.Error(t, failing.RequestReload(context.Background(), "iscsitarget"))
 	assert.True(t, failing.ReloadOwed("iscsitarget"))
 }
+
+// An idempotent CreateVolume replay that rotates the CHAP secret re-keys the
+// backend auth peer, which SCST serves only after a reload: the auth write
+// marks the change, so the replay's otherwise unchanged share pass reloads.
+func TestISCSICHAPRotationOnReplayReloads(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+	d.config.ISCSI.CHAP.Enabled = true
+	_, err := d.CreateVolume(ctx, apiCallCountCHAPVolumeRequest("chap-rotate"))
+	require.NoError(t, err)
+
+	client.resetCalls()
+	_, err = d.CreateVolume(ctx, apiCallCountCHAPVolumeRequest("chap-rotate"))
+	require.NoError(t, err)
+	_, methods := client.callSnapshot()
+	require.Zero(t, methods["ISCSIAuthUpdate"], "a same-secret replay rotates nothing")
+	assert.Zero(t, methods["ServiceReload"], "and reloads nothing")
+
+	client.resetCalls()
+	rotated := apiCallCountCHAPVolumeRequest("chap-rotate")
+	rotated.Secrets["password"] = "rotatedpw1234"
+	_, err = d.CreateVolume(ctx, rotated)
+	require.NoError(t, err)
+	_, methods = client.callSnapshot()
+	require.Equal(t, 1, methods["ISCSIAuthUpdate"], "the replay rotates the peer")
+	assert.Equal(t, 1, methods["ServiceReload"], "the rotation is reloaded")
+}
+
+// The share delete path and the allow-all initiator group create write iSCSI
+// objects too: each leaves a reload owed, so the next pass reloads.
+func TestISCSIDeleteAndInitiatorCreateLeaveAReloadOwed(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("owed-delete", "iscsi"))
+	require.NoError(t, err)
+	require.False(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"), "the create's reload covered it")
+
+	require.NoError(t, d.deleteISCSIShare(ctx, "pool/parent/owed-delete"))
+	assert.True(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"), "a share delete leaves a reload owed")
+
+	require.NoError(t, d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"))
+	require.False(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"))
+	for id := range client.MockClient.ISCSIInitiators {
+		delete(client.MockClient.ISCSIInitiators, id)
+	}
+	d.invalidateISCSITargetGroup()
+	_, err = d.resolveISCSITargetGroup(ctx)
+	require.NoError(t, err)
+	assert.True(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"), "creating the allow-all initiator group leaves a reload owed")
+}

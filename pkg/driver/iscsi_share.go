@@ -788,22 +788,30 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 	var errs []error
 	for _, association := range associations {
-		if deleteErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("target-extent %d: %w", association.ID, deleteErr))
 		}
 	}
 	if extent != nil {
-		if deleteErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("extent %d: %w", extent.ID, deleteErr))
 		}
 	}
 	if target != nil {
-		if deleteErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("target %d: %w", target.ID, deleteErr))
 		}
 	}
 	if initiatorGroup != nil {
-		if deleteErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("initiator group %d: %w", initiatorGroup.ID, deleteErr))
 		}
 	}

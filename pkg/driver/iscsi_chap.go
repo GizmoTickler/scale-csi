@@ -471,6 +471,7 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 		// stale secret. The tag stays stable, so target groups need no change.
 		updated, updateErr := d.truenasClient.ISCSIAuthUpdate(
 			ctx, peer.ID, secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
+		d.markISCSIChanged()
 		if updateErr != nil {
 			// iscsi.auth.update carries secret/peersecret as call arguments; the
 			// backend error can echo them and this status lands on the tenant's PVC.
@@ -488,6 +489,7 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 	}
 
 	peer, err := d.truenasClient.ISCSIAuthCreate(ctx, tag, secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
+	d.markISCSIChanged()
 	if err != nil {
 		// iscsi.auth.create carries secret/peersecret as call arguments; same
 		// forwarding channel as the rotation above.
@@ -547,7 +549,9 @@ func (d *Driver) reconcileDuplicateAuthPeers(ctx context.Context, tag int, ours 
 	}
 	// A concurrent controller won the tag. Drop our duplicate.
 	klog.Warningf("duplicate iSCSI auth peers for tag %d; keeping winner id=%d, deleting our id=%d", tag, winner.ID, ours.ID)
-	if delErr := d.truenasClient.ISCSIAuthDelete(ctx, ours.ID); delErr != nil {
+	delErr := d.truenasClient.ISCSIAuthDelete(ctx, ours.ID)
+	d.markISCSIChanged()
+	if delErr != nil {
 		klog.Warningf("failed to delete losing duplicate iSCSI auth peer id=%d for tag %d: %v", ours.ID, tag, delErr)
 	}
 	if winner.User != username || winner.CredentialFingerprint != requestFingerprint {
