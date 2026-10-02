@@ -1,6 +1,34 @@
-# Release notes — next (v1.24.0 draft)
+# Release notes — next (v1.24.1 draft)
 
-## v1.24.0 (draft) — fewer TrueNAS calls to delete a volume and to move an iSCSI volume
+## v1.24.1 (draft) — an NVMe-oF head disk outlives its first path
+
+Nothing to configure. One fix, in both node agents (the Rust agent, the
+default since v1.21.0, and the Go node plugin).
+
+- **A namespace's NQN is read through its block device.** With native NVMe
+  multipath, the head disk `nvmeXnY` is named after the subsystem instance,
+  which the kernel takes from the controller that founded the subsystem. The
+  node read the subsystem NQN from `/sys/class/nvme/nvmeX`, that founding
+  controller. Once that one path went away while the others stayed live, the
+  lookup failed, although the volume itself kept working. The node now reads
+  `/sys/block/nvmeXnY/device/subsysnqn` first: for a multipath head that is
+  the subsystem, which lives as long as any path does; for a non-multipath
+  namespace it is the controller. The controller lookup stays as the
+  fallback. Until the lost path came back, in both agents:
+  - session GC skipped its NVMe-oF pass on that node, so no orphaned session
+    was collected (nothing was disconnected wrongly);
+  - a raw-block NodePublishVolume, a block NodeExpandVolume and a repeated
+    NodeStageVolume of that volume failed with `Internal` ("failed to
+    identify ...");
+  - the `fast_io_fail_tmo` convergence passed over that subsystem's
+    controllers.
+
+### Rolling back to v1.24.0
+
+Nothing to undo. Rolled back, the lookup reads the founding controller again.
+
+
+## v1.24.0 — fewer TrueNAS calls to delete a volume and to move an iSCSI volume
 
 One default changes (`zfs.observeBusyBeforeDelete`, below); nothing else to
 configure.
