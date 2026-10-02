@@ -326,7 +326,7 @@ truenas:
   # Maximum concurrent API requests to TrueNAS (default: 10)
   # Lower this if TrueNAS becomes overloaded with many PVC operations.
   # Writes hold at most 4 of these slots (one fewer than this value when it is
-  # 4 or less), so reads always have one; nvmet writes hold at most 1.
+  # 4 or less), so reads always have one.
   maxConcurrentRequests: 10
 
   # Size of the TrueNAS WebSocket connection pool the controller multiplexes API

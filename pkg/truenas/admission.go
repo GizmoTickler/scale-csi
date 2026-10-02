@@ -2,7 +2,6 @@ package truenas
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 )
@@ -69,31 +68,27 @@ const agingStep = 2 * time.Second
 // serves writes largely one at a time, so a burst of writes holding every
 // slot used to keep the reads that publish and unpublish start with queued
 // behind them. Writes now hold at most writeCapacity of the slots, which
-// leaves the rest to reads; among the writes, nvmet writes (each one reloads
-// the kernel nvmet target on the appliance) hold at most one, so this client
-// never sends two of them at once.
+// leaves the rest to reads.
+//
+// nvmet writes have no lane of their own. A one-slot nvmet lane was tried:
+// with the middleware serving writes one at a time anyway, it let lower-class
+// writes take the write slots a waiting publish's nvmet write could not, and
+// in the latency model a drain under a write burst took 91 s instead of 24 s.
 type admissionLane int
 
 const (
 	laneRead admissionLane = iota
 	laneWrite
-	laneNVMetWrite
 )
 
 // defaultWriteCapacity is how many slots writes may hold at once.
 const defaultWriteCapacity = 4
-
-// nvmetWriteCapacity is how many slots nvmet writes may hold at once.
-const nvmetWriteCapacity = 1
 
 // laneForMethod classifies a middleware method. A method not known to be a
 // read is a write.
 func laneForMethod(method string) admissionLane {
 	if isReadAPIMethod(method) {
 		return laneRead
-	}
-	if strings.HasPrefix(method, "nvmet.") {
-		return laneNVMetWrite
 	}
 	return laneWrite
 }
@@ -120,11 +115,9 @@ type admissionGate struct {
 	mu       sync.Mutex
 	capacity int
 	inUse    int
-	// writeCapacity bounds the slots held by writes (nvmet ones included);
-	// writes and nvmetWrites count them.
+	// writeCapacity bounds the slots held by writes; writes counts them.
 	writeCapacity int
 	writes        int
-	nvmetWrites   int
 	seq           uint64
 	waiting       []*admissionWaiter
 	now           func() time.Time
@@ -198,25 +191,13 @@ func (g *admissionGate) laneHasRoomLocked(lane admissionLane) bool {
 	if g.inUse >= g.capacity {
 		return false
 	}
-	switch lane {
-	case laneWrite:
-		return g.writes < g.writeCapacity
-	case laneNVMetWrite:
-		return g.writes < g.writeCapacity && g.nvmetWrites < nvmetWriteCapacity
-	default:
-		return true
-	}
+	return lane != laneWrite || g.writes < g.writeCapacity
 }
 
 func (g *admissionGate) takeLocked(lane admissionLane) {
 	g.inUse++
-	switch lane {
-	case laneRead:
-	case laneWrite:
+	if lane == laneWrite {
 		g.writes++
-	case laneNVMetWrite:
-		g.writes++
-		g.nvmetWrites++
 	}
 }
 
@@ -225,15 +206,10 @@ func (g *admissionGate) putLocked(lane admissionLane) {
 		panic("truenas: request slot released without being acquired")
 	}
 	g.inUse--
-	switch lane {
-	case laneRead:
-	case laneWrite:
+	if lane == laneWrite {
 		g.writes--
-	case laneNVMetWrite:
-		g.writes--
-		g.nvmetWrites--
 	}
-	if g.writes < 0 || g.nvmetWrites < 0 {
+	if g.writes < 0 {
 		panic("truenas: write slot released without being acquired")
 	}
 }

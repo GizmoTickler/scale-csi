@@ -25,9 +25,9 @@ func TestAdmissionLaneForMethod(t *testing.T) {
 		"sharing.nfs.update":                   laneWrite,
 		"service.reload":                       laneWrite,
 		"iscsi.target.create":                  laneWrite,
-		"nvmet.host_subsys.create":             laneNVMetWrite,
-		"nvmet.port_subsys.delete":             laneNVMetWrite,
-		"nvmet.subsys.update":                  laneNVMetWrite,
+		"nvmet.host_subsys.create":             laneWrite,
+		"nvmet.port_subsys.delete":             laneWrite,
+		"nvmet.subsys.update":                  laneWrite,
 	} {
 		assert.Equal(t, want, laneForMethod(method), method)
 	}
@@ -97,16 +97,12 @@ func TestAdmissionGateWriteCapacityLeavesReadsASlot(t *testing.T) {
 }
 
 // concurrentRPCServer answers each request on its own goroutine. Methods in
-// hold block until release is closed; it tracks the most nvmet writes in
-// flight at once.
+// hold block until release is closed.
 type concurrentRPCServer struct {
-	mock       *mockWSServer
-	hold       map[string]bool
-	release    chan struct{}
-	inFlight   atomic.Int32
-	nvmetNow   atomic.Int32
-	nvmetMost  atomic.Int32
-	nvmetDelay time.Duration
+	mock     *mockWSServer
+	hold     map[string]bool
+	release  chan struct{}
+	inFlight atomic.Int32
 }
 
 func startConcurrentRPCServer(t *testing.T, hold map[string]bool) *concurrentRPCServer {
@@ -129,17 +125,6 @@ func startConcurrentRPCServer(t *testing.T, hold map[string]bool) *concurrentRPC
 				default:
 					s.inFlight.Add(1)
 					defer s.inFlight.Add(-1)
-					if laneForMethod(req.Method) == laneNVMetWrite {
-						now := s.nvmetNow.Add(1)
-						for {
-							most := s.nvmetMost.Load()
-							if now <= most || s.nvmetMost.CompareAndSwap(most, now) {
-								break
-							}
-						}
-						time.Sleep(s.nvmetDelay)
-						defer s.nvmetNow.Add(-1)
-					}
 					if s.hold[req.Method] {
 						<-s.release
 					}
@@ -191,28 +176,6 @@ func TestAdmissionPublishQueryIsNotQueuedBehindAWriteBurst(t *testing.T) {
 	}
 }
 
-// This client never sends two nvmet writes at once: each reloads the nvmet
-// target on the appliance, which serializes them anyway.
-func TestAdmissionNVMetWritesAreNeverSentInParallel(t *testing.T) {
-	server := startConcurrentRPCServer(t, nil)
-	server.nvmetDelay = 20 * time.Millisecond
-	client := server.client(t, 10)
-	var wg sync.WaitGroup
-	for _, method := range []string{
-		"nvmet.host_subsys.create", "nvmet.host_subsys.delete", "nvmet.port_subsys.create",
-		"nvmet.namespace.create", "nvmet.subsys.update", "nvmet.host.create",
-	} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, err := client.Call(context.Background(), method, map[string]interface{}{})
-			assert.NoError(t, err)
-		}()
-	}
-	wg.Wait()
-	assert.Equal(t, int32(1), server.nvmetMost.Load(), "nvmet writes in flight at once")
-}
-
 // A call backing off between retries of a connection failure holds no
 // slot: another call takes it meanwhile.
 func TestAdmissionRetryBackoffReleasesTheSlot(t *testing.T) {
@@ -244,4 +207,33 @@ func TestAdmissionRetryBackoffReleasesTheSlot(t *testing.T) {
 	client.semaphore.release()
 	require.Error(t, <-failing)
 	assert.Zero(t, client.semaphore.inFlight())
+}
+
+// A publish's write takes the next free write slot ahead of default writes,
+// whatever the writes in flight are: no sub-lane lets a lower class pass it.
+// (A one-slot nvmet lane did, and in the latency model a drain under a write
+// burst slowed from 24 s to 91 s.)
+func TestAdmissionGateAttachWriteIsNotPassedByDefaultWrites(t *testing.T) {
+	g := newAdmissionGateWithLanes(10, 4, AdmissionMetrics{})
+	attach := WithPriority(context.Background(), PriorityAttach)
+	background := WithPriority(context.Background(), PriorityDefault)
+	require.NoError(t, g.acquireLane(attach, laneForMethod("nvmet.host_subsys.create")))
+	for range 3 {
+		require.NoError(t, g.acquireLane(background, laneForMethod("pool.dataset.update")))
+	}
+	order := make(chan string, 2)
+	go func() {
+		if g.acquireLane(background, laneForMethod("pool.dataset.update")) == nil {
+			order <- "default write"
+		}
+	}()
+	waitQueued(t, g, 1)
+	go func() {
+		if g.acquireLane(attach, laneForMethod("nvmet.host_subsys.delete")) == nil {
+			order <- "publish nvmet write"
+		}
+	}()
+	waitQueued(t, g, 2)
+	g.releaseLane(laneWrite) // a default write finishes
+	assert.Equal(t, "publish nvmet write", <-order)
 }

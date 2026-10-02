@@ -61,8 +61,8 @@ read: the client caches the port after that.
   later page reports a volume's capacity as the walk's first page listed it,
   so a volume expanded mid-walk shows its new size on the next walk. And a
   zvol whose volsize cannot be read is reported with capacity 0 (unknown)
-  instead of the pool's free space. A volume deleted while a walk is in
-  flight is left out of it, as before.
+  instead of the pool's free space. A volume this controller deletes while a
+  walk is in flight is left out of it, as before.
 - **Concurrent listings share one read.** The startup readers that list every
   managed dataset at about the same time (the stale-record sweep, the orphan
   reconcile, the publication import, the unlock reconciler, ListVolumes) now
