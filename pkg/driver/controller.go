@@ -2144,6 +2144,16 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	// An attach-class hold (operation_lock.go): a snapshot of the volume goes
+	// on alongside; another publish or unpublish of it, or an exclusive
+	// operation, is waited for, up to attachLockWait.
+	lockKey := volumeLockKey(volumeID)
+	if !d.acquireOperationLockModeWait(ctx, lockKey, lockAttach, attachLockWait) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	}
+	defer d.releaseOperationLockMode(lockKey, lockAttach)
+	// The node identity is resolved under the lock, after any wait for it:
+	// a grant never uses an identity older than the lock it is made under.
 	identity, err := d.resolveControllerNodeIdentity(ctx, nodeID)
 	if err != nil {
 		return nil, err
@@ -2157,14 +2167,6 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
-	// An attach-class hold (operation_lock.go): a snapshot of the volume goes
-	// on alongside; another publish or unpublish of it, or an exclusive
-	// operation, is waited for, up to attachLockWait.
-	lockKey := volumeLockKey(volumeID)
-	if !d.acquireOperationLockModeWait(ctx, lockKey, lockAttach, attachLockWait) {
-		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
-	}
-	defer d.releaseOperationLockMode(lockKey, lockAttach)
 	// Strict fencing at startup: converge this volume first if startup has not
 	// yet (startup_gate.go). The dataset is read below, after it.
 	if gateErr := d.startupPublishGate(ctx, volumeID); gateErr != nil {

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -260,4 +264,53 @@ func TestLockExclusiveOperationsStillConflictWithSharedHolders(t *testing.T) {
 	_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-3", SourceVolumeId: "exclusive"})
 	assert.Equal(t, codes.Aborted, status.Code(err), "a snapshot alongside an exclusive holder")
 	d.releaseOperationLock(key)
+}
+
+// A publish that waited for its volume's lock resolves the node's identity
+// after the wait: a node whose CSINode changed NQN while the publish waited
+// is granted its current NQN, never the one read before the lock.
+func TestLockPublishResolvesTheNodeIdentityAfterTheWait(t *testing.T) {
+	setAttachLockWait(t, 5*time.Second)
+	ctx := context.Background()
+	d, gated := newLockTestVolume(t, "identity-after-wait")
+	d.name = "csi.scale.io"
+	csiNodeFor := func(nqn string) *storagev1.CSINode {
+		nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: nqn})
+		require.NoError(t, err)
+		return &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}, Spec: storagev1.CSINodeSpec{
+			Drivers: []storagev1.CSINodeDriver{{Name: "csi.scale.io", NodeID: nodeID}},
+		}}
+	}
+	kube := kubernetesfake.NewSimpleClientset(csiNodeFor("nqn.2014-08.org.nvmexpress:uuid:old"))
+	d.eventRecorder = &EventRecorder{clientset: kube}
+
+	key := volumeLockKey("identity-after-wait")
+	require.True(t, d.acquireOperationLock(key))
+	errs := make(chan error, 1)
+	go func() {
+		// A legacy plain node ID: the NQN comes from the CSINode.
+		_, err := d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+			VolumeId: "identity-after-wait", NodeId: "worker-a",
+			VolumeCapability: &csi.VolumeCapability{
+				AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+				AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+			},
+			VolumeContext: map[string]string{"node_attach_driver": "nvmeof"},
+		})
+		errs <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // the publish is waiting for the lock
+	_, err := kube.StorageV1().CSINodes().Update(ctx, csiNodeFor("nqn.2014-08.org.nvmexpress:uuid:new"), metav1.UpdateOptions{})
+	require.NoError(t, err)
+	d.releaseOperationLock(key)
+	require.NoError(t, <-errs)
+
+	subsystemIDText, err := gated.MockClient.DatasetGetUserProperty(ctx, "pool/parent/identity-after-wait", PropNVMeoFSubsystemID)
+	require.NoError(t, err)
+	subsystemID, err := strconv.Atoi(subsystemIDText)
+	require.NoError(t, err)
+	associations, err := gated.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
+	require.NoError(t, err)
+	require.Len(t, associations, 1)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:uuid:new", associations[0].HostNQN)
 }
