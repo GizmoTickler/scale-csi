@@ -3069,7 +3069,12 @@ func unmountFully(ctx context.Context, path, what string) error {
 	if unmountErr != nil {
 		klog.Warningf("Failed to unmount %s: %v", what, unmountErr)
 	}
-	mounted, checkErr := util.IsMountedWithContext(ctx, path)
+	// The check runs on its own short budget: a slow unmount that succeeded
+	// may have spent the RPC's deadline, and an unanswered check would fail
+	// the call although nothing is mounted any more.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), util.GetConfig().MountTimeout)
+	defer cancel()
+	mounted, checkErr := util.IsMountedWithContext(checkCtx, path)
 	switch {
 	case checkErr != nil && unmountErr != nil:
 		klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)

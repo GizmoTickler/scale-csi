@@ -551,7 +551,10 @@ pub(crate) async fn unmount_fully(
     if let Err(unmount) = &unmounted {
         warn!("Failed to unmount {what}: {unmount:#}");
     }
-    match (state.mounter.is_mounted(path, deadline).await, unmounted) {
+    // The check runs on the mount timeout alone: a slow unmount that
+    // succeeded may have spent the RPC's deadline, and an unanswered check
+    // would fail the call although nothing is mounted any more.
+    match (state.mounter.is_mounted(path, None).await, unmounted) {
         (Ok(false), Err(_)) => {
             info!("{} {path} is not mounted, proceeding with cleanup", capitalize(what));
             Ok(())

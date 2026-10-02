@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -114,4 +115,41 @@ func TestRemoveMountPoint(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(full, "sub"), 0o750))
 	require.ErrorIs(t, removeMountPoint(full), errMountPointNotEmpty)
 	assert.DirExists(t, filepath.Join(full, "sub"))
+}
+
+// spentAfterUnmount is an RPC context whose deadline is spent by the time the
+// unmount returns: it reports DeadlineExceeded once the fake umount has run
+// (the fake leaves <path>.fake-unmounted beside the path).
+type spentAfterUnmount struct {
+	context.Context
+	marker string
+}
+
+func (c spentAfterUnmount) Err() error {
+	if _, err := os.Stat(c.marker); err == nil {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func (c spentAfterUnmount) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+// A slow unmount that succeeded but spent the RPC's deadline: the post-unmount
+// check runs on its own budget, so the call does not fail with Internal
+// although nothing is mounted any more.
+func TestNodeUnpublishChecksTheMountAfterASlowUnmountOnItsOwnBudget(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "mount", "umount")
+	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "mounted")
+	targetPath := filepath.Join(t.TempDir(), "pod", "mount")
+	require.NoError(t, os.MkdirAll(targetPath, 0o750))
+	ctx := spentAfterUnmount{Context: context.Background(), marker: targetPath + ".fake-unmounted"}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	_, err := d.NodeUnpublishVolume(ctx, &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "pvc-nfs-1",
+		TargetPath: targetPath,
+	})
+	require.NoError(t, err)
+	assert.FileExists(t, targetPath+".fake-unmounted", "the unmount ran")
+	assert.NoDirExists(t, targetPath)
 }

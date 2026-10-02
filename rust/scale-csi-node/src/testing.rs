@@ -38,6 +38,11 @@ pub struct HostState {
     /// The NFS version an NFS mount negotiates (shown as `vers=`); 4.2 when
     /// unset. A version 3 mount shows as `nfs`, any other as `nfs4`.
     pub nfs_version: Option<String>,
+    /// The RPC's deadline is spent once a command with this prefix has run:
+    /// any later command bounded by the deadline is refused, as the real
+    /// runner refuses one whose deadline has passed.
+    pub deadline_spent_after: Option<String>,
+    deadline_spent: bool,
     pub calls: Vec<String>,
 }
 
@@ -119,10 +124,23 @@ impl FakeHost {
 
 #[tonic::async_trait]
 impl Runner for FakeHost {
-    async fn run(&self, program: &str, args: &[&str], _: Limits) -> std::io::Result<Output> {
+    async fn run(&self, program: &str, args: &[&str], limits: Limits) -> std::io::Result<Output> {
         let mut host = self.0.lock().unwrap();
         let call = format!("{program} {}", args.join(" "));
         host.calls.push(call.clone());
+        if host.deadline_spent && limits.rpc_deadline.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("deadline passed before running {program}"),
+            ));
+        }
+        if host
+            .deadline_spent_after
+            .as_ref()
+            .is_some_and(|prefix| call.starts_with(prefix.as_str()))
+        {
+            host.deadline_spent = true;
+        }
         if host.failing.iter().any(|prefix| call.starts_with(prefix.as_str())) {
             return Ok(Output {
                 code: Some(32),

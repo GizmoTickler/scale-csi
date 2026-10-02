@@ -841,3 +841,24 @@ async fn unstage_finds_the_share_in_mountinfo_when_findmnt_fails() {
     assert!(!n.host.is_mounted(&staging));
     assert_no_session_commands(&n);
 }
+
+/// A slow unmount that succeeded but spent the RPC's deadline: the
+/// post-unmount check runs on the mount timeout alone, so the call does not
+/// fail with Internal although nothing is mounted any more.
+#[tokio::test]
+async fn the_check_after_a_slow_unmount_has_its_own_budget() {
+    let n = nfs_node(NFS_ON);
+    let target = n.path("pods/p1/volumes/kubernetes.io~csi/pv/mount");
+    std::fs::create_dir_all(&target).unwrap();
+    n.host.mount(&target, SOURCE, "nfs4");
+    n.host.0.lock().unwrap().deadline_spent_after = Some(format!("umount {target}"));
+    let req = csi::NodeUnpublishVolumeRequest {
+        volume_id: VOLUME.into(),
+        target_path: target.clone(),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    node_unpublish(&n.state, &req, Some(deadline))
+        .await
+        .expect("unpublished although the deadline is spent");
+    assert!(!n.host.is_mounted(&target) && !exists(&target));
+}
