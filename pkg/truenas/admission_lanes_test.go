@@ -125,9 +125,11 @@ func startConcurrentRPCServer(t *testing.T, hold map[string]bool) *concurrentRPC
 				case "system.info":
 					resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-25.10.0", "hostname": "truenas-test"}
 				default:
-					s.inFlight.Add(1)
-					defer s.inFlight.Add(-1)
+					// Only held calls are counted: an unheld call's
+					// decrement can land after its caller has the answer.
 					if s.hold[req.Method] {
+						s.inFlight.Add(1)
+						defer s.inFlight.Add(-1)
 						<-s.release
 					}
 				}

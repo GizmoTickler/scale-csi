@@ -1,6 +1,13 @@
-# Release notes — next (v1.23.0 draft)
+# Release notes — next (v1.23.1 draft)
 
-## v1.23.0 (draft) — snapshots and publishes no longer turn each other away
+## v1.23.1 — v1.23.0, released
+
+v1.23.0's tag build failed on a race in one admission test (the mock server
+counted a finished query as in flight), so v1.23.0 published no images or
+chart. v1.23.1 is the same controller with that test fixed; everything in
+the v1.23.0 section below ships in v1.23.1.
+
+## v1.23.0 — snapshots and publishes no longer turn each other away
 
 Nothing to configure. Three changes to how the controller schedules its own
 work, and one fix to ListVolumes.
