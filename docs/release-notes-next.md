@@ -10,8 +10,8 @@ portals, records in Kubernetes.
 
 | | 30 volumes | 300 | 1,000 |
 |---|---|---|---|
-| Restart, everything in place | 1.4 s → 0.3 s | 13.7 s → 1.1 s | 50 s → 3.1 s |
-| 30-volume drain overlapping a restart (10 moves at 30 volumes) | 15.9 s → 6.1 s | 66 s → 18.2 s | 131 s → 18.4 s |
+| Restart, everything in place | 0.9 s → 0.2 s | 9.1 s → 1.1 s | 35 s → 3.1 s |
+| 30-volume drain overlapping a restart (10 moves at 30 volumes) | 10.6 s → 6.1 s | 41 s → 18.2 s | 101 s → 18.4 s |
 
 - **Per-volume readiness for publishes.** With strict fencing a
   ControllerPublishVolume no longer waits until every attached volume in the
