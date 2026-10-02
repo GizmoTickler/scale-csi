@@ -24,8 +24,9 @@ func TestDeleteVolumeLogsDatasetAttachmentsAndProcessesAndProceeds(t *testing.T)
 	d := &Driver{
 		config: &Config{
 			DriverName: "org.scale.csi.nfs",
-			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+			// zfs.observeBusyBeforeDelete: always (true) scans before the delete.
+			ZFS: ZFSConfig{DatasetParentName: "pool/parent", ObserveBusyBeforeDelete: BusyObservationAlways},
+			NFS: NFSConfig{ShareHost: "192.0.2.10"},
 		},
 		truenasClient: client,
 	}
@@ -64,8 +65,9 @@ func TestDeleteVolumeDatasetActivityQueryErrorsDoNotFailDelete(t *testing.T) {
 	d := &Driver{
 		config: &Config{
 			DriverName: "org.scale.csi.nfs",
-			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+			// zfs.observeBusyBeforeDelete: always (true) scans before the delete.
+			ZFS: ZFSConfig{DatasetParentName: "pool/parent", ObserveBusyBeforeDelete: BusyObservationAlways},
+			NFS: NFSConfig{ShareHost: "192.0.2.10"},
 		},
 		truenasClient: client,
 	}
@@ -92,6 +94,7 @@ func TestReconcileVolumeReapLogsDatasetActivityAndProceeds(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false,
 		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")}, nil,
 	)
+	d.config.ZFS.ObserveBusyBeforeDelete = BusyObservationAlways
 	old := time.Now().Add(-48 * time.Hour)
 	addReconcileDataset(client, "live-volume", old, true, 100)
 	addReconcileDataset(client, "busy-orphan", old, true, 100)

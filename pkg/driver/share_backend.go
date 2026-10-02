@@ -25,9 +25,11 @@ type ShareBackend interface {
 	// CreateShare creates the share for a dataset. freshlyCreated skips
 	// guaranteed-miss idempotency lookups; zvolReady indicates the zvol was
 	// returned by DatasetCreate or the clone readiness wait completed;
-	// finalProperties carries stamps NFS folds into its share-ID write (block
-	// protocols ignore them and are stamped separately).
-	CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error
+	// finalProperties carries CreateVolume's final stamps: NFS writes them with
+	// its share ID; the block protocols fold their resource IDs into the map,
+	// which CreateVolume then writes. res, when non-nil, receives the objects
+	// the create made so the same request's VolumeContext reuses them.
+	CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string, res *fenceResolution) error
 	// DeleteShare removes the share for a dataset.
 	DeleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string) error
 	// ApplyFence converges the backend's host allowlist to the published set.
@@ -44,8 +46,9 @@ type ShareBackend interface {
 	// writing the deny-all sentinel (which would self-fence the live node).
 	ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, hasDeferredActiveISCSI bool, res *fenceResolution) error
 	// VolumeContext populates the protocol-specific publish context keys onto
-	// volumeContext (which already carries node_attach_driver).
-	VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error
+	// volumeContext (which already carries node_attach_driver). res, when
+	// non-nil, carries objects this request already resolved or created.
+	VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, res *fenceResolution) error
 }
 
 // backendForShareType returns the ShareBackend for shareType, or nil for an

@@ -2,6 +2,7 @@
 package truenas
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -632,6 +633,7 @@ type ClientConfig struct {
 	HeartbeatInterval    time.Duration        // Interval for WebSocket heartbeat (default: 30s)
 	MaxConnections       int                  // Maximum number of concurrent connections (default: 5)
 	MaxConcurrentReqs    int                  // Maximum number of concurrent API requests (default: 10)
+	AdmissionMetrics     AdmissionMetrics     // Optional: queueing observations of the request slots
 	LazyConnect          bool                 // Skip eager connection; connect on first API use (node-only mode)
 	MetricsRecorder      MetricsRecorder      // Optional callback for recording request metrics
 	PendingDepthRecorder PendingDepthRecorder // Optional callback for in-flight request depth
@@ -731,7 +733,7 @@ type Client struct {
 	config                      *ClientConfig
 	pool                        []*Connection
 	next                        uint64                      // For round-robin selection
-	semaphore                   chan struct{}               // Limits concurrent requests to prevent TrueNAS overload
+	semaphore                   *admissionGate              // Limits concurrent requests to prevent TrueNAS overload; admits by priority and operation age
 	metricsRecorder             MetricsRecorder             // Optional callback for recording request metrics
 	pendingDepthRecorder        PendingDepthRecorder        // Optional callback for in-flight request depth
 	replicationJobAbortRecorder ReplicationJobAbortRecorder // Optional callback for successful job aborts
@@ -786,6 +788,16 @@ type Client struct {
 	// reload probes both verbs.
 	serviceReloadResolved  atomic.Bool
 	serviceReloadUseLegacy atomic.Bool
+
+	// nvmet.host_subsys.query and nvmet.port_subsys.query are asked to filter
+	// by subsys.id server-side. If a backend ever rejects that filter while
+	// the unfiltered query works, remember it so later calls go straight to
+	// the whole-table read instead of paying a rejected call first. Results
+	// are always re-filtered client-side either way.
+	// When the server last rejected the subsys.id filter (unix nanoseconds,
+	// 0 for never); see queryBySubsystem.
+	hostSubsysServerFilterRejected atomic.Int64
+	portSubsysServerFilterRejected atomic.Int64
 
 	dispatcher *jobDispatcher
 
@@ -908,7 +920,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	client := &Client{
 		config:                      cfg,
 		pool:                        make([]*Connection, cfg.MaxConnections),
-		semaphore:                   make(chan struct{}, cfg.MaxConcurrentReqs),
+		semaphore:                   newAdmissionGateWithMetrics(cfg.MaxConcurrentReqs, cfg.AdmissionMetrics),
 		metricsRecorder:             cfg.MetricsRecorder,
 		pendingDepthRecorder:        cfg.PendingDepthRecorder,
 		replicationJobAbortRecorder: cfg.ReplicationJobAbortRecorder,
@@ -1378,6 +1390,12 @@ func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, gener
 	// and get a response before the read deadline expires.
 	const readDeadlineInterval = 45 * time.Second
 
+	// One frame buffer for the life of this read loop: each message is read
+	// whole into it and decoded with json.Unmarshal, instead of a
+	// json.Decoder that grows and copies its own buffer per message. The
+	// decoded rpcResponse copies what it keeps (RawMessage fields copy their
+	// bytes), so the buffer is free for the next frame.
+	var frame bytes.Buffer
 	for {
 		if !c.isGenerationActive(generation) {
 			return
@@ -1389,7 +1407,7 @@ func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, gener
 		}
 
 		var resp rpcResponse
-		if err := conn.ReadJSON(&resp); err != nil {
+		if err := readFrameJSON(conn, &frame, &resp); err != nil {
 			// Check if this is a timeout - if so, just loop again to check connection state
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
@@ -1733,15 +1751,22 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		}
 	}
 
-	// Acquire semaphore slot (limit concurrent requests)
-	select {
-	case c.semaphore <- struct{}{}:
-		// Got a slot, continue
-	case <-ctx.Done():
+	// Acquire a request slot (limit concurrent requests) in the method's lane
+	// (laneForMethod). Waiters are admitted by priority, then by the age of
+	// the operation they belong to; see WithPriority and WithOperationStart.
+	lane := laneForMethod(method)
+	if err := c.semaphore.acquireLane(ctx, lane); err != nil {
 		abandonProbe()
-		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", ctx.Err())
+		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", err)
 	}
-	defer func() { <-c.semaphore }() // Release slot when done
+	// The slot is let go while the call backs off between retries, and taken
+	// again, in the same lane and at the same priority, for the next attempt.
+	holding := true
+	defer func() {
+		if holding {
+			c.semaphore.releaseLane(lane)
+		}
+	}()
 
 	maxRetries := c.config.APIRetryMaxAttempts
 	var lastErr error
@@ -1883,6 +1908,9 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 
 		// Don't retry on last attempt or if context is done
 		if attempt < maxRetries-1 {
+			// A backing-off call holds no slot: other calls use it meanwhile.
+			c.semaphore.releaseLane(lane)
+			holding = false
 			timer := time.NewTimer(retryDelay)
 			select {
 			case <-timer.C:
@@ -1904,6 +1932,15 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 				}
 				return nil, finalErr
 			}
+			if err := c.semaphore.acquireLane(ctx, lane); err != nil {
+				abandonProbe()
+				finalErr := fmt.Errorf("context canceled during retry: %w", err)
+				if c.metricsRecorder != nil {
+					c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
+				}
+				return nil, finalErr
+			}
+			holding = true
 		}
 	}
 
@@ -2236,4 +2273,35 @@ func (c *Client) CheckNVMeoFSupport(ctx context.Context) error {
 
 	klog.V(4).Infof("TrueNAS SCALE version %s supports NVMe-oF", info.Version)
 	return nil
+}
+
+// maxRetainedFrameBuffer bounds the frame buffer a read loop keeps between
+// messages: a large listing's buffer is released rather than pinned for the
+// life of the connection.
+const maxRetainedFrameBuffer = 1 << 20
+
+// readFrameJSON reads the next websocket message whole into buf and decodes
+// it into v. It returns the same errors conn.ReadJSON did: NextReader's
+// (timeouts included), io.ErrUnexpectedEOF for a truncated message, and the
+// JSON decode error.
+func readFrameJSON(conn *websocket.Conn, buf *bytes.Buffer, v interface{}) error {
+	_, reader, err := conn.NextReader()
+	if err != nil {
+		return err
+	}
+	buf.Reset()
+	if _, err = buf.ReadFrom(reader); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	if buf.Len() == 0 {
+		return io.ErrUnexpectedEOF
+	}
+	err = json.Unmarshal(buf.Bytes(), v)
+	if buf.Cap() > maxRetainedFrameBuffer {
+		*buf = bytes.Buffer{}
+	}
+	return err
 }

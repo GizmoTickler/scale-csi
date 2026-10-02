@@ -111,8 +111,9 @@ type Driver struct {
 	// Kubernetes event recorder
 	eventRecorder *EventRecorder
 
-	// Operation lock to prevent concurrent operations on same volume
-	operationLock sync.Map
+	// Per-key operation locks (operation_lock.go): a volume's lock is held
+	// exclusively, or in the compatible attach and data modes.
+	operationLocks operationLockTable
 
 	// NOTE (GF2-fix3/B1-a): there is deliberately NO Driver-level cache of the NAS
 	// civil timezone. The round-2 implementation kept one with its own one-hour
@@ -141,6 +142,11 @@ type Driver struct {
 	snapshotPageCache     []*truenas.Snapshot
 	snapshotPageCacheTime time.Time
 
+	// managedListingMu guards managedListing, the managed-dataset listing in
+	// flight that concurrent callers share (listAllManagedDatasets).
+	managedListingMu sync.Mutex
+	managedListing   *managedListingCall
+
 	// ListVolumes paging cache (P-3): the name-sorted managed-dataset listing
 	// fetched at the START of a paging walk (empty starting token), served to
 	// that walk's continuation pages within a short TTL. pool.dataset.query
@@ -152,9 +158,22 @@ type Driver struct {
 	// above: the cache feeds only read-only CSI listing pages, an empty
 	// starting token always refetches, and no delete/authorization decision
 	// ever reads it.
-	volumePageCacheMu   sync.Mutex
-	volumePageCache     []*truenas.Dataset
+	volumePageCacheMu sync.Mutex
+	volumePageCache   []listedVolume // the walk's frozen listing, sorted by name
+	// volumePageDeleted is when DeleteVolume removed each volume this
+	// controller deleted. A listing that began at or before that time may
+	// still hold the volume, so its pages leave it out. Entries no listing
+	// can need any more are pruned (pruneListedVolumeDeletes).
+	volumePageDeleted   map[string]time.Time
 	volumePageCacheTime time.Time
+	// volumePageCacheStart is when the cached view's listing began reading.
+	volumePageCacheStart time.Time
+	// volumePageListings are the ListVolumes listings in flight, each with
+	// the earliest time its rows can date from.
+	volumePageListings map[*volumeListing]struct{}
+	// unknownVolsizeLogged is the zvols ListVolumes has warned about once
+	// for an unreadable volsize.
+	unknownVolsizeLogged sync.Map
 
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
@@ -235,19 +254,35 @@ type Driver struct {
 	startupReconcileWg      sync.WaitGroup
 	startupReconcileOnce    sync.Once
 	startupReconcileSignal  chan struct{}
-	// startupReconcileQuarantineCount is the number of volumes
-	// quarantineStaleStartupFencingVolume (C11) carved out of the MOST RECENT
-	// reconcilePublishedAttachments pass. Reset to 0 at the same point that
-	// pass calls ResetStartupFencingUnconvergedVolumes (before any worker can
-	// observe it) and read by startStartupAttachmentReconcile immediately
-	// after that pass returns, so it never needs its own lock: exactly one
-	// pass is ever in flight for a given Driver. A quarantine is a DEFERRAL,
-	// not an abandonment — strict mode still latches readiness true on a
-	// quarantine-only pass, but must keep this field's reader from exiting
-	// the reconcile goroutine, since only that goroutine's later passes (woken
-	// by requestStartupAttachmentReconcile, e.g. from
-	// revokeStalePublicationRecord) can ever converge the quarantined volume.
-	startupReconcileQuarantineCount atomic.Int64
+	// startupReconcileTargetsMu guards startupReconcilePending and
+	// startupQuarantined.
+	startupReconcileTargetsMu sync.Mutex
+	// startupReconcilePending is the set of datasets a re-run signal named
+	// (a deferred fence, a revoked stale record) that no pass has taken yet.
+	// A signal wakes the loop, which re-runs exactly these volumes.
+	startupReconcilePending map[string]struct{}
+	// startupQuarantined maps each volume quarantineStaleStartupFencingVolume
+	// (C11) carved out to its dataset, across passes: a full pass replaces the
+	// set, a targeted pass replaces only its own volumes' entries. A
+	// quarantine is a DEFERRAL, not an abandonment — strict mode still latches
+	// readiness true on a quarantine-only pass, but the reconcile goroutine
+	// must not exit while this set is non-empty, since only its later passes
+	// (woken by requestStartupAttachmentReconcile, e.g. from
+	// revokeStalePublicationRecord) can ever converge a quarantined volume.
+	startupQuarantined map[string]startupQuarantine
+	// startupReconcileExited is set (under startupReconcileTargetsMu) when the
+	// reconcile loop has returned: later re-run requests are dropped instead of
+	// collecting in startupReconcilePending with nothing left to take them.
+	startupReconcileExited bool
+	// startupLockWatch, while the startup diff reads, records every volume
+	// lock held or taken (startup_diff.go).
+	startupLockWatch atomic.Pointer[startupLockWatch]
+	// startupGateMu guards the per-volume publish gate (startup_gate.go):
+	// whether a pass has taken its VolumeAttachment snapshot, and the volumes
+	// that snapshot saw attached that have not converged since.
+	startupGateMu       sync.Mutex
+	startupGateSnapshot bool
+	startupGatePending  map[string]*startupFencingVolume
 
 	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
 	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
@@ -277,6 +312,13 @@ type Driver struct {
 	capacityStopped bool
 	capacityCancel  context.CancelFunc
 	capacityWg      sync.WaitGroup
+
+	// The background import of publication records left on ZFS; the same
+	// mutex + terminal-flag pattern as the capacity loop.
+	publicationImportStateMu sync.Mutex
+	publicationImportStopped bool
+	publicationImportCancel  context.CancelFunc
+	publicationImportWg      sync.WaitGroup
 
 	// Controller-side poll of the durable last-reap record on .csi-bookkeeping.
 	// The delete-capable pass runs in the ephemeral CronJob; this loop is what
@@ -310,13 +352,21 @@ type Driver struct {
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
 	stalePublicationRecordsSeen sync.Map
-	fencingDeferredLogs         sync.Map
+	// publicationStore holds publication records; nil means the ZFS store.
+	publicationStore publicationStore
+	// publicationCacheRef is the store's watch, for Stop() to end; it races
+	// Run()'s startup, hence atomic.
+	publicationCacheRef atomic.Pointer[publicationCache]
+	fencingDeferredLogs sync.Map
 
 	// Track when orphaned sessions were first seen (for grace period). The
 	// protocol maps must remain independent: a cleanup pass may only retire
 	// stale observations from its own enumeration.
 	orphanedISCSISessionsSeen sync.Map // Key: IQN, Value: first seen time
 	orphanedNVMeSessionsSeen  sync.Map // Key: NQN, Value: first seen time
+	// nvmeSessions records the NQNs this node plugin connected; NVMe-oF
+	// session GC disconnects only those (nil: GC skips NVMe-oF).
+	nvmeSessions *sessionRegistry
 
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
@@ -424,8 +474,12 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		// done) hangs node startup indefinitely and the pod never becomes
 		// serviceable. commandTimeouts.nvme is already the configured budget
 		// for every other nvme-cli invocation this driver makes.
+		identityNetworks, networksErr := parseNodeIdentityNetworks(cfg.Config.NFS.NodeIdentityNetworks)
+		if networksErr != nil {
+			return nil, networksErr
+		}
 		identityCtx, identityCancel := context.WithTimeout(context.Background(), util.GetConfig().NVMeTimeout)
-		identity := discoverNodeIdentity(identityCtx, cfg.NodeID)
+		identity := discoverNodeIdentity(identityCtx, cfg.NodeID, identityNetworks)
 		identityCancel()
 		identity = nodeIdentityForEnabledProtocols(identity, cfg.Config)
 		var identityErr error
@@ -433,6 +487,19 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		if identityErr != nil {
 			return nil, fmt.Errorf("node startup identity cannot be encoded within CSI's %d-byte node_id limit: %w",
 				maxCSINodeIDBytes, identityErr)
+		}
+		for _, ip := range nodeIdentityDroppedIPs(identity, identityNetworks, encodedNodeID) {
+			klog.Warningf("nfs.nodeIdentityNetworks address %s does not fit in CSI's %d-byte node_id and is left out: the controller cannot grant it, so NFS mounts from it will be refused", ip, maxCSINodeIDBytes)
+		}
+	}
+
+	var nvmeSessions *sessionRegistry
+	if cfg.RunNode {
+		dir := nvmeSessionRegistryDir(cfg.Endpoint)
+		var regErr error
+		if nvmeSessions, regErr = newSessionRegistry(dir); regErr != nil {
+			klog.Warningf("Session GC: NVMe-oF session registry unavailable (%v); NVMe-oF sessions will not be garbage collected", regErr)
+			nvmeSessions = nil
 		}
 	}
 
@@ -472,6 +539,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			MaxConcurrentReqs:           cfg.Config.TrueNAS.MaxConcurrentRequests,
 			MetricsRecorder:             RecordTrueNASRequest,
 			PendingDepthRecorder:        SetTrueNASPendingCalls,
+			AdmissionMetrics:            TrueNASAdmissionMetrics(),
 			ReplicationJobAbortRecorder: RecordReplicationJobAborted,
 			CircuitBreaker:              cbConfig,
 			APIRetryMaxAttempts:         cfg.Config.Resilience.Retry.MaxAttempts,
@@ -518,6 +586,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		nodeID:                 cfg.NodeID,
 		encodedNodeID:          encodedNodeID,
 		endpoint:               cfg.Endpoint,
+		nvmeSessions:           nvmeSessions,
 		runController:          cfg.RunController,
 		runNode:                cfg.RunNode,
 		config:                 cfg.Config,
@@ -552,6 +621,12 @@ func (d *Driver) Run() error {
 		}
 	} else {
 		addr = u.Host
+	}
+
+	// Decided once, before anything serves: a controller told to keep records
+	// in Kubernetes that cannot stops here.
+	if storeErr := d.selectPublicationStore(context.Background()); storeErr != nil {
+		return storeErr
 	}
 
 	// Create listener
@@ -651,6 +726,7 @@ func (d *Driver) Run() error {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
+		d.startPublicationImport()
 		SetReconcileDeleteEnabled(d.config != nil && d.config.Reconcile.Delete.Enabled)
 		d.startTombstoneReapRecordPoll()
 	}
@@ -686,7 +762,11 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
+	d.stopPublicationImport()
 	d.stopTombstoneReapRecordPoll()
+	if publicationCache := d.publicationCacheRef.Load(); publicationCache != nil {
+		publicationCache.close()
+	}
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {
@@ -744,6 +824,21 @@ func shutdownAuxServers(healthServer *HealthServer, debugServer *DebugServer) {
 	}
 }
 
+// truenasAdmissionContext tells the TrueNAS client how to order this RPC's
+// requests when they queue for a request slot: attach and detach first (a pod
+// is waiting), deletes last, and within a class the oldest RPC first, so a burst
+// completes in arrival order instead of all at once at the end.
+func truenasAdmissionContext(ctx context.Context, fullMethod string, start time.Time) context.Context {
+	ctx = truenas.WithOperationStart(ctx, start)
+	switch fullMethod {
+	case csi.Controller_ControllerPublishVolume_FullMethodName, csi.Controller_ControllerUnpublishVolume_FullMethodName:
+		return truenas.WithPriority(ctx, truenas.PriorityAttach)
+	case csi.Controller_DeleteVolume_FullMethodName, csi.Controller_DeleteSnapshot_FullMethodName:
+		return truenas.WithPriority(ctx, truenas.PriorityDelete)
+	}
+	return ctx
+}
+
 // logInterceptor is a gRPC interceptor for logging requests with request IDs and timing.
 func (d *Driver) logInterceptor(
 	ctx context.Context,
@@ -790,7 +885,10 @@ func (d *Driver) logInterceptor(
 
 	// Log a cloned request with any CSI secrets structurally removed. The
 	// original request is left untouched for the RPC handler.
-	klog.V(5).Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
+	// Guarded: the clone is built only when V(5) is on, not on every RPC.
+	if requestLog := klog.V(5); requestLog.Enabled() {
+		requestLog.Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
+	}
 
 	// Kubernetes Pod readiness does not stop CSI sidecars in the same Pod from
 	// using the Unix socket. During strict startup convergence, enforce the gate
@@ -802,7 +900,7 @@ func (d *Driver) logInterceptor(
 	if d.strictStartupControllerRPCBlocked(info.FullMethod) {
 		err = status.Error(codes.Unavailable, "strict fencing startup reconciliation has not converged; retry this controller operation")
 	} else {
-		resp, err = handler(ctx, req)
+		resp, err = handler(truenasAdmissionContext(ctx, info.FullMethod, startTime), req)
 	}
 
 	// Calculate duration
@@ -837,6 +935,12 @@ func (d *Driver) strictStartupControllerRPCBlocked(fullMethod string) bool {
 		return false
 	}
 	switch fullMethod {
+	case "/csi.v1.Controller/ControllerPublishVolume":
+		// Gated per volume inside the handler, under the volume lock
+		// (startupPublishGate): a volume that has converged, or that had no
+		// VolumeAttachment when startup took its snapshot, is published at
+		// once instead of waiting for every other volume.
+		return false
 	case "/csi.v1.Controller/ControllerGetCapabilities",
 		"/csi.v1.Controller/ValidateVolumeCapabilities",
 		"/csi.v1.Controller/GetCapacity",
@@ -885,18 +989,6 @@ func requestWithoutSecrets(req interface{}) interface{} {
 		reflected.Clear(secrets)
 	}
 	return cloned
-}
-
-// acquireOperationLock acquires a lock for the given operation key.
-// Returns false if the lock is already held.
-func (d *Driver) acquireOperationLock(key string) bool {
-	_, loaded := d.operationLock.LoadOrStore(key, struct{}{})
-	return !loaded
-}
-
-// releaseOperationLock releases the lock for the given operation key.
-func (d *Driver) releaseOperationLock(key string) {
-	d.operationLock.Delete(key)
 }
 
 // GetTrueNASClient returns the TrueNAS API client.
@@ -1230,6 +1322,17 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 	if len(targetAddrs) == 0 {
 		targetAddrs = []string{d.config.NVMeoF.TransportAddress}
 	}
+	// Ownership: only sessions this plugin connected (recorded at NodeStage)
+	// are collectable. Another initiator's session to the same portals looks
+	// exactly like a leaked one; without the record GC cannot tell them apart
+	// and must leave it alone.
+	reg := d.nvmeSessions
+	if reg == nil {
+		klog.Warningf("Session GC: skipping NVMe-oF GC: no session registry to prove which sessions this plugin connected")
+		return
+	}
+	listed := make(map[string]struct{})
+	var expectedSet map[string]struct{}
 	d.gcSessions(ctx, gracePeriod, dryRun, sessionGCProtocol{
 		name:        "NVMe-oF",
 		metricLabel: "nvmeof",
@@ -1268,14 +1371,78 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 				}
 				if !inScope {
 					klog.V(5).Infof("Session GC: skipping session %s (no path matches configured addresses %v; paths: %v)", session.NQN, targetAddrs, session.Addresses)
+				} else if !reg.has(session.NQN) {
+					inScope = false
+					klog.V(4).Infof("Session GC: skipping session %s: not connected by this plugin (no registry record)", session.NQN)
 				}
+				listed[session.NQN] = struct{}{}
 				out = append(out, gcSession{id: session.NQN, inScope: inScope})
 			}
 			return out, nil
 		},
-		expected:   d.getExpectedNVMeoFNQNs,
-		disconnect: gcDisconnectNVMeoF,
+		expected: func() map[string]struct{} {
+			expectedSet = d.getExpectedNVMeoFNQNs()
+			// Staged volumes' sessions are this plugin's: record them, so a
+			// session staged before the registry existed (or whose record
+			// was lost) becomes collectable once it is orphaned.
+			if !dryRun {
+				for nqn := range expectedSet {
+					if err := reg.record(nqn); err != nil {
+						klog.Warningf("Session GC: %v", err)
+					}
+				}
+			}
+			return expectedSet
+		},
+		disconnect: func(nqn string) error {
+			if err := gcDisconnectNVMeoF(nqn); err != nil {
+				return err
+			}
+			if err := reg.forget(nqn); err != nil {
+				klog.Warningf("Session GC: %v", err)
+			}
+			return nil
+		},
 	})
+	if !dryRun && expectedSet != nil {
+		pruneSessionRegistry(reg, listed, expectedSet, gracePeriod)
+	}
+}
+
+// pruneSessionRegistry forgets records whose session no longer exists and is
+// not staged. A record younger than gracePeriod is kept: NodeStage writes it
+// before connecting, so a young record without a session may be a stage in
+// progress.
+func pruneSessionRegistry(reg *sessionRegistry, listed, expected map[string]struct{}, gracePeriod time.Duration) {
+	entries, err := reg.entries()
+	if err != nil {
+		klog.Warningf("Session GC: list session registry: %v", err)
+		return
+	}
+	for nqn, recorded := range entries {
+		if _, live := listed[nqn]; live {
+			continue
+		}
+		if _, staged := expected[nqn]; staged {
+			continue
+		}
+		if time.Since(recorded) < gracePeriod {
+			continue
+		}
+		if err := reg.forget(nqn); err != nil {
+			klog.Warningf("Session GC: %v", err)
+		}
+	}
+}
+
+// nvmeSessionRegistryDir places the NVMe-oF session registry beside the CSI
+// socket: the plugin's own host directory, which outlives plugin restarts.
+func nvmeSessionRegistryDir(endpoint string) string {
+	socket := strings.TrimPrefix(strings.TrimPrefix(endpoint, "unix://"), "unix:")
+	if socket == "" || !filepath.IsAbs(socket) {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(socket), "sessions", "nvmeof")
 }
 
 func nvmeSessionMatchesTransportAddress(sessionAddress, targetAddress string) bool {

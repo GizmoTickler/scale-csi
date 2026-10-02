@@ -47,6 +47,8 @@ var (
 	nodeUnmount                 = util.UnmountWithContext
 	nodeCheckISCSIMultipath     = util.CheckISCSIDeviceMultipathOwnership
 	nodeISCSIRescan             = util.ISCSIRescanSessionWithContext
+	nodeMultipathPaths          = util.MultipathPaths
+	nodeMultipathResize         = util.MultipathResizeMapWithContext
 	nodeNVMeRescan              = util.NVMeRescanWithContext
 	nodeDeviceSizePollTimeout   = 5 * time.Second
 	nodeDeviceSizePollInterval  = 200 * time.Millisecond
@@ -148,13 +150,21 @@ func accessTypeAtPath(path string) (nodeAccessType, error) {
 	if err != nil {
 		return "", err
 	}
-	if info.Mode().IsRegular() {
+	return accessTypeForMode(path, info.Mode())
+}
+
+// accessTypeForMode classifies a publish target. A raw-block target is the
+// regular file kubelet creates, but once published the device node is bind
+// mounted over it and stat reports a block device: both are raw block, or
+// every replay of a live raw-block publication fails.
+func accessTypeForMode(path string, mode os.FileMode) (nodeAccessType, error) {
+	switch {
+	case mode.IsRegular(), mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0:
 		return nodeAccessBlock, nil
-	}
-	if info.IsDir() {
+	case mode.IsDir():
 		return nodeAccessMount, nil
 	}
-	return "", fmt.Errorf("path %s has unsupported type %s", path, info.Mode())
+	return "", fmt.Errorf("path %s has unsupported type %s", path, mode)
 }
 
 func (d *Driver) stageRecord(target string) (nodeMountRecord, bool) {
@@ -234,7 +244,7 @@ func stageSourceIdentity(shareType ShareType, volumeContext map[string]string) (
 	}
 }
 
-func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeContext map[string]string) error {
+func (d *Driver) verifyStageDeviceSource(ctx context.Context, volumeID, devicePath string, shareType ShareType, volumeContext map[string]string) error {
 	switch shareType {
 	case ShareTypeNFS:
 		return status.Error(codes.AlreadyExists, "NFS staging target cannot contain a raw block device")
@@ -247,6 +257,11 @@ func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeConte
 			return status.Errorf(codes.AlreadyExists, "staging target is backed by iSCSI target %s, requested %s", actualIQN, volumeContext["iqn"])
 		}
 	case ShareTypeNVMeoF:
+		// A ublk device has no kernel NVMe controller; the daemon serving it
+		// is the only source of its identity.
+		if util.IsNVMeUblkDevice(devicePath) {
+			return d.verifyNVMeUblkStageSource(ctx, volumeID, devicePath, volumeContext)
+		}
 		actualNQN, err := nodeGetNVMeInfo(devicePath)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to identify staged NVMe-oF device %s: %v", devicePath, err)
@@ -258,7 +273,13 @@ func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeConte
 	return nil
 }
 
+// handleExistingStage is handleExistingStageContext for callers without an
+// RPC context.
 func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType ShareType, capability nodeCapabilitySignature, expectedSource string) (bool, error) {
+	return d.handleExistingStageContext(context.Background(), req, shareType, capability, expectedSource)
+}
+
+func (d *Driver) handleExistingStageContext(ctx context.Context, req *csi.NodeStageVolumeRequest, shareType ShareType, capability nodeCapabilitySignature, expectedSource string) (bool, error) {
 	stagingPath := req.GetStagingTargetPath()
 	mounted, err := nodeIsMounted(stagingPath)
 	if err != nil {
@@ -310,7 +331,23 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 			}
 			return true, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
 		}
-		if sourceErr := verifyStageDeviceSource(devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
+		if sourceErr := d.verifyStageDeviceSource(ctx, req.GetVolumeId(), devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
+			// ublk device numbers restart at 0 on every boot and every
+			// /dev/ublkbN is a CSI volume, so a staging link that survived a
+			// reboot routinely resolves to ANOTHER volume's live device. The
+			// daemon's identity check already proves the link is stale; unless a
+			// stage record says this path belongs to a different staged volume,
+			// report "not staged" so the ublk stage path attaches this volume and
+			// atomically replaces the link (the other volume's device is never
+			// touched). Same record guard as the dangling-link case above.
+			if util.IsNVMeUblkDevice(devicePath) && status.Code(sourceErr) == codes.AlreadyExists {
+				if record, ok := d.stageRecord(stagingPath); !ok ||
+					(record.VolumeID == req.GetVolumeId() && record.ExpectedSource == expectedSource && record.Capability == capability) {
+					klog.Infof("Staging link %s resolves to %s, now serving another volume (%v); re-staging %s", stagingPath, devicePath, sourceErr, req.GetVolumeId())
+					d.deleteStageRecord(stagingPath)
+					return false, nil
+				}
+			}
 			return true, sourceErr
 		}
 		liveSource = normalizeMountSource(devicePath)
@@ -329,7 +366,7 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 				return true, status.Errorf(codes.AlreadyExists, "staging target %s has filesystem %s, requested NFS", stagingPath, mountInfo.FSType)
 			}
 		default:
-			if sourceErr := verifyStageDeviceSource(liveSource, shareType, req.GetVolumeContext()); sourceErr != nil {
+			if sourceErr := d.verifyStageDeviceSource(ctx, req.GetVolumeId(), liveSource, shareType, req.GetVolumeContext()); sourceErr != nil {
 				return true, sourceErr
 			}
 			if capability.FSType != "" && !strings.EqualFold(mountInfo.FSType, capability.FSType) {
@@ -416,6 +453,18 @@ func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, 
 		return status.Errorf(codes.Internal, "failed to inspect existing publication mount: %v", err)
 	}
 	actualSource := normalizeMountSource(mountInfo.Source)
+	if capability.AccessType == nodeAccessBlock {
+		// The mount table shows a bound device node's source as devtmpfs
+		// ("udev[/nvme0n1]"), not the device: compare device numbers.
+		same, sameErr := sameBlockDevice(req.GetTargetPath(), expectedSource)
+		if sameErr != nil {
+			return status.Errorf(codes.Internal, "failed to inspect existing raw block publication: %v", sameErr)
+		}
+		if !same {
+			return status.Errorf(codes.AlreadyExists, "target path %s is not bound to the staged device %s", req.GetTargetPath(), expectedSource)
+		}
+		actualSource = normalizeMountSource(expectedSource)
+	}
 	if mountInfo.ReadOnly != req.GetReadonly() {
 		return status.Errorf(codes.AlreadyExists, "target path %s readonly state is %t, requested %t", req.GetTargetPath(), mountInfo.ReadOnly, req.GetReadonly())
 	}
@@ -435,6 +484,21 @@ func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, 
 		Readonly:       req.GetReadonly(),
 	})
 	return nil
+}
+
+// sameBlockDevice reports whether path (a raw-block publish target, the
+// device node bound over kubelet's placeholder) is the block device device.
+func sameBlockDevice(path, device string) (bool, error) {
+	pathMode, pathRdev, err := nodeStatsStat(path)
+	if err != nil {
+		return false, err
+	}
+	deviceMode, deviceRdev, err := nodeStatsStat(device)
+	if err != nil {
+		return false, err
+	}
+	isBlock := func(mode uint32) bool { return mode&unix.S_IFMT == unix.S_IFBLK }
+	return isBlock(pathMode) && isBlock(deviceMode) && pathRdev == deviceRdev, nil
 }
 
 func allowsMultiplePublicationTargets(mode csi.VolumeCapability_AccessMode_Mode) bool {
@@ -495,7 +559,18 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 		if mount.Target == req.GetTargetPath() || mount.Target == req.GetStagingTargetPath() || d.isKnownStageTarget(mount.Target) || !likelyCSIPublicationTarget(mount.Target) {
 			continue
 		}
-		if mountSourcesEqual(mount.Source, expectedSource) {
+		sameSource := mountSourcesEqual(mount.Source, expectedSource)
+		// A raw-block publication is a bind-mounted device node: the table
+		// shows it on devtmpfs ("udev[/sda]"), never as the staged device, so
+		// it is identified by its device number. Only devtmpfs entries are
+		// stat'ed: a stat of a hung network mount would hang this publish.
+		if !sameSource && capability.AccessType == nodeAccessBlock && mount.FSType == "devtmpfs" {
+			sameSource, err = sameBlockDevice(mount.Target, expectedSource)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to verify existing publication at %s: %v", mount.Target, err)
+			}
+		}
+		if sameSource {
 			if capability.AccessMode == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 				klog.Infof("NodePublishVolume: single-writer migration for volume %s is blocked by the still-mounted target %s; kubelet may still be tearing down the prior pod", req.GetVolumeId(), mount.Target)
 			}
@@ -507,8 +582,12 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 
 func (d *Driver) rememberPublication(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) {
 	liveSource := expectedSource
-	if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
-		liveSource = normalizeMountSource(mountInfo.Source)
+	// A raw-block publication is the staged device itself (its mount source
+	// is devtmpfs); validateExistingPublication compares it the same way.
+	if capability.AccessType != nodeAccessBlock {
+		if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
+			liveSource = normalizeMountSource(mountInfo.Source)
+		}
 	}
 	d.storePublicationRecord(nodeMountRecord{
 		VolumeID:       req.GetVolumeId(),
@@ -567,8 +646,8 @@ func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (
 	resp := &csi.NodeGetInfoResponse{
 		NodeId: d.encodedNodeID,
 	}
-	if d.config.Node.MaxVolumesPerNode > 0 {
-		resp.MaxVolumesPerNode = d.config.Node.MaxVolumesPerNode
+	if limit := d.config.nodeVolumeLimit(); limit > 0 {
+		resp.MaxVolumesPerNode = limit
 	}
 
 	// Add topology information if enabled
@@ -646,7 +725,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	if err != nil {
 		return nil, err
 	}
-	if handled, existingErr := d.handleExistingStage(req, attachDriver, capability, expectedSource); handled {
+	if handled, existingErr := d.handleExistingStageContext(ctx, req, attachDriver, capability, expectedSource); handled {
 		if existingErr != nil {
 			return nil, existingErr
 		}
@@ -657,7 +736,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		case ShareTypeISCSI:
 			d.convergeExistingISCSIPaths(ctx, stageContext, req.GetSecrets(), stagingPath, eventObject)
 		case ShareTypeNVMeoF:
-			d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
+			// Kernel path convergence is for kernel controllers only; a
+			// volume staged on a ublk device has none, and the daemon runs
+			// its own multipath.
+			if !d.isNVMeUblkStaged(stagingPath) {
+				d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
+			}
 		}
 		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
 		return &csi.NodeStageVolumeResponse{}, nil
@@ -687,7 +771,15 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
-		if err := d.stageNVMeoFVolume(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		dataPath, dataPathErr := d.nvmeoFDataPathForVolume(stageContext)
+		if dataPathErr != nil {
+			return nil, dataPathErr
+		}
+		if dataPath == NVMeoFDataPathUblk {
+			if err := d.stageNVMeoFUblkVolume(ctx, volumeID, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+				return nil, err
+			}
+		} else if err := d.stageNVMeoFVolume(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	default:
@@ -699,7 +791,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	// which an external mount could appear after the initial idempotency check;
 	// the protocol helpers' legacy mounted fast paths cannot bypass compatibility
 	// validation.
-	if handled, existingErr := d.handleExistingStage(req, attachDriver, capability, expectedSource); handled {
+	if handled, existingErr := d.handleExistingStageContext(ctx, req, attachDriver, capability, expectedSource); handled {
 		if existingErr != nil {
 			return nil, existingErr
 		}
@@ -788,26 +880,25 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	} else {
 		// For filesystem mode, unmount and remove directory
-		if err := util.UnmountWithContext(ctx, stagingPath); err != nil {
-			klog.Warningf("Failed to unmount staging path: %v", err)
-			// Check if still mounted before attempting removal to prevent data corruption
-			mounted, checkErr := util.IsMountedWithContext(ctx, stagingPath)
-			if checkErr != nil {
-				klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-				// If we can't verify mount status, don't risk removing a mounted path
-				return nil, status.Errorf(codes.Internal, "failed to unmount staging path and cannot verify mount status: %v", err)
-			}
-			if mounted {
-				return nil, status.Errorf(codes.Internal, "failed to unmount staging path (still mounted): %v", err)
-			}
-			// Not mounted, safe to continue with cleanup
-			klog.Infof("Staging path %s is not mounted, proceeding with cleanup", stagingPath)
+		if err := unmountFully(ctx, stagingPath, "staging path"); err != nil {
+			return nil, err
 		}
 
-		// Clean up staging directory (only reached if unmount succeeded or path was not mounted)
-		if err := os.RemoveAll(stagingPath); err != nil {
-			klog.Warningf("Failed to remove staging directory: %v", err)
+		// Clean up the empty mount point (only reached once nothing is mounted there)
+		if err := cleanupMountPoint(stagingPath, "staging path"); err != nil {
+			return nil, err
 		}
+	}
+
+	// The userspace NVMe/TCP data path holds no kernel session: detach the
+	// volume from nvmeublkd by volume ID and return before the kernel cleanup
+	// below, whose device-name heuristics were never meant for /dev/ublkbN.
+	if handled, ublkErr := d.unstageNVMeoFUblkVolume(ctx, volumeID, devicePath); ublkErr != nil {
+		return nil, ublkErr
+	} else if handled {
+		d.deleteStageRecord(stagingPath)
+		klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
+		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
 	// A raw-block staging symlink contains a literal /dev name that can become
@@ -847,6 +938,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 				} else {
 					klog.Infof("Disconnected NVMe-oF session %s", nqn)
 					primaryDisconnectSucceeded = true
+					d.forgetNVMeSession(nqn)
 				}
 			} else {
 				klog.V(4).Infof("Could not get NVMe info from device %s: %v", devicePath, nvmeErr)
@@ -951,6 +1043,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 				return fmt.Errorf("failed to disconnect NVMe-oF session %s: %w", nqn, err)
 			}
 			klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
+			d.forgetNVMeSession(nqn)
 		}
 	case ShareTypeNFS:
 		// NFS mounts have no session/login concept to clean up here.
@@ -1087,7 +1180,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 				return nil, status.Errorf(codes.Internal, "staging path did not resolve to a block device: %s", devicePath)
 			}
 			shareType := d.nodeAttachDriver(req.GetVolumeContext())
-			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
+			if ownershipErr := d.validateRawBlockDeviceOwnership(ctx, volumeID, devicePath, shareType); ownershipErr != nil {
 				return nil, ownershipErr
 			}
 
@@ -1202,23 +1295,13 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	defer d.releaseOperationLock(targetLockKey)
 
 	// Unmount target path
-	if err := util.UnmountWithContext(ctx, targetPath); err != nil {
-		klog.Warningf("Failed to unmount target path: %v", err)
-		// Check if still mounted before attempting removal
-		mounted, checkErr := util.IsMountedWithContext(ctx, targetPath)
-		if checkErr != nil {
-			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-			return nil, status.Errorf(codes.Internal, "failed to unmount target path and cannot verify mount status: %v", err)
-		}
-		if mounted {
-			return nil, status.Errorf(codes.Internal, "failed to unmount target path (still mounted): %v", err)
-		}
-		klog.Infof("Target path %s is not mounted, proceeding with cleanup", targetPath)
+	if err := unmountFully(ctx, targetPath, "target path"); err != nil {
+		return nil, err
 	}
 
-	// Remove target path (only reached if unmount succeeded or path was not mounted)
-	if err := os.RemoveAll(targetPath); err != nil {
-		klog.Warningf("Failed to remove target path: %v", err)
+	// Remove the empty mount point (only reached once nothing is mounted there)
+	if err := cleanupMountPoint(targetPath, "target path"); err != nil {
+		return nil, err
 	}
 	d.deletePublicationRecord(targetPath)
 
@@ -1374,6 +1457,12 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 		return nil, status.Errorf(codes.Internal, "failed to resolve expansion device: %v", err)
 	}
 
+	// A ublk device is neither a kernel NVMe namespace nor a SCSI disk, and
+	// has no rescan: it takes its own path.
+	if util.IsNVMeUblkDevice(devicePath) {
+		return d.expandNVMeUblkVolume(ctx, volumeID, volumePath, devicePath, rawBlock, capacityBytes)
+	}
+
 	shareType := blockTransportForDevice(devicePath, d.config.GetDriverShareType())
 	if shareType.IsBlockProtocol() {
 		if devicePath == "" {
@@ -1381,7 +1470,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 		}
 
 		if rawBlock {
-			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
+			if ownershipErr := d.validateRawBlockDeviceOwnership(ctx, volumeID, devicePath, shareType); ownershipErr != nil {
 				return nil, ownershipErr
 			}
 		}
@@ -1395,12 +1484,8 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 		switch shareType {
 		case ShareTypeISCSI:
-			portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
-			if infoErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
-			}
-			if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+			if rescanErr := rescanISCSIDevice(ctx, devicePath); rescanErr != nil {
+				return nil, rescanErr
 			}
 		case ShareTypeNVMeoF:
 			if rescanErr := nodeNVMeRescan(ctx, devicePath); rescanErr != nil {
@@ -1446,7 +1531,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 	}, nil
 }
 
-func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, shareType ShareType) error {
+func (d *Driver) validateRawBlockDeviceOwnership(ctx context.Context, volumeID, devicePath string, shareType ShareType) error {
 	switch shareType {
 	case ShareTypeISCSI:
 		_, iqn, err := nodeGetISCSIInfo(devicePath)
@@ -1460,6 +1545,9 @@ func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, sh
 				devicePath, iqn, expected)
 		}
 	case ShareTypeNVMeoF:
+		if util.IsNVMeUblkDevice(devicePath) {
+			return d.validateNVMeUblkRawBlockOwnership(ctx, volumeID, devicePath)
+		}
 		nqn, err := nodeGetNVMeInfo(devicePath)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to identify NVMe-oF session for raw block device %s: %v", devicePath, err)
@@ -1478,6 +1566,52 @@ func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, sh
 
 func sessionTargetMatchesExpected(actual, expected string) bool {
 	return actual == expected || strings.HasSuffix(actual, ":"+expected)
+}
+
+// rescanISCSIDevice rescans the session behind devicePath. A dm-multipath map
+// has one session per path: every path is rescanned, then multipathd resizes
+// the map, which never grows on its own nor while one path is still small.
+func rescanISCSIDevice(ctx context.Context, devicePath string) error {
+	mapName, paths, isMap, err := nodeMultipathPaths(devicePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to inspect %s: %v", devicePath, err)
+	}
+	if !isMap {
+		portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
+		if infoErr != nil {
+			return status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
+		}
+		if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
+			return status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+		}
+		return nil
+	}
+	type target struct{ portal, iqn string }
+	var targets []target
+	seen := map[target]bool{}
+	for _, path := range paths {
+		portal, iqn, infoErr := nodeGetISCSIInfo(path)
+		if infoErr != nil {
+			klog.Warningf("Multipath map %s: path %s has no iSCSI session to rescan: %v", mapName, path, infoErr)
+			continue
+		}
+		if t := (target{portal, iqn}); !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return status.Errorf(codes.Internal, "failed to identify an iSCSI session for multipath map %s (%s)", mapName, devicePath)
+	}
+	for _, t := range targets {
+		if rescanErr := nodeISCSIRescan(ctx, t.portal, t.iqn); rescanErr != nil {
+			return status.Errorf(codes.Internal, "failed to rescan iSCSI path %s of %s: %v", t.portal, devicePath, rescanErr)
+		}
+	}
+	if resizeErr := nodeMultipathResize(ctx, mapName); resizeErr != nil {
+		return status.Errorf(codes.Internal, "failed to resize multipath map %s: %v", mapName, resizeErr)
+	}
+	return nil
 }
 
 func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capacityBytes int64) (int64, error) {
@@ -2339,6 +2473,14 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for NVMe-oF staging")
 	}
+	// The kernel path must never connect a volume that selected the
+	// userspace data path; NodeStageVolume routes those to
+	// stageNVMeoFUblkVolume.
+	if dataPath, dataPathErr := d.nvmeoFDataPathForVolume(volumeContext); dataPathErr != nil {
+		return dataPathErr
+	} else if dataPath == NVMeoFDataPathUblk {
+		return status.Error(codes.Internal, "NVMe-oF volume selects the ublk data path; refusing to connect it with the kernel initiator")
+	}
 	nqn := volumeContext["nqn"]
 	transport := volumeContext["transport"]
 	address := volumeContext["address"]
@@ -2346,6 +2488,14 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 
 	if nqn == "" || address == "" {
 		return status.Error(codes.InvalidArgument, "NVMe-oF NQN and address are required in volume context")
+	}
+	// Record the session as this plugin's BEFORE connecting, so session GC
+	// can collect it if it is ever orphaned. A failed record does not fail
+	// the stage: an unrecorded session is merely never garbage collected.
+	if d.nvmeSessions != nil {
+		if err := d.nvmeSessions.record(nqn); err != nil {
+			klog.Warningf("NVMe-oF stage %s: %v; session GC will not collect this session", nqn, err)
+		}
 	}
 
 	if transport == "" {
@@ -2908,4 +3058,74 @@ func createSymlinkAtomic(target, linkPath string) error {
 	}
 
 	return nil
+}
+
+// unmountFully unmounts path and proves nothing is left mounted there before
+// it may be removed. One umount lifts only the top of a stack of mounts, and
+// what is underneath may be a live share or filesystem. what names the path in
+// errors ("staging path", "target path").
+func unmountFully(ctx context.Context, path, what string) error {
+	unmountErr := util.UnmountWithContext(ctx, path)
+	if unmountErr != nil {
+		klog.Warningf("Failed to unmount %s: %v", what, unmountErr)
+	}
+	// The check runs on its own short budget: a slow unmount that succeeded
+	// may have spent the RPC's deadline, and an unanswered check would fail
+	// the call although nothing is mounted any more.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), util.GetConfig().MountTimeout)
+	defer cancel()
+	mounted, checkErr := util.IsMountedWithContext(checkCtx, path)
+	switch {
+	case checkErr != nil && unmountErr != nil:
+		klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
+		return status.Errorf(codes.Internal, "failed to unmount %s and cannot verify mount status: %v", what, unmountErr)
+	case checkErr != nil:
+		return status.Errorf(codes.Internal, "cannot verify that %s %s is unmounted: %v", what, path, checkErr)
+	case mounted && unmountErr != nil:
+		return status.Errorf(codes.Internal, "failed to unmount %s (still mounted): %v", what, unmountErr)
+	case mounted:
+		return status.Errorf(codes.Internal, "%s %s is still mounted after unmount: another mount is stacked underneath; retrying unmounts it", what, path)
+	case unmountErr != nil:
+		klog.Infof("%s %s is not mounted, proceeding with cleanup", what, path)
+	}
+	return nil
+}
+
+// errMountPointNotEmpty is a directory that still holds files once nothing is
+// mounted on it.
+var errMountPointNotEmpty = errors.New("directory is not empty")
+
+// removeMountPoint removes an unmounted mount point without descending into
+// it (mount-utils CleanupMountPoint): absent is fine, a directory goes only
+// when empty, a file (a raw-block bind target) goes. A directory with files
+// in it is errMountPointNotEmpty. Never recursive: what is under a mount point
+// may be a volume's data.
+func removeMountPoint(path string) error {
+	err := os.Remove(path)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("%w: %w", errMountPointNotEmpty, err)
+	}
+	return err
+}
+
+// cleanupMountPoint removes an unmounted mount point. A directory that still
+// has files in it fails the call: reporting success would leave kubelet's own
+// teardown failing with ENOTEMPTY forever, and the files are not ours to
+// delete. what names the path ("staging path", "target path").
+func cleanupMountPoint(path, what string) error {
+	err := removeMountPoint(path)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errMountPointNotEmpty):
+		return status.Errorf(codes.Internal,
+			"%s %s is not empty after unmount; its contents (on the node's disk, not the volume) are left in place and must be removed by hand",
+			what, path)
+	default:
+		klog.Warningf("Failed to remove %s %s: %v", what, path, err)
+		return nil
+	}
 }

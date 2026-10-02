@@ -113,6 +113,12 @@ const (
 	volumeSnapshotNamespaceKey = "csi.storage.k8s.io/volumesnapshot/namespace"
 )
 
+// The controller's Kubernetes API request rate.
+const (
+	kubernetesClientQPS   = 50
+	kubernetesClientBurst = 100
+)
+
 // EventRecorder wraps Kubernetes event recording functionality
 type EventRecorder struct {
 	recorder      record.EventRecorder
@@ -130,6 +136,10 @@ func NewEventRecorder(driverName string) *EventRecorder {
 		klog.V(4).Infof("Not running in Kubernetes cluster, events disabled: %v", err)
 		return &EventRecorder{enabled: false}
 	}
+	// client-go's default (5 requests a second, bursts of 10) throttled a
+	// 50-volume drain to the API's pace once publication records moved into
+	// Kubernetes: each move makes about 7 requests.
+	config.QPS, config.Burst = kubernetesClientQPS, kubernetesClientBurst
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {

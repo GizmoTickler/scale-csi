@@ -520,7 +520,7 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			// entry's Status carries PublishedNodeIds decoded from the volume's
 			// own publication records, which ride on the same per-page
 			// pool.dataset.query hydration the entry is built from — zero extra
-			// API cost. See publishedNodeIDsFromDataset.
+			// API cost. See publishedNodeIDs.
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_LIST_VOLUMES_PUBLISHED_NODES,
@@ -676,11 +676,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// would simply observe "already held" and abort a request that has no
 	// actual concurrency to serialize against.
 	if cloneSourceVolumeID != "" && cloneSourceVolumeID != volumeID {
+		// A data-class hold (operation_lock.go): the clone only reads the
+		// source and creates and destroys its own snapshot of it, so a publish
+		// or unpublish of the source goes on alongside.
 		sourceVolumeLockKey := volumeLockKey(cloneSourceVolumeID)
-		if !d.acquireOperationLock(sourceVolumeLockKey) {
+		if !d.acquireOperationLockMode(sourceVolumeLockKey, lockData) {
 			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 		}
-		defer d.releaseOperationLock(sourceVolumeLockKey)
+		defer d.releaseOperationLockMode(sourceVolumeLockKey, lockData)
 	}
 
 	// Lock on the sanitized volume ID so all operations use the same key space.
@@ -799,6 +802,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, performanceErr
 	}
 	ctx = withZFSPerformanceClass(ctx, performanceClass)
+
+	// Node data path for NVMe-oF (kernel initiator or the userspace nvmeublkd
+	// path). Pure validation; the choice is only recorded in the volume
+	// context. A StorageClass that does not set it is a strict no-op.
+	dataPath, dataPathErr := d.nvmeoFDataPathForCreate(req.GetParameters(), shareType)
+	if dataPathErr != nil {
+		return nil, dataPathErr
+	}
+	ctx = withNVMeoFDataPath(ctx, dataPath)
 
 	// VolumeAttributesClass (CSI MODIFY_VOLUME): CreateVolume may carry
 	// mutable_parameters from the PVC's VolumeAttributesClass. Enforce the SAME
@@ -1041,7 +1053,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
 	// result and the clone readiness path do not need another zvol poll.
-	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady, volumeProperties); shareErr != nil {
+	//
+	// A clone or copy reaching this point was made by this call:
+	// handleVolumeContentSource returns Aborted when the destination already
+	// existed. No share object can be named after it yet, so for NFS and
+	// NVMe-oF it is as fresh as a DatasetCreate result; there, freshlyCreated
+	// only skips the guaranteed-miss lookups, which on a clone first chase the
+	// share IDs it inherited from its SOURCE. iSCSI is excluded on purpose: it
+	// also reads freshlyCreated as "the zvol holds no data" when choosing the
+	// extent geometry, and a clone's data contradicts that.
+	shareFresh := freshlyCreated || (contentSource != nil && shareType != ShareTypeISCSI)
+	// One memo for this request: the share create records the objects it made
+	// and the volume context below reuses them instead of reading them back.
+	createRes := &fenceResolution{}
+	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, shareFresh, zvolReady, volumeProperties, createRes); shareErr != nil {
 		// (C12) Cleanup on failure. deleteShare MUST run before DatasetDelete,
 		// exactly like the property-write failure arm below: not every
 		// createShareWithOptions failure exit rolls back its own partial share
@@ -1062,10 +1087,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, shareErr
 	}
 
-	// Block protocols (iSCSI/NVMe-oF) stamp their resource IDs non-fatally inside
-	// createShareWithOptions, so the managed/ownership/provision/name stamps still
-	// happen here as a separate, fatal update. NFS already stamped them together
-	// with the share ID and skips this round trip.
+	// Block protocols (iSCSI/NVMe-oF) folded their resource IDs into
+	// volumeProperties inside createShareWithOptions, so this fatal update
+	// carries them with the managed/ownership/provision/name stamps (NVMe-oF has
+	// no other write of them). NFS already stamped all of it together with the
+	// share ID and skips this round trip.
 	if shareType != ShareTypeNFS {
 		if waitErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, volumeProperties); waitErr != nil {
 			// Property setting failed - clean up the share and dataset to avoid orphaned resources
@@ -1098,7 +1124,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Get volume context for response
-	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
+	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType, createRes)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", err)
 	}
@@ -1568,7 +1594,10 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
 	// This handles the case where a previous CreateVolume created the dataset but failed
 	// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
-	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, nil); shareErr != nil {
+	// The ensure resolves (or rebuilds) the share objects once; the volume
+	// context below reuses them through this request's memo.
+	existingRes := &fenceResolution{}
+	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, existingRes); shareErr != nil {
 		return nil, shareErr
 	}
 
@@ -1578,7 +1607,7 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// than duplicating it.
 	d.ensureSnapshotTask(ctx, existingDS, datasetName, volumeID, vp.snapshotTask, req)
 
-	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
+	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType, existingRes)
 	if ctxErr != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 	}
@@ -1707,6 +1736,9 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	volumeID := req.GetVolumeId()
 	defer func() {
 		d.recordOperationFailureEvent(volumeEventRef(volumeID), EventReasonVolumeDeleteFailed, "DeleteVolume", operationErr)
+		if operationErr == nil && volumeID != "" {
+			d.forgetListedVolume(volumeID)
+		}
 	}()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
@@ -1751,6 +1783,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			} else {
 				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
 			}
+			// A retry after a failed forget below lands here: best effort too.
+			if forgetErr := d.publications().forget(ctx, datasetName); forgetErr != nil {
+				klog.Warningf("Failed to remove the publication records of deleted volume %s: %v", volumeID, forgetErr)
+			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
 		return nil, status.Errorf(codes.Internal, "failed to verify volume %s: %v", volumeID, err)
@@ -1793,23 +1829,34 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// share. The share must be deleted before the dataset (extents block zvol
 	// deletion), so bailing after share deletion would leave a volume that
 	// still exists but is inaccessible, with no path that re-creates its share.
-	// The snapshot and dataset-origin checks each cost one query on every delete;
-	// the dependency-error fallback after DatasetDelete stays as a second line
-	// of defense.
-	hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
-	if cloneErr != nil {
-		return nil, status.Errorf(codes.Internal,
-			"failed to verify clone dependencies for volume %s before share deletion: %v", volumeID, cloneErr)
-	}
-	if hasDependentClones {
-		klog.Infof("Volume %s has a dependent clone, cannot delete", volumeID)
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"volume %s has dependent clones that must be deleted first", volumeID)
-	}
+	// The snapshot listing costs one query on every delete; the dependency-error
+	// fallback after DatasetDelete stays as a second line of defense.
 	snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
 	if snapErr != nil {
 		return nil, status.Errorf(codes.Internal,
 			"failed to verify snapshot dependencies for volume %s before share deletion: %v", volumeID, snapErr)
+	}
+	// The dependent-clone check is scoped to exactly this volume's own
+	// snapshots: a clone depends on this volume only through one of them. With
+	// none, there is nothing a clone can depend on, because ZFS keeps a cloned
+	// snapshot until its last clone is gone (a deferred destroy included), so
+	// the listing above already proves the answer and the parent-wide origin
+	// scan (one O(N) query) is skipped. TrueNAS 26.0 does not project the
+	// snapshot `clones` property through any API (live-checked: requested, it is
+	// silently dropped), so with snapshots present the origin scan remains the
+	// only authority. The same listing already decides the foreign-snapshot
+	// guard below, so this adds no new trust in it.
+	if len(snapshots) > 0 {
+		hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
+		if cloneErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"failed to verify clone dependencies for volume %s before share deletion: %v", volumeID, cloneErr)
+		}
+		if hasDependentClones {
+			klog.Infof("Volume %s has a dependent clone, cannot delete", volumeID)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"volume %s has dependent clones that must be deleted first", volumeID)
+		}
 	}
 	snapshots, snapErr = d.deleteOrphanedInternalCloneSourceSnapshots(ctx, snapshots)
 	if snapErr != nil {
@@ -1928,7 +1975,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		// Re-check dataset origins for a clone created after the up-front guard,
 		// then classify snapshots. This remains authoritative on TrueNAS 26.0,
 		// where snapshot clone projections are empty.
-		hasDependentClones, cloneErr = d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
+		hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
 		if cloneErr != nil {
 			return nil, status.Errorf(codes.Internal,
 				"failed to verify clone dependencies for volume %s: %v", volumeID, cloneErr)
@@ -2027,6 +2074,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	}
 
+	// Records kept outside the dataset (VolumePublications) did not go with
+	// it. A failure fails this attempt; its retry finds the dataset gone and
+	// tries again above.
+	if err := d.publications().forget(ctx, datasetName); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to remove the publication records of volume %s: %v", volumeID, err)
+	}
+
 	// Drop the volume's per-volume usage series so a deleted volume cannot leave
 	// a latched near-quota gauge (and unbounded label cardinality) behind
 	// (GF2-fix/F6). A no-op when the feature never published one.
@@ -2101,6 +2155,16 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	// An attach-class hold (operation_lock.go): a snapshot of the volume goes
+	// on alongside; another publish or unpublish of it, or an exclusive
+	// operation, is waited for, up to attachLockWait.
+	lockKey := volumeLockKey(volumeID)
+	if !d.acquireOperationLockModeWait(ctx, lockKey, lockAttach, attachLockWait) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	}
+	defer d.releaseOperationLockMode(lockKey, lockAttach)
+	// The node identity is resolved under the lock, after any wait for it:
+	// a grant never uses an identity older than the lock it is made under.
 	identity, err := d.resolveControllerNodeIdentity(ctx, nodeID)
 	if err != nil {
 		return nil, err
@@ -2114,11 +2178,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
-	lockKey := volumeLockKey(volumeID)
-	if !d.acquireOperationLock(lockKey) {
-		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	// Strict fencing at startup: converge this volume first if startup has not
+	// yet (startup_gate.go). The dataset is read below, after it.
+	if gateErr := d.startupPublishGate(ctx, volumeID); gateErr != nil {
+		return nil, gateErr
 	}
-	defer d.releaseOperationLock(lockKey)
 
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
@@ -2157,7 +2221,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	// Publication records (CSI single-node exclusivity, idempotency, takeover) are
 	// maintained unconditionally; fencing.mode only governs backend allowlist
 	// enforcement inside publishFencedVolume.
-	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly(), res); err != nil {
+	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, nodeID, req.GetVolumeCapability(), req.GetReadonly(), res); err != nil {
 		return nil, err
 	}
 
@@ -2203,11 +2267,12 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
+	// Attach-class, as ControllerPublishVolume.
 	lockKey := volumeLockKey(volumeID)
-	if !d.acquireOperationLock(lockKey) {
+	if !d.acquireOperationLockModeWait(ctx, lockKey, lockAttach, attachLockWait) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
-	defer d.releaseOperationLock(lockKey)
+	defer d.releaseOperationLockMode(lockKey, lockAttach)
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
@@ -2283,14 +2348,16 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 // gone — its cost scaled with the TOTAL system dataset count (the middleware
 // materializes user properties for the whole system on every such call; the
 // same 47 rows went 152ms→630ms when 300 unrelated datasets were added
-// elsewhere). Each WALK now reuses listAllManagedDatasets — the reconciler's
+// elsewhere). Each WALK reuses listAllManagedDatasets — the reconciler's
 // path-scoped zfs.resource.query read with its paged pool.dataset.query
-// fallback — exactly once, and hydrates ONLY the page being returned through
-// id-filtered DatasetGetByNames reads (no materialization cost). The hydration
-// is REQUIRED, not an optimization detail: zfs.resource.query carries no
-// encryption fields at all (P-11), and the entry's VolumeCondition must see
-// Encrypted/Locked; it also restores the per-property Source that
-// publicationRecordsFromDataset depends on for PublishedNodeIds.
+// fallback — exactly once, for the walk's membership and order. With records
+// in Kubernetes every page is served from it: the capacity from the listing's
+// properties, the published nodes from the VolumePublication cache; only a
+// dataset that still carries ZFS publication record keys (not yet imported)
+// is re-read, by name (DatasetGetByNames), because the listing carries no
+// property sources and publicationRecordsFromDataset trusts only a LOCAL
+// record. With records on ZFS every page is re-read by name, as before v1.22:
+// a record written after the listing exists only on its dataset.
 //
 // STABILITY (P-3): pool.dataset.query offset pagination has NO ordering (rows
 // come back in DB-row order), so pages skipped/duplicated volumes under
@@ -2298,10 +2365,10 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 // periodically. Exactly like ListSnapshots, a fresh walk (empty starting
 // token) freezes the name-sorted managed listing into a short-TTL cache and
 // continuation tokens slice that frozen view. Starting-token semantics
-// (integer offset) are unchanged.
-//
-// The client-side managed-resource check on the hydrated dataset remains as a
-// compatibility safeguard.
+// (integer offset) are unchanged. A volume this controller deleted at or
+// after the moment the walk's listing began reading (a shared listing it
+// joined may have begun before the walk) is left out of the walk, as a
+// re-read would have left it out.
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	klog.V(4).Info("ListVolumes called")
 
@@ -2321,23 +2388,30 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		requestedLimit = 100
 	}
 
-	page, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
+	page, viewStart, hasMore, listing, err := d.managedVolumesForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
+	// The page is a listing until its entries are built: the deletes it
+	// filters on are kept until then, however long the re-read below takes.
+	defer d.endVolumeListing(listing)
 
-	// Hydrate ONLY this page via one id-filtered pool.dataset.query
-	// (chunked only if a page's names outgrow the request budget). The
-	// ["id","in",names] filter skips the full-system user-property
-	// materialization that made the old filtered listing O(system size), and
-	// unlike the zfs.resource.query listing it carries the encryption fields
-	// (P-11) and user-property sources the entries below are built from.
-	names := make([]string, 0, len(page))
-	for _, ds := range page {
-		names = append(names, ds.Name)
+	// Re-read the page by name (chunked only if the names outgrow the request
+	// budget): the listing has no property sources, and only a local record is
+	// the volume's own. With records on ZFS every page is re-read, as before
+	// v1.22: a record written after the walk's listing (a publish between two
+	// pages) is on the dataset only, so the frozen view cannot know of it.
+	// With records in Kubernetes only the datasets still carrying ZFS record
+	// keys (not yet imported) are re-read; new records go to Kubernetes.
+	reReadAll := d.publicationRecordsOnZFS()
+	var keyed []string
+	for _, entry := range page {
+		if reReadAll || entry.recordKeys {
+			keyed = append(keyed, entry.name)
+		}
 	}
-	hydrated := make(map[string]*truenas.Dataset, len(names))
-	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
+	hydrated := make(map[string]*truenas.Dataset, len(keyed))
+	for _, chunk := range chunkDatasetNames(keyed, datasetGetByNamesBatchBudget) {
 		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
 		if getErr != nil {
 			// DatasetGetByNames omits absent names instead of erroring, so a
@@ -2351,34 +2425,36 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 
 	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(page))
 	for _, listed := range page {
-		ds, ok := hydrated[listed.Name]
-		if !ok {
-			// Deleted between the walk's frozen listing and this page's
-			// hydration: skip the entry rather than report a gone volume.
+		if d.listedVolumeDeletedSince(listed.name, viewStart) {
 			continue
 		}
-
-		// Skip if not managed by CSI (compatibility safeguard; the listing
-		// already filtered on the managed stamp).
-		if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" { //nolint:gocritic // compatibility pre-filter only ('the listing already filtered on the managed stamp' per the preceding comment); not the authoritative check
-			continue
+		capacity := listed.capacity
+		ds := &truenas.Dataset{Name: listed.name}
+		if reReadAll || listed.recordKeys {
+			var ok bool
+			if ds, ok = hydrated[listed.name]; !ok {
+				// Deleted between the walk's frozen listing and this page's
+				// re-read: skip the entry rather than report a gone volume.
+				continue
+			}
+			// Skip if not managed by CSI (compatibility safeguard; the listing
+			// already filtered on the managed stamp).
+			if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" { //nolint:gocritic // compatibility pre-filter only; not the authoritative check
+				continue
+			}
+			capacity = d.listedCapacity(ds)
 		}
-
-		volumeID := path.Base(ds.Name)
-		capacity := d.getDatasetCapacity(ds)
 
 		entries = append(entries, &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
-				VolumeId:      volumeID,
+				VolumeId:      path.Base(listed.name),
 				CapacityBytes: capacity,
 			},
 			Status: &csi.ListVolumesResponse_VolumeStatus{
-				// LIST_VOLUMES_PUBLISHED_NODES (F-1): the hydrated dataset
-				// already carries the volume's publication records, so this is
-				// free. Requires the source-bearing pool.dataset.query read
-				// above — publicationRecordsFromDataset only trusts LOCAL
-				// properties, and the resource-query listing strips sources.
-				PublishedNodeIds: publishedNodeIDsFromDataset(ds),
+				// LIST_VOLUMES_PUBLISHED_NODES (F-1): from the publication
+				// store. A dataset without record keys has no ZFS records, so
+				// only the Kubernetes side (the cache) can name any.
+				PublishedNodeIds: d.publishedNodeIDs(ctx, ds),
 			},
 		})
 	}
@@ -2404,62 +2480,283 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 // always refetches regardless of TTL.
 const volumeListPageCacheTTL = 30 * time.Second
 
-// managedDatasetsForListPage returns one page of the parent's managed datasets
-// for ListVolumes, plus whether more pages remain in the frozen view. A fresh
-// walk (empty starting token) fetches the full managed set once via
-// listAllManagedDatasets (path-scoped zfs.resource.query, paged
-// pool.dataset.query fallback — both filtered to PropManagedResource=="true"),
-// sorts it by name so offsets are stable across pages, and repopulates the
-// cache; a continuation token within the TTL is served from that frozen view,
-// so a walk can neither skip nor duplicate volumes however much create/delete
-// churn happens meanwhile. A continuation arriving after the TTL (or before
-// any walk populated the cache, e.g. across a controller restart) refetches —
-// offset tokens remain valid against the refreshed set exactly as they were
-// against the old per-page reads.
-func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) ([]*truenas.Dataset, bool, error) {
+// listedVolume is one managed volume as a ListVolumes walk's frozen view
+// keeps it: its dataset name, its capacity as the listing reported it, and
+// whether the dataset carries ZFS publication record keys (and so must be
+// re-read for its records).
+type listedVolume struct {
+	name       string
+	capacity   int64
+	recordKeys bool
+}
+
+// managedVolumesForListPage returns one page of the parent's managed volumes
+// for ListVolumes, when the listing behind it began, and whether more pages
+// remain in the frozen view. A fresh walk (empty starting token) fetches the
+// full managed set once via listAllManagedDatasets (path-scoped
+// zfs.resource.query, paged pool.dataset.query fallback — both filtered to
+// PropManagedResource=="true"), sorts it by name so offsets are stable across
+// pages, and repopulates the cache; a continuation token within the TTL is
+// served from that frozen view, so a walk can neither skip nor duplicate
+// volumes however much create/delete churn happens meanwhile. A continuation
+// arriving after the TTL (or before any walk populated the cache, e.g. across
+// a controller restart) refetches — offset tokens remain valid against the
+// refreshed set exactly as they were against the old per-page reads. The view
+// keeps three small fields per volume, not the listing's decoded datasets.
+//
+// The returned listing is registered, and the caller ends it
+// (endVolumeListing) once it has filtered the page's entries: until then the
+// deletes since viewStart are kept. A continuation page's listing starts at
+// the cached view's start, registered under the same lock the view is read
+// under, so no prune in between can drop a delete the page needs.
+func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []listedVolume, viewStart time.Time, hasMore bool, listing *volumeListing, err error) {
 	if !freshWalk {
 		d.volumePageCacheMu.Lock()
 		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
-			cached := d.volumePageCache
+			cached, cachedStart := d.volumePageCache, d.volumePageCacheStart
+			listing = d.registerVolumeListingLocked(cachedStart)
 			d.volumePageCacheMu.Unlock()
-			page, hasMore := sliceVolumeListPage(cached, limit, offset)
-			return page, hasMore, nil
+			page, hasMore = sliceVolumeListPage(cached, limit, offset)
+			return page, cachedStart, hasMore, listing, nil
 		}
 		d.volumePageCacheMu.Unlock()
 	}
-	all, err := d.listAllManagedDatasets(ctx)
+	listing = d.beginVolumeListing()
+	all, start, err := d.listAllManagedDatasetsWithStart(ctx)
 	if err != nil {
-		return nil, false, err
+		d.endVolumeListing(listing)
+		return nil, time.Time{}, false, nil, err
 	}
 	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
 	// pool.dataset.query fallback guarantees one.
-	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+	volumes := make([]listedVolume, 0, len(all))
+	for _, dataset := range all {
+		volumes = append(volumes, listedVolume{
+			name:       dataset.Name,
+			capacity:   d.listedCapacity(dataset),
+			recordKeys: datasetHasPublicationRecordKeys(dataset),
+		})
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].name < volumes[j].name })
 	d.volumePageCacheMu.Lock()
-	d.volumePageCache = all
-	d.volumePageCacheTime = time.Now()
+	// A volume DeleteVolume removed at or after the listing began may still
+	// be in its rows: leave it out of the view.
+	kept := volumes[:0]
+	for _, volume := range volumes {
+		if deletedAt, deleted := d.volumePageDeleted[volume.name]; deleted && !deletedAt.Before(start) {
+			continue
+		}
+		kept = append(kept, volume)
+	}
+	volumes = kept
+	// A slower walk's older listing does not replace a newer one's view.
+	if d.volumePageCache == nil || !start.Before(d.volumePageCacheStart) {
+		d.volumePageCache = volumes
+		d.volumePageCacheTime = time.Now()
+		d.volumePageCacheStart = start
+	}
 	d.volumePageCacheMu.Unlock()
-	page, hasMore := sliceVolumeListPage(all, limit, offset)
-	return page, hasMore, nil
+	page, hasMore = sliceVolumeListPage(volumes, limit, offset)
+	return page, start, hasMore, listing, nil
+}
+
+// volumeListing is one ListVolumes listing in flight. floor is the earliest
+// time its rows can date from: its own arrival, or the start of the shared
+// listing already in flight that it may join.
+type volumeListing struct {
+	floor time.Time
+}
+
+// beginVolumeListing registers a listing so that deletes it may need to leave
+// out are kept until it is done.
+func (d *Driver) beginVolumeListing() *volumeListing {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	return d.registerVolumeListingLocked(d.sharedListingFloor(time.Now()))
+}
+
+// registerVolumeListingLocked registers a listing whose rows date from floor.
+// The caller holds volumePageCacheMu.
+func (d *Driver) registerVolumeListingLocked(floor time.Time) *volumeListing {
+	listing := &volumeListing{floor: floor}
+	if d.volumePageListings == nil {
+		d.volumePageListings = make(map[*volumeListing]struct{})
+	}
+	d.volumePageListings[listing] = struct{}{}
+	return listing
+}
+
+// endVolumeListing ends a listing; nil is a no-op.
+func (d *Driver) endVolumeListing(listing *volumeListing) {
+	if listing == nil {
+		return
+	}
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	delete(d.volumePageListings, listing)
+	d.pruneListedVolumeDeletes(time.Now())
+}
+
+// sharedListingFloor is the earlier of now and the start of the shared
+// managed listing in flight: a listing that begins now may join it.
+func (d *Driver) sharedListingFloor(now time.Time) time.Time {
+	d.managedListingMu.Lock()
+	defer d.managedListingMu.Unlock()
+	if d.managedListing != nil && d.managedListing.start.Before(now) {
+		return d.managedListing.start
+	}
+	return now
+}
+
+// pruneListedVolumeDeletes drops the deletes no listing can need: those
+// before the start of the cached view (while it is served), of every listing
+// in flight, and of the shared listing in flight that a new one may join.
+// With none of these, every entry goes, so the map stays bounded when nothing
+// lists. The caller holds volumePageCacheMu.
+func (d *Driver) pruneListedVolumeDeletes(now time.Time) {
+	floor := d.sharedListingFloor(now)
+	held := floor.Before(now)
+	if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
+		held = true
+		if d.volumePageCacheStart.Before(floor) {
+			floor = d.volumePageCacheStart
+		}
+	}
+	for listing := range d.volumePageListings {
+		held = true
+		if listing.floor.Before(floor) {
+			floor = listing.floor
+		}
+	}
+	if !held {
+		clear(d.volumePageDeleted)
+		return
+	}
+	for name, deletedAt := range d.volumePageDeleted {
+		if deletedAt.Before(floor) {
+			delete(d.volumePageDeleted, name)
+		}
+	}
+}
+
+// forgetListedVolume records that DeleteVolume removed a volume, so a listing
+// that began at or before now leaves it out. It is recorded even while no walk
+// is cached: a fresh listing may be in flight.
+func (d *Driver) forgetListedVolume(volumeID string) {
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return
+	}
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	if d.volumePageDeleted == nil {
+		d.volumePageDeleted = make(map[string]time.Time)
+	}
+	now := time.Now()
+	d.volumePageDeleted[datasetName] = now
+	d.pruneListedVolumeDeletes(now)
+}
+
+// listedVolumeDeletedSince reports a volume DeleteVolume removed at or after
+// viewStart, the start of the listing a page is served from.
+func (d *Driver) listedVolumeDeletedSince(datasetName string, viewStart time.Time) bool {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	deletedAt, deleted := d.volumePageDeleted[datasetName]
+	return deleted && !deletedAt.Before(viewStart)
+}
+
+// publicationRecordsOnZFS reports the plain ZFS publication store: records
+// live only on dataset properties, so a listing cannot carry ones written
+// after it was taken.
+func (d *Driver) publicationRecordsOnZFS() bool {
+	_, onZFS := d.publications().(zfsPublicationStore)
+	return onZFS
+}
+
+// listedCapacity is a ListVolumes entry's capacity (listedDatasetCapacity).
+// A zvol whose volsize cannot be read is reported as 0, unknown, and logged
+// once per volume.
+func (d *Driver) listedCapacity(ds *truenas.Dataset) int64 {
+	capacity, known := listedDatasetCapacity(ds)
+	if !known {
+		if _, logged := d.unknownVolsizeLogged.LoadOrStore(ds.Name, struct{}{}); !logged {
+			klog.Warningf("ListVolumes: the volsize of zvol %s is unreadable; reporting its capacity as unknown (0)", ds.Name)
+		}
+	}
+	return capacity
+}
+
+// listedDatasetCapacity is getDatasetCapacity over a listing's dataset. The
+// zfs.resource.query listing reports a property as {value, raw} with no
+// parsed field: value is the number, raw its string. A pool.dataset.query row
+// (the listing's fallback, and the re-read) has parsed. Each is read in that
+// order. A zvol's capacity is its volsize and nothing else: when volsize is
+// unreadable the capacity is unknown (0, which CSI allows for capacity_bytes)
+// and known is false. Falling through to available would report the pool's
+// free space as the zvol's size.
+func listedDatasetCapacity(ds *truenas.Dataset) (capacity int64, known bool) {
+	if ds.Type == "VOLUME" {
+		if bytes, ok := listedPropertyBytes(ds.Volsize); ok {
+			return bytes, true
+		}
+		return 0, false
+	}
+	if bytes, ok := listedPropertyBytes(ds.Refquota); ok && bytes > 0 {
+		return bytes, true
+	}
+	if requestedSize := datasetUserProperty(ds, PropRequestedSizeBytes); requestedSize != "" && requestedSize != "-" {
+		if parsed, err := strconv.ParseInt(requestedSize, 10, 64); err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	if bytes, ok := listedPropertyBytes(ds.Available); ok {
+		return bytes, true
+	}
+	return 0, true
+}
+
+// listedPropertyBytes reads a numeric property from parsed, then value, then
+// the rawvalue string (pool.dataset.query), then the raw string
+// (zfs.resource.query).
+func listedPropertyBytes(property truenas.DatasetProperty) (int64, bool) {
+	if parsed, ok := property.Parsed.(float64); ok {
+		return int64(parsed), true
+	}
+	switch value := property.Value.(type) {
+	case float64:
+		return int64(value), true
+	case string:
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	for _, text := range []string{property.Rawvalue, property.Raw} {
+		if parsed, err := strconv.ParseInt(text, 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 // sliceVolumeListPage slices one offset/limit page out of the frozen listing.
 // Because the full set length is known, hasMore is exact — no lookahead row and
 // no trailing empty page, matching the old fetchLimit=limit+1 token semantics.
-func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page []*truenas.Dataset, hasMore bool) {
+func sliceVolumeListPage(names []listedVolume, limit, offset int) (page []listedVolume, hasMore bool) {
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= len(datasets) {
+	if offset >= len(names) {
 		return nil, false
 	}
-	end := len(datasets)
+	end := len(names)
 	if limit > 0 && offset+limit < end {
 		end = offset + limit
 	}
-	return datasets[offset:end], end < len(datasets)
+	return names[offset:end], end < len(names)
 }
 
-// publishedNodeIDsFromDataset derives a ListVolumes entry's PublishedNodeIds
+// publishedNodeIDs derives a ListVolumes entry's PublishedNodeIds
 // from the volume's own publication records (F-1). record.EncodedID is the CSI
 // NodeId the CO passed to ControllerPublishVolume, which is exactly the
 // identifier the CO correlates published nodes by.
@@ -2476,8 +2773,8 @@ func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page [
 // publication/unpublication authorization loudly, but a read-only listing must
 // not go dark over one corrupt property — the entry is returned without
 // published-node data instead.
-func publishedNodeIDsFromDataset(ds *truenas.Dataset) []string {
-	records, err := publicationRecordsFromDataset(ds)
+func (d *Driver) publishedNodeIDs(ctx context.Context, ds *truenas.Dataset) []string {
+	records, err := readPublicationRecordsCached(ctx, d.publications(), ds.Name, ds)
 	if err != nil {
 		klog.Warningf("ListVolumes: skipping published-node ids for %s: %v", ds.Name, err)
 		return nil
@@ -2558,12 +2855,14 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 
 	// Always acquire the source-volume lock before the snapshot lock. This
 	// serializes snapshot creation with DeleteVolume and gives all creators a
-	// fixed lock order.
+	// fixed lock order. The hold is data-class (operation_lock.go): a publish
+	// or unpublish of the source goes on alongside, as the snapshot never
+	// touches its share, allowlist or records.
 	sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
-	if !d.acquireOperationLock(sourceVolumeLockKey) {
+	if !d.acquireOperationLockMode(sourceVolumeLockKey, lockData) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 	}
-	defer d.releaseOperationLock(sourceVolumeLockKey)
+	defer d.releaseOperationLockMode(sourceVolumeLockKey, lockData)
 
 	snapshotID := sanitizeVolumeID(name)
 	if _, err := d.datasetForID(snapshotID); err != nil {
@@ -2964,10 +3263,11 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	if strings.HasPrefix(snap.Dataset, parentPrefix) {
 		sourceVolumeID := path.Base(snap.Dataset)
 		sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
-		if !d.acquireOperationLock(sourceVolumeLockKey) {
+		// Data-class, as CreateSnapshot.
+		if !d.acquireOperationLockMode(sourceVolumeLockKey, lockData) {
 			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 		}
-		defer d.releaseOperationLock(sourceVolumeLockKey)
+		defer d.releaseOperationLockMode(sourceVolumeLockKey, lockData)
 	}
 	// The per-snapshot lock key derives from the SHORT name, not the raw handle
 	// string: CreateSnapshot locks "snapshot:"+shortName, and the same snapshot
@@ -3357,7 +3657,7 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			PublishedNodeIds: publishedNodeIDsFromDataset(ds),
+			PublishedNodeIds: d.publishedNodeIDs(ctx, ds),
 		},
 	}, nil
 }
@@ -4678,7 +4978,9 @@ func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds
 	return nil
 }
 
-func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) (map[string]string, error) {
+// res, when non-nil, carries the share objects this request already resolved
+// or created, so the context is built without reading them again.
+func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, res *fenceResolution) (map[string]string, error) {
 	volumeContext := map[string]string{
 		"node_attach_driver": shareType.String(),
 	}
@@ -4692,9 +4994,16 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 	}
 
 	if backend := backendForShareType(d, shareType); backend != nil {
-		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext); err != nil {
+		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext, res); err != nil {
 			return nil, err
 		}
+	}
+
+	// A StorageClass-pinned NVMe-oF data path travels to NodeStage here. Absent
+	// unless the StorageClass set nvmeof/dataPath, so every other volume
+	// context is unchanged.
+	if dataPath := nvmeoFDataPathFromContext(ctx); dataPath != "" && shareType == ShareTypeNVMeoF {
+		volumeContext[nvmeoFDataPathKey] = dataPath
 	}
 
 	// Encryption at rest (GF-Sprint 1): expose ONLY the algorithm marker so

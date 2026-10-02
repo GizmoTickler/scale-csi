@@ -28,8 +28,14 @@ name="$(basename "$0")"
 if [ -n "$FAKE_NODE_COMMAND_LOG" ]; then
 	printf '%s %s\n' "$name" "$*" >> "$FAKE_NODE_COMMAND_LOG"
 fi
+for arg in "$@"; do final="$arg"; done
 case "$name" in
 	findmnt)
+		# After a umount the mount point is gone, unless a test stacks a
+		# second mount underneath (FAKE_NODE_STACKED_MOUNT).
+		if [ "$1" = "--mountpoint" ] && [ -e "$2.fake-unmounted" ] && [ -z "$FAKE_NODE_STACKED_MOUNT" ]; then
+			exit 1
+		fi
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ] && [ -f "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			case " $* " in
 				*" SOURCE,FSTYPE,OPTIONS "*)
@@ -73,6 +79,7 @@ case "$name" in
 		exit 97
 		;;
 	mount)
+		rm -f "$final.fake-unmounted"
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			: > "$FAKE_NODE_MOUNT_STATE_FILE"
 			previous=""
@@ -103,6 +110,7 @@ case "$name" in
 		exit 0
 		;;
 	umount)
+		: > "$final.fake-unmounted" 2>/dev/null || true
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			rm -f "$FAKE_NODE_MOUNT_STATE_FILE"
 			rm -f "$FAKE_NODE_MOUNT_STATE_FILE.info"
@@ -234,6 +242,23 @@ func TestNodeGetInfo(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, int64(32), resp.MaxVolumesPerNode)
+	})
+
+	t.Run("UblkDefaultAdvertisesItsVolumeBudget", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		d.config.NVMeoF.Enabled = true
+		d.config.NVMeoF.DataPath = NVMeoFDataPathUblk
+		d.config.NVMeoF.Ublk.MaxVolumesPerNode = 64
+
+		resp, err := d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+
+		require.NoError(t, err)
+		assert.Equal(t, int64(64), resp.MaxVolumesPerNode, "past this nvmeublkd refuses the attach, so the scheduler must know")
+
+		d.config.Node.MaxVolumesPerNode = 12
+		resp, err = d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+		require.NoError(t, err)
+		assert.Equal(t, int64(12), resp.MaxVolumesPerNode, "an explicit node limit wins")
 	})
 
 	t.Run("WithTopology", func(t *testing.T) {
@@ -850,6 +875,16 @@ func TestNodePublishUnpublishVolume_BlockRoundTrip(t *testing.T) {
 	stagingPath := filepath.Join(t.TempDir(), "staged-device")
 	require.NoError(t, os.Symlink("/dev/null", stagingPath))
 	targetPath := filepath.Join(t.TempDir(), "pod", "volume")
+	// The fake mount cannot bind a device: report the bound target as the
+	// staged device, as stat through a real bind mount does.
+	originalStat := nodeStatsStat
+	t.Cleanup(func() { nodeStatsStat = originalStat })
+	nodeStatsStat = func(path string) (uint32, uint64, error) {
+		if path == targetPath || path == "/dev/null" {
+			return unix.S_IFBLK | 0o660, 7, nil
+		}
+		return originalStat(path)
+	}
 	d := newTestNodeDriver(ShareTypeISCSI)
 	req := &csi.NodePublishVolumeRequest{
 		VolumeId:          "block-vol",

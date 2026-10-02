@@ -145,19 +145,23 @@ func TestListVolumes_Pagination(t *testing.T) {
 	assert.Equal(t, []string{"vol-0", "vol-1", "vol-2", "vol-3", "vol-4"}, walkedIDs)
 
 	// P-2 API shape: one path-scoped listing per WALK (the fresh page), served
-	// from the frozen view for both continuation pages; one id-filtered
-	// hydration read per page. The old per-page pool.dataset.query lookahead
-	// (DatasetList with limit+1) is gone entirely — DatasetList would only run
-	// as the fallback when the resource listing errs.
+	// from the frozen view for both continuation pages. With records in
+	// Kubernetes no page is re-read: none of these datasets carries a ZFS
+	// publication record key, so the listing alone answers every entry. With
+	// records on ZFS every page is re-read by name, since a record written
+	// after the listing is on the dataset only. The old per-page pool.dataset.query
+	// lookahead (DatasetList with limit+1) is gone entirely — DatasetList
+	// would only run as the fallback when the resource listing errs.
 	assert.Equal(t, []string{"pool/parent"}, paginatedClient.datasetQueryByParentParents,
 		"exactly one listing call per walk, issued by the fresh (empty-token) page")
 	assert.Empty(t, paginatedClient.datasetListLimits,
 		"the pool.dataset.query fallback must not run when the path-scoped listing succeeds")
-	assert.Equal(t, [][]string{
-		{"pool/parent/vol-0", "pool/parent/vol-1"},
-		{"pool/parent/vol-2", "pool/parent/vol-3"},
-		{"pool/parent/vol-4"},
-	}, paginatedClient.datasetGetByNamesCalls, "one page-scoped hydration read per returned page")
+	if recordsInKubernetes() {
+		assert.Empty(t, paginatedClient.datasetGetByNamesCalls, "no page re-read without ZFS record keys")
+	} else {
+		assert.Equal(t, [][]string{{"pool/parent/vol-0", "pool/parent/vol-1"}, {"pool/parent/vol-2", "pool/parent/vol-3"}, {"pool/parent/vol-4"}},
+			paginatedClient.datasetGetByNamesCalls, "with records on ZFS every page is re-read by name")
+	}
 }
 
 func TestListSnapshots_Pagination(t *testing.T) {

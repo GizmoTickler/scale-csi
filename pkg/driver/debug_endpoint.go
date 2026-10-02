@@ -249,14 +249,7 @@ func (s *DebugServer) collectState() DebugState {
 	// Currently-held per-volume operation locks (acquireOperationLock in
 	// driver.go). A key that stays here across repeated fetches is the
 	// signature of a wedged operation — exactly what this endpoint is for.
-	d.operationLock.Range(func(key, _ interface{}) bool {
-		if lockKey, ok := key.(string); ok {
-			state.OperationLocks = append(state.OperationLocks, lockKey)
-		}
-		return true
-	})
-	// sync.Map iteration order is unspecified; sort for a diff-stable dump.
-	sort.Strings(state.OperationLocks)
+	state.OperationLocks = append(state.OperationLocks, d.describedOperationLocks()...)
 
 	// Backend connection view. IsConnected is read directly instead of via
 	// observeTrueNASConnection so a debug fetch never mutates metrics or emits

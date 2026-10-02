@@ -415,7 +415,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 			"a source with no block history costs the one history read, whatever the class says")
 
 		nfs, nfsMethods := measure(t, "restore-nfs", "nfs", nil, nil)
-		assert.Equal(t, 10, nfs, "the NFS clone golden is untouched by any of this")
+		assert.Equal(t, 9, nfs, "the NFS clone golden is untouched by any of this")
 		assert.Zero(t, nfsMethods["ISCSIExtentFindByDisk"])
 	})
 }
@@ -1391,10 +1391,15 @@ func TestBackStampingAVolumeCostsNoExtraRoundTrip(t *testing.T) {
 		"the publish must back-stamp the LIVE extent's geometry; 512 here is the controller default being stamped instead")
 	assert.Equal(t, "true", legacyDS.UserProperties[PropBlockISCSIPblocksize].Value,
 		"and the physical half with it — a half-stamped volume is refused on its next rebuild")
-	assert.Equal(t, stampedTotal, legacyTotal,
-		"and back-stamping it must cost exactly what re-ensuring an already-recorded volume costs")
-	assert.Equal(t, stampedMethods["DatasetSetUserProperties"], legacyMethods["DatasetSetUserProperties"],
+	// Batch 4.3: re-ensuring an already-recorded volume writes nothing at all,
+	// so back-stamping costs exactly the one dataset update that carries the
+	// resource IDs and the geometry together, never a write of its own.
+	assert.Equal(t, 0, stampedMethods["DatasetSetUserProperties"],
+		"an already-recorded volume is not rewritten")
+	assert.Equal(t, 1, legacyMethods["DatasetSetUserProperties"],
 		"the geometry must ride in the resource-ID update, not in a write of its own")
+	assert.Equal(t, stampedTotal+1, legacyTotal,
+		"and back-stamping it must cost exactly that one update over re-ensuring an already-recorded volume")
 }
 
 // TestStampVsLiveGeometryDisagreementIsRefused is mechanism (4) on a volume, and

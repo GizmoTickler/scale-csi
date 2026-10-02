@@ -199,4 +199,35 @@ roleRef:
   kind: Role
   name: {{ include "scale-csi.fullname" . }}-controller-leases
   apiGroup: rbac.authorization.k8s.io
+---
+# Publication records (VolumePublication, crds/), kept in this namespace only.
+# "watch" feeds the cache ListVolumes reads; there is no patch: every write is
+# an update carrying the resourceVersion it read.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-controller-publications
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["scale-csi.io"]
+    resources: ["volumepublications"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-controller-publications
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "scale-csi.controllerServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "scale-csi.fullname" . }}-controller-publications
+  apiGroup: rbac.authorization.k8s.io
 {{- end }}

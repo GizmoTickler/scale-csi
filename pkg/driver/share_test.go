@@ -98,6 +98,14 @@ func (m *shareVerificationErrorMock) NVMeoFNamespaceGet(context.Context, int) (*
 	return nil, m.err
 }
 
+func (m *ErrorInjectingMockClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	m.CleanupCalls = append(m.CleanupCalls, fmt.Sprintf("NVMeoFSubsystemDeleteCascade(%d)", id))
+	if m.InjectNVMeoFSubsystemDeleteError != nil {
+		return m.InjectNVMeoFSubsystemDeleteError
+	}
+	return m.MockClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
 type nvmeReconcileFailureMock struct {
 	*truenas.MockClient
 	deletedSubsystemIDs []int
@@ -122,7 +130,7 @@ func (m *iscsiTargetCreateFailMock) ISCSITargetCreate(ctx context.Context, name,
 }
 
 func (m *nvmePortAssociationFailMock) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...truenas.NVMeoFPortCreateOptions) (*truenas.NVMeoFPort, error) {
-	if m.cachedPort != nil {
+	if m.cachedPort != nil && m.cachedPort.Address == address {
 		return m.cachedPort, nil
 	}
 	m.portFindCalls++
@@ -540,7 +548,11 @@ func TestDeleteNVMeoFShare_PropagatesCleanupErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "NVMe-oF cleanup errors")
 }
 
-func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
+// TestDeleteNVMeoFShare_LeavesASharedSubsystemAlone: a subsystem that also
+// serves another volume's namespace keeps its port associations and is not
+// deleted (deleting the associations took the other volume offline, and the
+// subsystem delete was refused anyway, so the delete failed for good).
+func TestDeleteNVMeoFShare_LeavesASharedSubsystemAlone(t *testing.T) {
 	mockClient := &nvmeDeleteAssociationCountingMock{MockClient: truenas.NewMockClient()}
 	d := &Driver{
 		config: &Config{
@@ -557,11 +569,13 @@ func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mockClient.DatasetSetUserProperty(context.Background(), datasetName, PropNVMeoFSubsystemID, "1"))
 	mockClient.NVMeSubsystems[1] = &truenas.NVMeoFSubsystem{ID: 1, Name: "test-nvme-assoc-cache"}
+	mockClient.NVMeNamespaces[99] = &truenas.NVMeoFNamespace{ID: 99, SubsystemID: 1, DevicePath: "zvol/tank/k8s/volumes/another"}
 
-	err = d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName)
-	require.Error(t, err)
-	assert.Equal(t, 1, mockClient.portSubsysDeleteCalls)
-	assert.Equal(t, 1, mockClient.portSubsysListCalls)
+	require.NoError(t, d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName))
+	assert.Zero(t, mockClient.portSubsysDeleteCalls, "no port association of the shared subsystem is deleted")
+	assert.Zero(t, mockClient.portSubsysListCalls)
+	assert.Contains(t, mockClient.NVMeSubsystems, 1, "the subsystem stays")
+	assert.Contains(t, mockClient.NVMeNamespaces, 99, "and so does the other volume's namespace")
 }
 
 // =============================================================================
@@ -905,12 +919,87 @@ func TestCreateNVMeoFShareDeletesNewSubsystemOnHostReconcileFailure(t *testing.T
 	datasetName := "tank/k8s/volumes/reconcile-failure"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
+	// A subsystem of this name left behind by an earlier attempt: the create
+	// adopts it, and only an adopted subsystem is reconciled (a truly new one
+	// has nothing to reconcile).
+	leftover, err := base.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName(datasetName), true, nil)
+	require.NoError(t, err)
 
 	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "reconcile-failure", true, true, nil)
 	require.Error(t, err)
-	require.Len(t, client.deletedSubsystemIDs, 1)
+	require.Equal(t, []int{leftover.ID}, client.deletedSubsystemIDs)
 	_, err = client.NVMeoFSubsystemGet(ctx, client.deletedSubsystemIDs[0])
 	require.Error(t, err)
+}
+
+// A subsystem nvmet.subsys.create really made already has exactly the
+// allow_any_host value and host associations it was created with, so the
+// create path no longer re-reads or rewrites them. An adopted one still is.
+func TestCreateNVMeoFShareReconcilesOnlyAnAdoptedSubsystem(t *testing.T) {
+	for _, mode := range []FencingMode{FencingModeStrict, FencingModeOff} {
+		for _, adopted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s adopted=%v", mode, adopted), func(t *testing.T) {
+				ctx := context.Background()
+				base := truenas.NewMockClient()
+				nqn := "nqn.2014-08.org.nvmexpress:node-a"
+				_, err := base.NVMeoFHostCreate(ctx, nqn)
+				require.NoError(t, err)
+				client := &allowlistCountingClient{MockClient: base}
+				nvme := NVMeoFConfig{Transport: "TCP", TransportAddress: "192.0.2.20", TransportServiceID: 4420}
+				if mode == FencingModeOff {
+					nvme.SubsystemHosts = []string{nqn}
+				}
+				d := &Driver{
+					config:        &Config{Fencing: FencingConfig{Mode: mode}, NVMeoF: nvme},
+					truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+				}
+				datasetName := "tank/k8s/volumes/reconcile-only-adopted"
+				ds, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+				require.NoError(t, err)
+				if adopted {
+					// Left by an earlier attempt, without its host association (and,
+					// under strict, left open): it must be reconciled.
+					_, err = base.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName(datasetName), mode == FencingModeStrict, nil)
+					require.NoError(t, err)
+				}
+				counter := &hostSubsysCallCounter{allowlistCountingClient: client}
+				d.truenasClient = counter
+
+				require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "reconcile-only-adopted", true, true, nil))
+				subsystem, err := base.NVMeoFSubsystemFindByName(ctx, d.nvmeSubsystemName(datasetName))
+				require.NoError(t, err)
+				assert.False(t, subsystem.AllowAnyHost)
+				associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+				require.NoError(t, err)
+				if mode == FencingModeOff {
+					require.Len(t, associations, 1, "the configured static host is associated")
+				} else {
+					assert.Empty(t, associations, "strict starts closed")
+				}
+				reconcileCalls := client.nvmeAllowAnyHost.Load() + counter.lists + counter.finds
+				if adopted {
+					assert.NotZero(t, reconcileCalls)
+				} else {
+					assert.Zero(t, reconcileCalls, "a subsystem this call created is not read back or rewritten")
+				}
+			})
+		}
+	}
+}
+
+type hostSubsysCallCounter struct {
+	*allowlistCountingClient
+	lists, finds int64
+}
+
+func (c *hostSubsysCallCounter) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
+	c.lists++
+	return c.allowlistCountingClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
+}
+
+func (c *hostSubsysCallCounter) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*truenas.NVMeoFHostSubsys, error) {
+	c.finds++
+	return c.allowlistCountingClient.NVMeoFHostSubsysFind(ctx, hostID, subsysID)
 }
 
 func TestEnsureShareExistsDoesNotDeletePreexistingSubsystemOnHostReconcileFailure(t *testing.T) {
@@ -1393,7 +1482,7 @@ func TestCreateShareWithOptions_UnsupportedType(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := d.createShareWithOptions(ctx, nil, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, false, nil)
+	err := d.createShareWithOptions(ctx, nil, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, false, nil, nil)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported share type")

@@ -1190,3 +1190,55 @@ func TestChartStartupConnectTimeoutFailsAtRenderPastInt32(t *testing.T) {
 		t.Fatalf("a representable timeout must still render its derived threshold")
 	}
 }
+
+// TestChartObserveBusyBeforeDeletePlumbing: zfs.observeBusyBeforeDelete
+// defaults to on-failure (the controller's own default) and is rendered only
+// when set to something else, so the default configmap carries no key an
+// older binary would refuse. The boolean forms render as booleans, which every
+// release since the key was added accepts; the mode names render as strings.
+func TestChartObserveBusyBeforeDeletePlumbing(t *testing.T) {
+	for _, args := range [][]string{nil, {"--set", "zfs.observeBusyBeforeDelete=on-failure"}} {
+		out := helmTemplate(t, append([]string{"--show-only", "templates/configmap.yaml"}, args...)...)
+		if strings.Contains(out, "observeBusyBeforeDelete") {
+			t.Errorf("%v: the configmap must not emit zfs.observeBusyBeforeDelete at its default", args)
+		}
+	}
+	for value, want := range map[string]string{
+		"true":   "      observeBusyBeforeDelete: true\n",
+		"false":  "      observeBusyBeforeDelete: false\n",
+		"always": "      observeBusyBeforeDelete: \"always\"\n",
+		"never":  "      observeBusyBeforeDelete: \"never\"\n",
+	} {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.observeBusyBeforeDelete="+value)
+		if !strings.Contains(out, want) {
+			t.Errorf("--set zfs.observeBusyBeforeDelete=%s did not render %q; got:\n%s", value, want, out)
+		}
+	}
+	out := helmTemplateExpectError(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.observeBusyBeforeDelete=sometimes")
+	if !strings.Contains(out, "observeBusyBeforeDelete") {
+		t.Errorf("the schema must reject zfs.observeBusyBeforeDelete=sometimes by name; got:\n%s", out)
+	}
+}
+
+// TestDashboardBusyPanelDescribesOnFailureMode: the delete-observability panel
+// must not claim the busy scans run before every destroy; by default
+// (zfs.observeBusyBeforeDelete: on-failure) they run only after a failed one.
+func TestDashboardBusyPanelDescribesOnFailureMode(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(chartDir(t), "templates", "grafana-dashboard.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	start := strings.Index(content, `"description":"Best-effort delete observability`)
+	if start < 0 {
+		t.Fatal("the delete-observability panel description is missing")
+	}
+	end := strings.Index(content[start+15:], `","`)
+	description := content[start : start+15+end]
+	if strings.Contains(description, "immediately before a dataset destroy") {
+		t.Errorf("the panel still says the scans run before every destroy: %s", description)
+	}
+	if !strings.Contains(description, "on-failure") {
+		t.Errorf("the panel must name the default on-failure mode: %s", description)
+	}
+}

@@ -274,7 +274,7 @@ func canonicalNodeIPs(ips []net.IP) []net.IP {
 	return result
 }
 
-func discoverNodeIdentity(ctx context.Context, nodeName string) NodeIdentity {
+func discoverNodeIdentity(ctx context.Context, nodeName string, identityNetworks []nodeIdentityNetwork) NodeIdentity {
 	identity := NodeIdentity{Name: nodeName}
 	if output, err := nodeIdentityCommand(ctx, "nvme", "show-hostnqn"); err == nil {
 		identity.NVMeNQN = strings.TrimSpace(string(output))
@@ -308,31 +308,232 @@ func discoverNodeIdentity(ctx context.Context, nodeName string) NodeIdentity {
 		// non-deferably (see validateOrDeferFencingIdentity).
 		identity.ISCSIReportedSentinel = true
 	}
-	for _, envName := range []string{"NODE_IP", "NODE_IPS"} {
-		for _, value := range strings.FieldsFunc(os.Getenv(envName), func(r rune) bool { return r == ',' || r == ' ' }) {
-			if ip := net.ParseIP(value); ip != nil {
-				identity.IPs = append(identity.IPs, ip)
-			}
-		}
-	}
-	// The chart injects status.hostIP. Prefer that stable control-plane identity
-	// over enumerating host-network/CNI interfaces, whose addresses and lexical
-	// order can change across restarts and would make CSI's node_id unstable.
-	if len(identity.IPs) == 0 {
-		if addresses, err := nodeInterfaceAddrs(); err == nil {
-			for _, address := range addresses {
-				value := address.String()
-				if host, _, splitErr := net.SplitHostPort(value); splitErr == nil {
-					value = host
-				} else if slash := strings.IndexByte(value, '/'); slash >= 0 {
-					value = value[:slash]
-				}
-				if ip := net.ParseIP(value); ip != nil {
-					identity.IPs = append(identity.IPs, ip)
-				}
-			}
-		}
-	}
-	identity.IPs = canonicalNodeIPs(identity.IPs)
+	identity.IPs = nodeIdentityIPs(os.Getenv("NODE_IP"), os.Getenv("NODE_IPS"), nodeInterfaceIPs, identityNetworks)
 	return identity
+}
+
+// nodeIdentityIPs is the identity's IP list: the addresses in NODE_IP/NODE_IPS
+// (the chart injects status.hostIP), or, when neither holds one, every
+// interface address. The chart's stable control-plane address is preferred
+// over enumerating host-network/CNI interfaces, whose addresses and order can
+// change across restarts and would make CSI's node_id unstable.
+//
+// identityNetworks (nfs.nodeIdentityNetworks) adds, on top of that, every
+// interface address inside one of the listed storage networks: a node that
+// reaches the NAS over a storage fabric presents that fabric address as its
+// NFS client address, and the controller can only add it to an export's hosts
+// when it is in the identity. With no networks the result is exactly the
+// historical one, and the interfaces are not even read when an env address
+// exists, so the default node_id never changes.
+func nodeIdentityIPs(nodeIP, nodeIPs string, interfaceIPs func() []net.IP, identityNetworks []nodeIdentityNetwork) []net.IP {
+	var ips []net.IP
+	for _, value := range []string{nodeIP, nodeIPs} {
+		for _, field := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' }) {
+			if ip := net.ParseIP(field); ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	var interfaces []net.IP
+	if len(ips) == 0 || len(identityNetworks) > 0 {
+		interfaces = interfaceIPs()
+	}
+	if len(ips) == 0 {
+		ips = append(ips, interfaces...)
+	}
+	if len(identityNetworks) > 0 {
+		for _, ip := range canonicalNodeIPs(interfaces) {
+			if nodeIdentityNetworksContain(identityNetworks, ip) {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return canonicalNodeIPs(ips)
+}
+
+// nodeInterfaceIPs lists this host's interface addresses (the node plugin runs
+// on the host network). A listing failure is no addresses, as before.
+func nodeInterfaceIPs() []net.IP {
+	addresses, err := nodeInterfaceAddrs()
+	if err != nil {
+		klog.Warningf("discoverNodeIdentity: cannot list interface addresses: %v", err)
+		return nil
+	}
+	ips := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		value := address.String()
+		if host, _, splitErr := net.SplitHostPort(value); splitErr == nil {
+			value = host
+		} else if slash := strings.IndexByte(value, '/'); slash >= 0 {
+			value = value[:slash]
+		}
+		if ip := net.ParseIP(value); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
+
+// maxNodeIdentityNetworks bounds nfs.nodeIdentityNetworks like every other
+// address list in the config.
+const maxNodeIdentityNetworks = 16
+
+// nodeIdentityNetwork is one nfs.nodeIdentityNetworks entry: a CIDR, or a bare
+// IP that matches only itself.
+type nodeIdentityNetwork struct {
+	network *net.IPNet
+	ip      net.IP
+}
+
+// parseNodeIdentityNetworks validates nfs.nodeIdentityNetworks. An entry is a
+// CIDR or a bare IP, without a zone; an IPv4-mapped IPv6 CIDR is refused (write
+// the IPv4 form) because identity IPs are canonical IPv4 and the two spellings
+// would otherwise match differently. The Rust node agent applies the same rules
+// (rust/scale-csi-node/src/discovery.rs), checked against the shared vectors.
+func parseNodeIdentityNetworks(entries []string) ([]nodeIdentityNetwork, error) {
+	if len(entries) > maxNodeIdentityNetworks {
+		return nil, fmt.Errorf("nfs.nodeIdentityNetworks must contain at most %d entries (got %d)", maxNodeIdentityNetworks, len(entries))
+	}
+	networks := make([]nodeIdentityNetwork, 0, len(entries))
+	for i, entry := range entries {
+		value := strings.TrimSpace(entry)
+		if strings.Contains(value, "/") {
+			ip, network, err := net.ParseCIDR(value)
+			if err != nil {
+				return nil, fmt.Errorf("nfs.nodeIdentityNetworks[%d] %q is not a CIDR or an IP address", i, entry)
+			}
+			if ip.To4() != nil && strings.Contains(value, ":") {
+				return nil, fmt.Errorf("nfs.nodeIdentityNetworks[%d] %q is an IPv4-mapped IPv6 network; write it as an IPv4 CIDR", i, entry)
+			}
+			networks = append(networks, nodeIdentityNetwork{network: network})
+			continue
+		}
+		ip := net.ParseIP(value)
+		if ip == nil {
+			return nil, fmt.Errorf("nfs.nodeIdentityNetworks[%d] %q is not a CIDR or an IP address", i, entry)
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
+		networks = append(networks, nodeIdentityNetwork{ip: ip})
+	}
+	return networks, nil
+}
+
+// nodeIdentityNetworksContain reports whether a canonical identity IP is in
+// one of the networks: an IPv4 network holds only IPv4 addresses, an IPv6
+// network only IPv6 ones.
+func nodeIdentityNetworksContain(networks []nodeIdentityNetwork, ip net.IP) bool {
+	for _, entry := range networks {
+		if entry.network != nil && entry.network.Contains(ip) {
+			return true
+		}
+		if entry.ip != nil && entry.ip.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeIdentityDroppedIPs lists the identity-network addresses that the CSI
+// 256-byte node_id limit left out of nodeID: the controller cannot grant them,
+// so NFS mounts from them will be refused. The encoder packs IPs in canonical
+// text order and drops the tail; the caller warns rather than failing the node
+// plugin, which still serves every other address and protocol.
+func nodeIdentityDroppedIPs(identity NodeIdentity, identityNetworks []nodeIdentityNetwork, nodeID string) []net.IP {
+	if len(identityNetworks) == 0 || len(identity.IPs) == 0 {
+		return nil
+	}
+	encoded, err := parseNodeIdentity(nodeID)
+	if err != nil {
+		return nil
+	}
+	kept := make(map[string]struct{}, len(encoded.IPs))
+	for _, ip := range encoded.IPs {
+		kept[ip.String()] = struct{}{}
+	}
+	var dropped []net.IP
+	for _, ip := range canonicalNodeIPs(identity.IPs) {
+		if _, ok := kept[ip.String()]; !ok && nodeIdentityNetworksContain(identityNetworks, ip) {
+			dropped = append(dropped, ip)
+		}
+	}
+	return dropped
+}
+
+// nodeNVMeHostIDFiles are read in order for the node's NVMe host ID. The node
+// plugin mounts the host root at /host; the unprefixed path covers an image
+// that bind-mounts /etc/nvme directly.
+var nodeNVMeHostIDFiles = []string{"/host/etc/nvme/hostid", "/etc/nvme/hostid"}
+
+// nodeNVMeHostID returns the NVMe host ID the node's own `nvme connect` would
+// use alongside hostNQN, so a userspace initiator presents the same identity
+// as the kernel one. The configured /etc/nvme/hostid wins; otherwise the ID
+// is the UUID of a UUID-form host NQN (nqn.2014-08.org.nvmexpress:uuid:<id>),
+// which is how nvme-cli derives it when the file is absent (the case on
+// Flatcar). A present but malformed file is an error rather than a fallback:
+// the kernel path would present that file's value, not the derived one.
+func nodeNVMeHostID(hostNQN string) (string, error) {
+	for _, path := range nodeNVMeHostIDFiles {
+		contents, err := nodeReadIdentityFile(path)
+		if err != nil {
+			continue
+		}
+		raw := strings.TrimSpace(string(contents))
+		if raw == "" {
+			continue
+		}
+		hostID, ok := canonicalNVMeHostID(raw)
+		if !ok {
+			return "", fmt.Errorf("%s does not hold a UUID host ID: %q", path, raw)
+		}
+		return hostID, nil
+	}
+	if _, uuid, found := strings.Cut(strings.TrimSpace(hostNQN), ":uuid:"); found {
+		if hostID, ok := canonicalNVMeHostID(uuid); ok {
+			return hostID, nil
+		}
+	}
+	return "", fmt.Errorf("no NVMe host ID: /etc/nvme/hostid is absent and host NQN %q is not UUID-based", hostNQN)
+}
+
+// canonicalNVMeHostID returns raw as a lower-case 8-4-4-4-12 UUID, accepting
+// any dash placement or none, or ok=false when raw is not 32 hex digits.
+func canonicalNVMeHostID(raw string) (string, bool) {
+	hex := strings.ReplaceAll(strings.ToLower(raw), "-", "")
+	if len(hex) != 32 {
+		return "", false
+	}
+	for _, c := range hex {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return hex[0:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:32], true
+}
+
+// validateNodeIdentityNetworks checks nfs.nodeIdentityNetworks at config load
+// (the controller and the node read the same file). It also warns when a
+// network lies outside a non-empty nfs.shareAllowedNetworks: the controller
+// stamps only identity IPs inside those networks onto an export, so a fabric
+// address outside them would still never be granted.
+func validateNodeIdentityNetworks(nfs *NFSConfig) error {
+	networks, err := parseNodeIdentityNetworks(nfs.NodeIdentityNetworks)
+	if err != nil {
+		return err
+	}
+	if len(nfs.ShareAllowedNetworks) == 0 {
+		return nil
+	}
+	for i, entry := range networks {
+		ip := entry.ip
+		if entry.network != nil {
+			ip = entry.network.IP
+		}
+		if allowed, allowedErr := ipWithinConfiguredNetworks(ip, nfs.ShareAllowedNetworks); allowedErr == nil && !allowed {
+			klog.Warningf("nfs.nodeIdentityNetworks[%d] %q is outside nfs.shareAllowedNetworks %v: the controller never grants node addresses outside shareAllowedNetworks, so add the storage network there too",
+				i, nfs.NodeIdentityNetworks[i], nfs.ShareAllowedNetworks)
+		}
+	}
+	return nil
 }

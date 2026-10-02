@@ -584,11 +584,19 @@ Watch these series:
   connections;
 - `scale_csi_truenas_pending_calls` for current in-flight JSON-RPC depth across
   the pool; a sustained rise indicates backend latency or stalled callers;
+- `scale_csi_truenas_requests_waiting{class}` and
+  `scale_csi_truenas_request_admission_wait_seconds{class}` for calls queued for
+  one of the client's request slots, by operation class (`attach`, `default`,
+  `delete`). Attach is admitted first; a rising `attach` wait means TrueNAS
+  cannot keep up even with publishes first, while `delete` waiting is expected
+  under load;
 - `scale_csi_iscsi_sessions_total` and `scale_csi_nvme_sessions_total` for the
   sessions observed by node session garbage collection;
 - `scale_csi_node_connect_total` and
   `scale_csi_gc_sessions_disconnected_total` for per-transport node connection
-  attempts and orphan cleanup;
+  attempts and orphan cleanup; attaches through the userspace NVMe/TCP data
+  path count under `transport="nvmeof-ublk"`, separate from the kernel
+  initiator's `nvmeof`;
 - `scale_csi_nvme_path_connect_total{address,result}` for requested NVMe-oF
   path convergence. A sustained non-zero rate for `result="error"` identifies
   a secondary path that remains unavailable or exhausted the shared five-second

@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,27 +26,40 @@ type MockClient struct {
 	mu                     sync.RWMutex
 	setUserPropertiesCalls int
 
+	// DisableResourceQuery models an appliance without zfs.resource.query for
+	// the dependent-clone origin scan, which then covers only the CSI parent
+	// (pool.dataset.query) instead of the whole pool.
+	DisableResourceQuery bool
+
 	// Mock data
-	Datasets                   map[string]*Dataset
-	Snapshots                  map[string]*Snapshot
-	NFSShares                  map[int]*NFSShare
-	ISCSITargets               map[int]*ISCSITarget
-	ISCSIExtents               map[int]*ISCSIExtent
-	TargetExtents              map[int]*ISCSITargetExtent
-	NVMeHosts                  map[string]*NVMeoFHost
-	NVMeHostSubsystems         map[int]*NVMeoFHostSubsys
-	NVMeSubsystems             map[int]*NVMeoFSubsystem
-	NVMeNamespaces             map[int]*NVMeoFNamespace
-	ISCSIPortals               map[int]*ISCSIPortal
-	ISCSIInitiators            map[int]*ISCSIInitiator
-	ISCSIAuths                 map[int]*ISCSIAuth
-	PoolAvailable              int64
-	ReplicationJobs            map[int64]*ReplicationJob
-	SnapshotTasks              map[int]*SnapshotTask
-	SnapshotTaskDeleteCalls    []int
-	nextSnapshotTaskID         int
-	deferredSnapshots          map[string]struct{}
-	DatasetDeleteCalls         []DatasetDeleteCall
+	Datasets           map[string]*Dataset
+	Snapshots          map[string]*Snapshot
+	NFSShares          map[int]*NFSShare
+	ISCSITargets       map[int]*ISCSITarget
+	ISCSIExtents       map[int]*ISCSIExtent
+	TargetExtents      map[int]*ISCSITargetExtent
+	NVMeHosts          map[string]*NVMeoFHost
+	NVMeHostSubsystems map[int]*NVMeoFHostSubsys
+	NVMeSubsystems     map[int]*NVMeoFSubsystem
+	NVMeNamespaces     map[int]*NVMeoFNamespace
+	// NVMePorts and NVMePortSubsystems make ports and port associations
+	// stateful: one port per transport address, and associations that a
+	// later listing returns, so a test sees a re-created association.
+	NVMePorts               map[string]*NVMeoFPort
+	NVMePortSubsystems      map[int]*NVMeoFPortSubsys
+	ISCSIPortals            map[int]*ISCSIPortal
+	ISCSIInitiators         map[int]*ISCSIInitiator
+	ISCSIAuths              map[int]*ISCSIAuth
+	PoolAvailable           int64
+	ReplicationJobs         map[int64]*ReplicationJob
+	SnapshotTasks           map[int]*SnapshotTask
+	SnapshotTaskDeleteCalls []int
+	nextSnapshotTaskID      int
+	deferredSnapshots       map[string]struct{}
+	DatasetDeleteCalls      []DatasetDeleteCall
+	// SnapshotDeleteCalls records every SnapshotDelete with the admission
+	// priority its context carried.
+	SnapshotDeleteCalls        []SnapshotDeleteCall
 	DatasetAttachmentValues    map[string][]DatasetAttachment
 	DatasetProcessValues       map[string][]DatasetProcess
 	DatasetAttachmentCalls     []string
@@ -331,6 +345,14 @@ type DatasetDeleteCall struct {
 	Name      string
 	Recursive bool
 	Force     bool
+	// Priority is the admission priority the call's context carried.
+	Priority Priority
+}
+
+// SnapshotDeleteCall records one SnapshotDelete.
+type SnapshotDeleteCall struct {
+	ID       string
+	Priority Priority
 }
 
 // NewMockClient creates a new MockClient.
@@ -347,6 +369,8 @@ func NewMockClient() *MockClient {
 		NVMeHostSubsystems:      make(map[int]*NVMeoFHostSubsys),
 		NVMeSubsystems:          make(map[int]*NVMeoFSubsystem),
 		NVMeNamespaces:          make(map[int]*NVMeoFNamespace),
+		NVMePorts:               make(map[string]*NVMeoFPort),
+		NVMePortSubsystems:      make(map[int]*NVMeoFPortSubsys),
 		ReplicationJobs:         make(map[int64]*ReplicationJob),
 		SnapshotTasks:           make(map[int]*SnapshotTask),
 		DatasetAttachmentValues: make(map[string][]DatasetAttachment),
@@ -785,6 +809,7 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 		Name:      name,
 		Recursive: recursive,
 		Force:     force,
+		Priority:  priorityOf(ctx),
 	})
 
 	if m.InjectError != nil {
@@ -1143,12 +1168,25 @@ func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName 
 		return false, m.InjectError
 	}
 	originPrefix := datasetName + "@"
-	for _, dataset := range m.Datasets {
-		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
+	for name, dataset := range m.Datasets {
+		if m.originScanSees(datasetName, name) && strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// originScanSees mirrors the real client's origin-scan scope: the whole pool of
+// subject where zfs.resource.query is available (the default), else only the
+// CSI parent of subject (DisableResourceQuery models the pool.dataset.query
+// fallback).
+func (m *MockClient) originScanSees(subject, name string) bool {
+	datasetPath, _, _ := strings.Cut(subject, "@")
+	if m.DisableResourceQuery {
+		return strings.HasPrefix(name, path.Dir(datasetPath)+"/")
+	}
+	pool, _, _ := strings.Cut(datasetPath, "/")
+	return name == pool || strings.HasPrefix(name, pool+"/")
 }
 
 // DatasetPromote models pool.dataset.promote with FULL live fidelity (P3):
@@ -1226,7 +1264,8 @@ func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) err
 }
 
 // SnapshotDependentClones mirrors the real client's authoritative per-snapshot
-// dependent-clone query: it walks ALL datasets, not only driver-managed ones,
+// dependent-clone query: it walks every dataset in the client's scope (see
+// originScanSees), not only driver-managed ones,
 // so a test can seed an unmanaged sibling clone and see it counted.
 func (m *MockClient) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
 	m.mu.RLock()
@@ -1236,7 +1275,7 @@ func (m *MockClient) SnapshotDependentClones(ctx context.Context, snapshotID str
 	}
 	var clones []string
 	for name, dataset := range m.Datasets {
-		if datasetPropertyString(dataset.Origin) == snapshotID {
+		if m.originScanSees(snapshotID, name) && datasetPropertyString(dataset.Origin) == snapshotID {
 			clones = append(clones, name)
 		}
 	}
@@ -1680,6 +1719,7 @@ func (m *MockClient) SetSnapshotUsedBytes(snapshotID string, usedBytes int64) {
 func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.SnapshotDeleteCalls = append(m.SnapshotDeleteCalls, SnapshotDeleteCall{ID: snapshotID, Priority: priorityOf(ctx)})
 
 	if m.InjectError != nil {
 		return m.InjectError
@@ -2084,7 +2124,7 @@ func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotI
 func (m *MockClient) snapshotClonesLocked(snapshotID string) []string {
 	var clones []string
 	for name, dataset := range m.Datasets {
-		if datasetPropertyString(dataset.Origin) == snapshotID {
+		if m.originScanSees(snapshotID, name) && datasetPropertyString(dataset.Origin) == snapshotID {
 			clones = append(clones, name)
 		}
 	}
@@ -2761,6 +2801,41 @@ func (m *MockClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsys
 	return associations, nil
 }
 
+// NVMeoFHostSubsysList returns a copy of every association.
+func (m *MockClient) NVMeoFHostSubsysList(ctx context.Context) ([]*NVMeoFHostSubsys, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	associations := make([]*NVMeoFHostSubsys, 0, len(m.NVMeHostSubsystems))
+	for _, association := range m.NVMeHostSubsystems {
+		associationCopy := *association
+		if m.EmptyNVMeHostNQN {
+			associationCopy.HostNQN = ""
+		}
+		associations = append(associations, &associationCopy)
+	}
+	sort.Slice(associations, func(i, j int) bool { return associations[i].ID < associations[j].ID })
+	return associations, nil
+}
+
+// NVMeoFHostList returns a copy of every host.
+func (m *MockClient) NVMeoFHostList(ctx context.Context) ([]*NVMeoFHost, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	hosts := make([]*NVMeoFHost, 0, len(m.NVMeHosts))
+	for _, host := range m.NVMeHosts {
+		hostCopy := *host
+		hosts = append(hosts, &hostCopy)
+	}
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].ID < hosts[j].ID })
+	return hosts, nil
+}
+
 func (m *MockClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2802,7 +2877,19 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 		}
 	}
 
+	// Like the real client: a create for a name that exists returns the
+	// existing subsystem, marked as adopted.
+	for _, existing := range m.NVMeSubsystems {
+		if existing.Name == name {
+			adopted := *existing
+			adopted.Adopted = true
+			return &adopted, nil
+		}
+	}
 	id := len(m.NVMeSubsystems) + 1
+	for m.NVMeSubsystems[id] != nil {
+		id++
+	}
 	hosts := append([]int(nil), hostIDs...)
 	sub := &NVMeoFSubsystem{
 		ID:           id,
@@ -2852,6 +2939,33 @@ func (m *MockClient) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 			delete(m.NVMeHostSubsystems, associationID)
 		}
 	}
+	m.deletePortSubsystemsLocked(id)
+	return nil
+}
+
+func (m *MockClient) deletePortSubsystemsLocked(subsysID int) {
+	for associationID, association := range m.NVMePortSubsystems {
+		if association.SubsysID == subsysID {
+			delete(m.NVMePortSubsystems, associationID)
+		}
+	}
+}
+func (m *MockClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.NVMeSubsystems, id)
+	for namespaceID, namespace := range m.NVMeNamespaces {
+		if namespace.SubsystemID == id {
+			delete(m.NVMeNamespaces, namespaceID)
+		}
+	}
+	for associationID, association := range m.NVMeHostSubsystems {
+		if association.SubsysID == id {
+			delete(m.NVMeHostSubsystems, associationID)
+		}
+	}
+	m.deletePortSubsystemsLocked(id)
 	return nil
 }
 func (m *MockClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error) {
@@ -2956,33 +3070,94 @@ func (m *MockClient) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespac
 
 	list := make([]*NVMeoFNamespace, 0, len(m.NVMeNamespaces))
 	for _, n := range m.NVMeNamespaces {
-		list = append(list, n)
+		namespaceCopy := *n
+		list = append(list, &namespaceCopy)
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list, nil
 }
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
-	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.NVMePorts) == 0 {
+		return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil
+	}
+	ports := make([]*NVMeoFPort, 0, len(m.NVMePorts))
+	for _, port := range m.NVMePorts {
+		copied := *port
+		ports = append(ports, &copied)
+	}
+	sort.Slice(ports, func(i, j int) bool { return ports[i].ID < ports[j].ID })
+	return ports, nil
+}
+
+// mockPortLocked returns the one port for transport/address/port, creating
+// it on first use. The first port created gets ID 1.
+func (m *MockClient) mockPortLocked(transport, address string, port int) *NVMeoFPort {
+	key := fmt.Sprintf("%s|%s|%d", transport, address, port)
+	if existing := m.NVMePorts[key]; existing != nil {
+		copied := *existing
+		return &copied
+	}
+	created := &NVMeoFPort{ID: len(m.NVMePorts) + 1, Transport: transport, Address: address, Port: port}
+	m.NVMePorts[key] = created
+	copied := *created
+	return &copied
 }
 func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
-	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mockPortLocked(transport, address, port), nil
 }
 func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
-	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mockPortLocked(transport, address, port), nil
 }
 func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*NVMeoFPortSubsys, error) {
-	return &NVMeoFPortSubsys{ID: 1, PortID: portID, SubsysID: subsysID}, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, association := range m.NVMePortSubsystems {
+		if association.PortID == portID && association.SubsysID == subsysID {
+			copied := *association
+			return &copied, nil
+		}
+	}
+	id := len(m.NVMePortSubsystems) + 1
+	for m.NVMePortSubsystems[id] != nil {
+		id++
+	}
+	association := &NVMeoFPortSubsys{ID: id, PortID: portID, SubsysID: subsysID}
+	m.NVMePortSubsystems[id] = association
+	copied := *association
+	return &copied, nil
 }
 func (m *MockClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
-	return true, nil
+	associations, err := m.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
+	return len(associations) > 0, err
 }
 func (m *MockClient) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	associations := make([]*NVMeoFPortSubsys, 0, len(m.NVMePortSubsystems))
+	for _, association := range m.NVMePortSubsystems {
+		copied := *association
+		associations = append(associations, &copied)
+	}
+	sort.Slice(associations, func(i, j int) bool { return associations[i].ID < associations[j].ID })
+	return associations, nil
 }
 func (m *MockClient) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
-	// Return empty list for mock
-	return nil, nil
+	all, err := m.NVMeoFPortSubsysList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NVMeoFPortSubsysFilterBySubsystem(all, subsysID), nil
 }
 func (m *MockClient) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.NVMePortSubsystems, id)
 	return nil
 }
 func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, error) {
@@ -2991,12 +3166,19 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 
 	list := make([]*NVMeoFSubsystem, 0, len(m.NVMeSubsystems))
 	for _, s := range m.NVMeSubsystems {
-		list = append(list, s)
+		subsystemCopy := *s
+		subsystemCopy.Hosts = append([]int(nil), s.Hosts...)
+		subsystemCopy.Namespaces = append([]int(nil), s.Namespaces...)
+		subsystemCopy.Ports = append([]int(nil), s.Ports...)
+		list = append(list, &subsystemCopy)
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list, nil
 }
 func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
-	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mockPortLocked(transport, address, port), nil
 }
 func (m *MockClient) InvalidateNVMeoFPort(ctx context.Context, transport, address string, port int) {}
 func (m *MockClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {

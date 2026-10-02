@@ -1,4 +1,853 @@
-# Release notes — v1.12.0 (next)
+# Release notes — next (v1.24.0 draft)
+
+## v1.24.0 (draft) — fewer TrueNAS calls to delete a volume and to move an iSCSI volume
+
+One default changes (`zfs.observeBusyBeforeDelete`, below); nothing else to
+configure.
+
+The numbers below are not measured on hardware. They come from an in-process
+model: the TrueNAS mock with per-call costs taken from 30 days of the
+controller's own request-duration metrics on a TrueNAS 26.0 system
+(`pool.dataset.attachments` 0.72 s, `pool.dataset.processes` 0.54 s,
+`pool.dataset.delete` 0.87 s, `pool.dataset.update` 1.51 s,
+`pool.dataset.query` 0.29 s), a parent-wide dataset query at 5.3 ms per row,
+and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
+
+| | v1.23.1 | v1.24.0 |
+|---|---|---|
+| DeleteVolume, NFS, no snapshots, 30 volumes: calls; TrueNAS time | 8; 3.2 s | 5; 1.5 s |
+| ... at 300 volumes | 8; 4.6 s | 5; 1.5 s |
+| ... at 1,000 volumes | 8; 8.3 s | 5; 1.5 s |
+| Strict iSCSI move (unpublish A, publish B): calls; writes; TrueNAS time | 25; 13; 12.4 s | 19; 7; 6.8 s |
+| Strict iSCSI republish to the same node: calls; writes | 15; 6 | 9; 0 |
+
+- **Delete: no origin scan for a volume without snapshots.** Before deleting
+  a volume's share, DeleteVolume checks that no clone depends on it. A clone
+  can depend on a volume only through one of the volume's own snapshots, and
+  ZFS keeps a cloned snapshot until its last clone is gone. So when the
+  volume has no snapshots (the snapshot listing the delete already makes says
+  so), the check is answered without the parent-wide `pool.dataset.query` of
+  every dataset's origin. A volume with snapshots still runs it: TrueNAS 26.0
+  does not return the snapshot `clones` property through `pool.snapshot.query`
+  or `zfs.resource.snapshot.query` (checked read-only on a live system: it is
+  silently dropped, also for snapshots that do have clones), so the origin
+  scan stays the only authority. A clone of another volume's snapshot never
+  blocks this volume's delete.
+- **Delete: a clone outside the CSI parent is now seen.** The origin scan
+  used to read only the datasets below the CSI parent, so a clone elsewhere
+  in the pool (a restore or backup target, an admin's `zfs clone`) was
+  missed: DeleteVolume deleted the share, ZFS then refused to destroy the
+  dataset, and the volume was left without a share. The scan (also used by
+  the tombstone reaper and promote) now reads every dataset of the pool with
+  one `zfs.resource.query` of the pool root, origin property only. Checked
+  read-only on a live TrueNAS 26.0 system: this sees the pool's internal
+  datasets that `pool.dataset.query` hides, among them a real clone whose
+  origin is in another parent, and costs about what the parent scan did (78
+  datasets in 0.39 s against 47 in 0.45 s). If the pool scan fails, or the
+  controller cannot tell whether `zfs.resource.query` exists (its capability
+  check failed), the delete fails and is retried rather than scanning less.
+  Only on an appliance where `zfs.resource.query` is known to be absent does
+  the scan stay parent-scoped, with the old gap.
+- **Delete: the busy scans run when a delete fails, by default.**
+  `zfs.observeBusyBeforeDelete` now takes a mode:
+  - `on-failure` (the new default): the two observation-only scans
+    (`pool.dataset.attachments`, `pool.dataset.processes`) run only after a
+    dataset delete fails with anything other than a snapshot or children
+    dependency, and what they find is logged at the default verbosity.
+  - `always` (or `true`): before every delete, as before. This is the only
+    setting that records a forced delete of a dataset that was still in use.
+  - `never` (or `false`): not at all.
+
+  The default follows the record: over 30 days, 6,071 dataset deletes each
+  ran both scans, and not one found an attachment or a process, or failed to
+  answer. The `scale_csi_dataset_busy_observations_total` and
+  `..._errors_total` series now exist at zero from start-up. A failure is
+  classified on its reason, not the dataset's name: a volume whose name
+  contains "snapshot" is still observed. `yes`/`no`/`on`/`off` are still
+  accepted as booleans.
+- **iSCSI: write and reload only when something changed.** A publish no
+  longer re-stamps the target, extent and association IDs that are already
+  set; the strict fence no longer rewrites an initiator group that already
+  holds the allowlist, an initiator-group ID that is already stamped, or a
+  target whose groups are already right. A reload follows a change, not a
+  call: the controller tracks the iSCSI changes it has written and which of
+  them a successful reload covers. A pass that changed nothing reloads only
+  if an earlier change is still owed a reload (its reload failed or never ran,
+  or it predates this controller's start: the first iSCSI pass after a start
+  reloads once). A create always reloads, and its ID stamp is always written.
+  A fence that revokes a node (an unpublish, a stale-grant revoke) always
+  reloads, even when it wrote nothing.
+
+  Two consequences:
+  - The record of what a reload covers is per controller process. It knows
+    nothing of changes another controller, or a previous process, wrote; the
+    first iSCSI pass after a start therefore reloads, and revokes always do.
+  - Out-of-band drift in what SCST has loaded (a target or initiator change
+    made outside the controller and not reloaded, or a reload done by hand
+    that failed) is no longer healed by every publish. A publish heals what it
+    compares (the target's groups, the initiator allowlist, the stored IDs)
+    and reloads when it writes; anything else is healed by the next
+    controller restart, whose first iSCSI pass reloads.
+
+### Other fixes
+
+- On TrueNAS 26.0, listing a volume's snapshots dropped a row that came back
+  without its dataset field; the dataset is now taken from the snapshot's
+  name. An empty listing reads as "no snapshots" to DeleteVolume.
+
+### Rolling back to v1.23.1
+
+Nothing to undo on TrueNAS. If your values set `zfs.observeBusyBeforeDelete`
+to `always`, `on-failure` or `never`, set it to `true` or `false` (or remove
+it) before rolling back: the v1.23.1 chart's schema accepts only a boolean,
+and a v1.23.1 controller reading a mode name refuses to start. The default
+render does not contain the key. Rolled back, the busy scans run before every
+delete again.
+
+## v1.23.1 — v1.23.0, released
+
+v1.23.0's tag build failed on a race in one admission test (the mock server
+counted a finished query as in flight), so v1.23.0 published no images or
+chart. v1.23.1 is the same controller with that test fixed; everything in
+the v1.23.0 section below ships in v1.23.1.
+
+## v1.23.0 — snapshots and publishes no longer turn each other away
+
+Nothing to configure. Three changes to how the controller schedules its own
+work, and one fix to ListVolumes.
+
+The numbers below are not measured on hardware. They come from the same
+in-process model as v1.22.0 (the TrueNAS mock with per-call latencies
+calibrated on nas01, writes served one at a time, strict fencing, NVMe-oF
+with four portals, records in Kubernetes), driving a 30-move drain through a
+model of the attacher at 300 volumes. Medians of three runs.
+
+| 30-move drain at 300 volumes | v1.22.0 | v1.23.0 |
+|---|---|---|
+| A snapshot of each moving volume at the same time: snapshots Aborted | 90 | 0 |
+| ... snapshot completion, median / slowest | 18.0 s / 21.2 s | 12.6 s / 18.1 s |
+| ... drain | 19.7 s | 21.1 s |
+| Under a burst of 12 background writers: drain | 23.7 s | 22.1 s |
+| Kubernetes requests for the drain's records | 210 | 150 |
+| No contention: drain; restart at 1,000 volumes | 18.2 s; 3.1 s | 18.2 s; 3.1 s |
+
+With snapshots the drain itself takes 1.4 s longer: the snapshot writes now
+share the appliance with it instead of failing and running after it.
+
+- **Volume lock modes.** ControllerPublishVolume and ControllerUnpublishVolume
+  hold their volume's lock attach-class; CreateSnapshot, DeleteSnapshot and a
+  volume clone's source hold it data-class. The two classes run alongside
+  each other, so a snapshot of a volume no longer fails Aborted because the
+  volume is being published, or the other way round. Everything else is
+  unchanged: two publishes or unpublishes of one volume are still serialised
+  (strict fencing decides each grant from what the previous one left), two
+  snapshot operations on one volume still are, and DeleteVolume,
+  ControllerExpandVolume, ModifyVolume, CreateVolume, promote and the
+  background reconcilers still hold a volume's lock exclusively. While the
+  startup worker waits for a volume's lock, no new attach or data holder is
+  let in ahead of it. The debug endpoint names a shared hold's modes, as
+  `volume:x(attach+data)`.
+- **A publish waits briefly for its volume.** A publish or unpublish that
+  finds its volume's lock held by a conflicting operation now waits up to
+  8 seconds for it before returning Aborted, instead of returning Aborted at
+  once and leaving the attacher to back off for longer than the conflict
+  lasted. Only one publish or unpublish waits per volume: any further one
+  returns Aborted at once, so an RWX volume with many attachments in flight
+  cannot hold every attacher worker. The cost: when ten or more attaches of
+  one RWX volume arrive together, all but the running one and the one
+  waiting get Aborted and come back after the attacher's backoff. The node's identity (its CSINode and
+  Node) is read after the lock is taken.
+- **Reads ahead of write bursts.** Of the TrueNAS request slots
+  (`truenas.maxConcurrentRequests`, 10 by default), writes now hold at most
+  4, so the reads a publish or unpublish starts with are sent at once
+  however many writes are queued on the appliance. Priority still decides
+  among the requests whose kind has a free slot: a publish's write takes the
+  next write slot ahead of background writes. A call that backs off between
+  retries of a connection failure no longer holds a slot while it waits.
+- **VolumePublication writes are a compare-and-set.** A record write or
+  removal carries the resourceVersion of the read the controller made under
+  the volume lock to decide it (the reads that only report records, such as
+  ListVolumes and the startup diff, never set it): one request per write
+  instead of two (a first publish 3 → 2 requests, an unpublish 4 → 3). A
+  write or removal that finds the object changed, created or removed since
+  that read is no longer retried over the other writer's record: the publish
+  or unpublish returns Aborted ("publication record changed since it was
+  read"), and its retry decides again from a fresh read.
+- **ListVolumes.** A continuation page could report a volume this controller
+  had deleted after the walk began, if the walk's cached view expired while
+  the page re-read its datasets (records in Kubernetes only). Every page now
+  keeps the deletes it filters on until its entries are built.
+
+## v1.22.0 — a restart of seconds, a drain that does not wait for it
+
+Nothing to configure. Startup with strict fencing, a drain that overlaps a
+controller restart, and ListVolumes all cost less.
+
+At 1,000 volumes, a controller restart with everything already in place
+takes about 3 s if TrueNAS serves the controller's concurrent reads in
+parallel, and about 10 s if it serialises them (9.8 s in the serial run),
+against 34 s and 107 s before. These times are not measured on hardware.
+They come from an in-process model: the TrueNAS mock with per-call latencies
+calibrated on nas01, strict fencing, NVMe-oF with four portals, records in
+Kubernetes. Whether nas01 serves the reads in parallel is not established,
+hence the range.
+
+| | 30 volumes | 300 | 1,000 |
+|---|---|---|---|
+| Restart, everything in place, reads served in parallel | 0.9 s → 0.3 s | 8.8 s → 1.1 s | 34 s → 3.1 s |
+| Restart, everything in place, reads serialised | 3.3 s → 0.4 s | 32 s → 3.1 s | 107 s → 9.8 s |
+| 30-volume drain overlapping a restart (10 moves at 30 volumes) | 10.6 s → 6.1 s | 41 s → 18.2 s | 101 s → 18.4 s |
+
+The model charges each portal's port lookup once per process, as a point
+read: the client caches the port after that.
+
+- **Per-volume readiness for publishes.** With strict fencing a
+  ControllerPublishVolume no longer waits until every attached volume in the
+  cluster has converged. Once startup has taken its VolumeAttachment
+  snapshot, a publish waits only for its own volume: a volume that has
+  converged, or had no VolumeAttachment in the snapshot, is published at
+  once; one still pending is converged by the publish itself, under the
+  volume lock, before the node is granted, and the publish returns
+  Unavailable if that fails. CreateVolume, ControllerExpandVolume and the
+  other provisioning calls still wait for global readiness, as before.
+- **A busy volume no longer fails the startup pass.** A startup worker waits
+  up to 15 seconds for a volume lock a live operation holds, and when some
+  volumes do fail, the retry re-runs only those.
+- **Diff-first startup.** A full startup pass reads the fleet once (the
+  attached volumes' datasets, by name, in up to four requests, and the nvmet
+  subsystem, namespace, port and host tables) and converges on its own, under
+  the volume lock, only the volumes whose records or backend differ from what
+  their attachments need. A restart with everything in place makes no
+  per-volume TrueNAS call and takes no volume lock. This covers strict
+  NVMe-oF volumes; NFS, iSCSI and additive mode take the per-volume path as
+  before. A volume a live operation touches while the diff reads is never
+  judged from those reads. The diff never grants, revokes or writes a
+  volume's records or share. On a fresh process it does resolve the
+  configured portals, up to four port lookups with multipath, and
+  NVMeoFGetOrCreatePort creates a port that is missing, as the per-volume
+  path would.
+- **ListVolumes from the listing.** With records in Kubernetes, a
+  ListVolumes walk takes each entry's capacity from the one managed-dataset
+  listing it already makes and its published nodes from the
+  VolumePublication cache, instead of re-reading every page from TrueNAS.
+  Only a dataset that still carries ZFS publication records (not yet
+  imported) is re-read. At 1,000 volumes a walk is 1 TrueNAS call instead of
+  11, and in the benchmark 144 ms and 17.8 MB instead of 343 ms and 30.1 MB.
+  With records on ZFS every page is still re-read by name, as before, because
+  a record written during the walk exists only on its dataset. The entries
+  are the same as before, with two exceptions. With records in Kubernetes, a
+  later page reports a volume's capacity as the walk's first page listed it,
+  so a volume expanded mid-walk shows its new size on the next walk. And a
+  zvol whose volsize cannot be read is reported with capacity 0 (unknown)
+  instead of the pool's free space. A volume this controller deletes while a
+  walk is in flight is left out of it, as before.
+- **Concurrent listings share one read.** The startup readers that list every
+  managed dataset at about the same time (the stale-record sweep, the orphan
+  reconcile, the publication import, the unlock reconciler, ListVolumes) now
+  share one listing in flight; each gets its own copy.
+
+## v1.21.0 — the Rust node agent is the default
+
+`node.implementation` now defaults to `rust`: the node DaemonSet runs the Rust
+node agent (`scale-csi-node`) instead of the Go node plugin, from the same
+image. It serves NVMe-oF (kernel initiator and nvmeublkd), iSCSI and NFS, and
+has run every node of the maintainers' cluster since 2026-10-02 after a canary
+from v1.15.0.
+
+### Upgrade
+
+- **Upgrading switches the node plugin to Rust.** The DaemonSet's pods are
+  replaced one node at a time; the agent adopts every volume the Go plugin
+  staged (staging mounts, NVMe-oF and iSCSI sessions, NFS mounts) with no
+  volume work, and the pods using them keep running.
+- **To stay on the Go node plugin,** set `node.implementation: go` before
+  upgrading. Switching back later is the same: each plugin adopts what the
+  other staged.
+- **`node.rustNodes`** (a Rust canary in a Go cluster) now needs
+  `node.implementation: go` set explicitly; with the Rust default it is
+  refused, as it always was with `implementation: rust`.
+- NFS over a storage network with fencing on needs
+  `nfs.nodeIdentityNetworks`, the same as with the Go plugin (see v1.18.0).
+
+## v1.20.0 — kernel NVMe-oF waits for the current /dev node
+
+- **Kernel NVMe-oF: a stage right after a handover waits for the current /dev
+  node.** When one plugin unstaged a kernel NVMe-oF volume and the other
+  staged it at once (disconnect, then connect to the same subsystem), the
+  device wait found the namespace in sysfs and took `/dev/nvmeXnY` as soon as
+  it existed. That node could still be the previous namespace's, because
+  devtmpfs and udev remove it a little later, so blkid or mkfs failed with
+  ENXIO. Both plugins now accept the native multipath head (found under the
+  subsystem) or a controller's namespace (found through `nvme list-subsys`)
+  only when its `/dev` node is a block device whose number matches the
+  namespace's sysfs `dev` file, and keep polling until then, within the
+  existing device timeout. The ublk data path is unchanged.
+
+## v1.17.0 — Kubernetes Events from the Rust node agent
+
+### The Rust node agent records Kubernetes Events
+
+The Rust node agent (`node.implementation: rust` or `node.rustNodes`) wrote
+its events to its log only. It now records them as Kubernetes Events, the same
+ones the Go node plugin records, so `kubectl describe`, dashboards and alerts
+that read Events see no difference between the two:
+
+- **Which events.** `MountFailed`, `NVMeConnectFailed`, `NVMePathDegraded` and
+  `NVMeMultipathUnaggregated`, all of type Warning, on the pod using the
+  volume, else its PVC, else its PV, else the node, with the driver name as
+  the source component and the node's host name as the source host. Events on
+  a PV or node go to the `default` namespace, as the Go node's do.
+- **Repeats.** An identical event (same object, reason and message) within 10
+  minutes of the last one raises the existing Event's count instead of
+  creating another. Each object gets at most 25 events at once, then one more
+  every 5 minutes, like the Go node's client-go recorder.
+- **Never in the way.** An event is queued (up to 256) and written by a
+  background task; a CSI call never waits for the API. An event that does not
+  fit on the queue, is rate limited, or that the API refuses is dropped and
+  counted in the new `scale_csi_events_dropped_total{reason}` metric
+  (`queue_full`, `rate_limited`, `api_error`, `closed`), and logged.
+- **Outside a cluster** (no service account token or no
+  `KUBERNETES_SERVICE_HOST`/`PORT`), or if the service account CA cannot be
+  read, events go to the log as before.
+
+No chart change: the node ClusterRole already allows creating and patching
+Events.
+
+## v1.19.0 — fewer TrueNAS calls on NVMe-oF, a cheaper restart
+
+Nothing to configure. The controller makes fewer calls to TrueNAS and to the
+Kubernetes API for the same work, and uses less memory. Counts below are the
+calls the controller makes for one operation, measured against the test
+appliance; strict fencing, NVMe-oF.
+
+- **Moving a volume between nodes.** A first publish on a node is 8 calls
+  instead of 10, an unpublish 5 instead of 7, so a move is 13 instead of 17.
+  A repeated publish of an unchanged volume is 5 instead of 8 (with records
+  kept on ZFS), and no longer asks TrueNAS to create a host association that
+  already exists, a request TrueNAS rejected while queueing it behind other
+  writes.
+- **Association lookups no longer grow with the NAS.** The two lookups a
+  publish or unpublish makes for a volume's host and port associations ask
+  TrueNAS for that volume's rows only, instead of reading every association on
+  the appliance and filtering them in the controller. The controller still
+  checks every row it gets back.
+- **Creating a volume.** A new NVMe-oF volume is 9 calls instead of 13 (15
+  instead of 19 with four multipath addresses), and one of the calls saved is
+  a subsystem update that made TrueNAS reload its NVMe target. A retried
+  create of a complete volume is 3 calls instead of 5. A clone from a snapshot
+  is 12 calls instead of 20, a clone from a volume 13 instead of 21. An NFS
+  clone saves one lookup (9 and 12 calls).
+- **Restarting the controller.** The startup pass lists the cluster's
+  PersistentVolumes, VolumeAttachments, CSINodes and Nodes once, then reads
+  each attached volume's own VolumeAttachments by name; before, it listed all
+  four again for every volume. A publication record that already says what
+  the attachment says is not rewritten, so a restart with everything in place
+  writes no VolumePublication. A volume whose attachment is gone or being
+  deleted is still never granted.
+- **After the start.** A fence deferred for a node that has not reported its
+  identity yet, or a stale record removed from a volume the start had set
+  aside, re-runs that one volume instead of the whole startup pass.
+- **First contact with TrueNAS.** The two checks for the TrueNAS 26 dataset and
+  snapshot query methods now ask about the pool's top dataset only. They used
+  to ask for every dataset and every snapshot on the appliance with their
+  properties, tens of megabytes on a large NAS, decoded and thrown away.
+- **Memory and CPU.** Reading one dataset allocates about a third of what it
+  did (14 KB instead of 41 KB). A full ListVolumes walk, which the
+  external-attacher runs every minute, takes 27 MB of allocations instead of
+  48 MB at 1,000 volumes and keeps 0.1 MB alive between walks instead of
+  4.5 MB. Each controller request logs with 12 allocations instead of 49.
+
+### Upgrade
+
+- Nothing to configure. Before rolling it out, confirm on the NAS, read-only,
+  that TrueNAS answers the narrower questions the way this release expects
+  (`<id>` is any NVMe-oF subsystem with hosts, `<pool>` the pool of
+  `zfs.datasetParentName`):
+  - `midclt call nvmet.host_subsys.query '[["subsys.id","=",<id>]]'` returns
+    exactly the rows of `midclt call nvmet.host_subsys.query` whose `subsys.id`
+    is `<id>`; the same for `nvmet.port_subsys.query`. If TrueNAS rejects the
+    filter the controller falls back to the full list on its own; if it
+    answered with fewer rows, strict fencing could miss a host to remove.
+  - `midclt call zfs.resource.query '{"paths":["<pool>"],"get_children":false,"properties":["used"]}'`
+    and `midclt call zfs.resource.snapshot.query '{"paths":["<pool>"],"recursive":false,"properties":null}'`
+    both succeed.
+
+## v1.18.0 — the Rust node agent serves iSCSI and NFS
+
+### The Rust node agent serves iSCSI
+
+`scale-csi-node`, the opt-in Rust node plugin, now serves iSCSI volumes as well
+as NVMe-oF. An iSCSI-only install (NVMe-oF off) may run the agent.
+
+- **Same commands, same host access.** The agent runs `iscsiadm` through the
+  image's wrapper (nsenter into the host), as the Go plugin does, with the same
+  arguments: a static node record (`-o new`), CHAP on the record, `--login`,
+  and a SendTargets discovery (cached and serialized per portal) only when the
+  target is not found. Logins per portal are limited by
+  `resilience.rateLimiting.maxConcurrentLogins`; `commandTimeouts.iscsi`,
+  `iscsi.deviceWaitTimeout`, `iscsi.nameSuffix` and
+  `node.sessionCleanupDelay` mean what they mean for the Go plugin.
+- **CHAP.** The volume's `chap` mode and the node-stage secret are validated as
+  the Go plugin validates them, before any login. The method and user names go
+  to `iscsiadm`; the passwords are written straight into the node record files
+  (0600) and never appear on any command line or in the log. A rejected secret
+  is `Unauthenticated` and is not retried; a record that cannot be written fails
+  the stage (`ISCSICHAPFailed`).
+- **Multipath.** With a `portals` hint of two or more IP portals and
+  dm-multipath on the node, the agent logs in through every portal, drops a
+  path that reaches another LUN, and stages the dm map of the LUN's WWID (or,
+  when no map appears within 5 s, the primary path alone). Without multipathd it
+  stays on the primary portal and says so (`ISCSIMultipathUnavailable`). A
+  replay tops up the paths of a staged map.
+- **Unstage and session GC.** Unstage logs out every session of the volume's
+  target, found through the mounted device or by the target name derived from
+  the volume ID (never through a raw-block link's device name, which can be
+  stale after a reboot); a session that will not log out fails the unstage so
+  kubelet retries. Session GC logs out a session only when it goes through the
+  configured portal, its target is one the driver names for a volume, and no
+  staged volume has used it for the grace period; an in-use disk whose identity
+  cannot be read skips the pass.
+- **Interchangeable with the Go plugin.** The staging layout (a link to the
+  disk or dm map for raw block, a mount for a filesystem) and the node records
+  are the same, and iSCSI keeps no other state on the node, so a volume staged
+  by one plugin is published, expanded and unstaged by the other.
+- **Events and metrics** keep the Go plugin's names: `ISCSILoginFailed`,
+  `ISCSIPathDegraded`, `ISCSIMultipathUnavailable`, `ISCSICHAPFailed`,
+  `MountFailed`; `scale_csi_iscsi_sessions_total`,
+  `scale_csi_iscsi_path_connect_total` and the `iscsi` transport of
+  `scale_csi_node_connect_total` and `scale_csi_gc_sessions_disconnected_total`.
+
+### Differences from the Go plugin
+
+- The agent stages, unstages and expands iSCSI volumes only where the
+  configuration enables iSCSI; on an install without it an iSCSI volume is
+  refused as before, and `iscsiadm` never runs.
+- A device wait also ends at the caller's deadline (the Go plugin waits out
+  its full device timeout).
+- After a reboot, a raw-block staging link that names another volume's disk
+  (SCSI disk names are handed out again in login order) or a disk with no iSCSI
+  session is re-staged, as the agent already did for ublk; the Go plugin
+  answers AlreadyExists until the link is removed by hand. The other disk and
+  its session are never touched, and a record naming another volume on the
+  path keeps the refusal.
+
+### Upgrade
+
+Nothing changes unless `node.implementation` or `node.rustNodes` is set. To
+try the agent on an iSCSI install, canary it with `node.rustNodes` first;
+removing the setting hands the nodes back to the Go plugin with no volume work.
+
+### NFS over a storage network with fencing on
+
+With `fencing.mode` `strict` (or `additive` on an export that already lists
+hosts), the controller grants an NFS export to the publishing node's identity
+IPs. Those were the node's `status.hostIP`, its Kubernetes address. A node that
+reaches the NAS over a separate storage network (its own subnet and interface,
+for example a NAS at 192.168.201.10 reached from the node's 192.168.201.x
+interface) presents its address on that network instead, which was not in the
+export's hosts, and the NAS refused the mount (NFSv4.1/4.2 returned `ENOENT`).
+
+- **The fix.** `nfs.nodeIdentityNetworks` lists the storage networks, as CIDRs
+  or single IPs (at most 16). At startup each node plugin, Go and Rust, adds its
+  interface addresses inside those networks to the IPs of its node ID, beside
+  its `status.hostIP`. The controller then grants them like any identity IP.
+  Link-local addresses are never used; IPv4 and IPv6 networks are both
+  accepted; an IPv4-mapped IPv6 network is refused (write the IPv4 form).
+- **Enable it.** Set `nfs.nodeIdentityNetworks: [192.168.201.0/24]` (every
+  fabric subnet the nodes mount from, including each `nfs.addresses` subnet with
+  trunking). If `nfs.shareAllowedNetworks` is set, it must cover these networks
+  too, or the controller still leaves the addresses out (it logs a warning at
+  start). List only storage subnets: a pod or CNI range would make node IDs
+  change with CNI addresses. On an IPv6 fabric with SLAAC privacy addresses,
+  list the node's stable address rather than the /64.
+- **Upgrade effect.** Unset, the default, nothing changes: every node ID is
+  byte-identical to the previous release's and the interfaces are not read. Setting it changes
+  the node ID of every node with an address in a listed network. kubelet
+  re-registers the plugin with the new ID when the node plugin restarts (the
+  chart rolls the DaemonSet on a ConfigMap change); the Kubernetes Node does not
+  restart. An export picks up a node's new address on that volume's next
+  publish to the node, so a volume that must move its mounts to the fabric
+  needs its pods rescheduled. The `server` of existing volumes is fixed at
+  creation: pointing `nfs.server` at the fabric address affects new volumes.
+  Rolling back to a release without the key: remove it first (the ConfigMap is
+  strict-parsed), and the node IDs return to their old value.
+- **The 256-byte limit.** The node ID still packs IPs in canonical order and
+  drops what does not fit. A storage-network address that is dropped is named in
+  a warning at node start; a typical node (name, NQN, IQN, one Kubernetes and a
+  couple of fabric addresses) fits with room to spare.
+
+### The Rust node agent serves NFS
+
+`scale-csi-node` now serves NFS volumes, with the Go node plugin's behaviour:
+
+- the same mount, `mount -t nfs -o nfsvers=4,<StorageClass mount options>`,
+  with `nconnect=` from `nfs.nconnect` and `max_connect=` for trunking replacing
+  theirs, at the same staging path, so a volume staged by either plugin is
+  taken over by the other;
+- NFSv4.1+ session trunking from the publish context's `addresses`, with the
+  same fallback without `max_connect`, the 4.1 check, the probe mounts and their
+  cleanup on unstage;
+- the legacy direct publish without a staging path;
+- the same errors, events (`NFSMountFailed`, `NFSTrunkingDegraded`,
+  `NFSTrunkingUnavailable`, `MountFailed`), metrics (`node_connect_total` with
+  `transport="nfs"`, `nfs_trunk_connect_total`), stats (bytes and inodes, after
+  a mount-table check that never touches a hung mount) and expansion (nothing to
+  do on the node);
+- an NFS unmount that fails falls back to a lazy unmount, as before.
+
+With iSCSI and NFS ported, the agent serves NVMe-oF, iSCSI and NFS in any
+combination; the chart refuses `node.implementation: rust` or
+`node.rustNodes` only when no protocol is enabled.
+
+Unstaging an NFS volume never stats its mount point on one of the agent's
+async workers: the share is found from findmnt, then from mountinfo, and any
+remaining call on the path runs on a blocking thread with the mount timeout.
+On a dead hard mount such a call blocks in the kernel, and each stuck volume
+used to hold one worker until the agent stopped answering for every protocol.
+
+### Fixed in both node plugins
+
+- **Unstage and unpublish never delete through a mount.** One `umount` lifts
+  only the top of a stack of mounts, and both plugins then removed the path
+  recursively, which on a share or filesystem still mounted underneath deletes
+  the volume's data (two plugins staging during a handover can stack mounts).
+  Both now check that nothing is mounted after the unmount (Internal
+  otherwise, so kubelet retries and the next unmount lifts the next mount) and
+  remove the mount point without recursing. That check runs on its own budget
+  (the mount timeout), so an unmount that succeeded but used up the RPC's
+  deadline no longer fails the call.
+- **A non-empty directory after the unmount fails the call.** Both plugins
+  follow Kubernetes mount-utils `CleanupMountPoint`: an absent path is fine, a
+  file (a raw-block publish target) is removed, an empty directory is removed,
+  and a directory that still has files in it once nothing is mounted fails
+  unstage or unpublish with Internal ("staging path X is not empty after
+  unmount; its contents (on the node's disk, not the volume) are left in place
+  and must be removed by hand"). Before, both plugins logged a warning and
+  reported success, and kubelet's own removal of the directory then failed
+  with ENOTEMPTY on every retry. Nothing is ever deleted recursively: remove the
+  files by hand and kubelet's next retry finishes.
+- **iSCSI multipath expansion.** A dm-multipath map grows only when multipathd
+  resizes it, and only to its smallest path. Expansion rescanned the session of
+  one path and waited for a size that never came, so the PVC stayed in
+  `FileSystemResizePending`. Both plugins now rescan every path's session, then
+  run `multipathd resize map <name>` through a new host wrapper
+  (`/usr/local/bin/multipathd`, as for `iscsiadm`; the node's multipath-tools
+  must provide `multipathd`). multipathd exiting non-zero, or answering
+  `fail`, fails the expansion with Internal. Only a dm-multipath map (dm UUID
+  `mpath-<wwid>`) is expanded this way; any other device-mapper device, such
+  as a kpartx partition or an LVM volume, takes the single-device rescan. A
+  dm device whose UUID cannot be read fails the expansion with Internal rather
+  than being guessed at; one with no UUID file is not a map.
+- **An iSCSI stage right after a handover no longer fails in blkid.** When one
+  plugin unstaged a volume and the other staged it at once (logout, then login
+  to the same target), the device wait found the new disk in sysfs and took
+  `/dev/<name>` as soon as it existed. That node could still be the previous
+  disk's, because devtmpfs and udev remove it a little later, so the stage
+  failed with `blkid: error: /dev/sdb: No such device or address`. Both plugins
+  now accept a device only when its `/dev` node is a block device whose number
+  matches the kernel's (`/sys/class/block/<name>/dev`) and keep polling until
+  then, within the existing device timeout. The same check applies to the
+  portal-scoped lookup, the IQN fallback and the dm-multipath map
+  (`/dev/mapper/<name>` or `/dev/dm-N` against the map's own number).
+
+## v1.16.0 — publication records in Kubernetes
+
+A publication record says "this volume is published to this node, with this
+identity". Until now each one was a ZFS user property on the volume's dataset,
+and every write was a dataset update of 0.2-0.4 s that TrueNAS serves one at a
+time. The controller now keeps them as `VolumePublication` objects in its own
+namespace. A publish or unpublish writes no dataset property any more.
+
+- **What it buys.** On the benchmark controller, 50 concurrent strict-fencing
+  moves (unpublish from one node, publish on another) finish in 27.7 s instead
+  of 65 s on v1.14.0, a 30-volume drain in about 17 s of control plane. Per
+  operation, with fencing off, a publish is 2 TrueNAS calls instead of 3 and an
+  unpublish 1 instead of 2; a strict NVMe-oF unpublish is 7 instead of 9.
+- **The object.** `volumepublications.scale-csi.io` (v1alpha1, namespaced), one
+  per volume and node, shipped in the chart's `crds/`. The controller gets a
+  Role for them in its namespace only. `kubectl get vpub -n <namespace>` lists
+  them with dataset, node and state.
+- **Moving the existing records.** Records already on ZFS keep working. A
+  volume's first publish or unpublish after the upgrade moves its records into
+  Kubernetes and removes them from the dataset (one dataset update, once). With
+  fencing on, where the controller is a single replica, a background pass a
+  minute after the start moves the rest, one volume every half second at the
+  lowest priority, and repeats every 10 minutes until none are left. With
+  fencing off, where two replicas may run, there is no background pass: two
+  processes could otherwise undo each other's removals. Records move on each
+  volume's next publish or unpublish instead, and until then are read from ZFS
+  as before. A clone's inherited records are never moved.
+- **Reads.** ListVolumes and ControllerGetVolume, which the external-attacher
+  calls every minute, read a watch-fed cache, not the API. DeleteVolume removes
+  the volume's objects.
+- **The Kubernetes client** now allows 50 requests a second (bursts of 100)
+  instead of client-go's 5 (bursts of 10), which throttled a 50-volume drain.
+- **Copies stop inheriting publications.** A replicated or `zfs recv`'d dataset
+  carried its source's records as its own. Once a volume's records have moved,
+  a copy of it carries none. A copy made before then still does until a later
+  release stops reading ZFS records.
+
+### Upgrade
+
+- **The CRD must be installed with the chart.** Helm installs `crds/` on a new
+  install but not on an upgrade. With Flux, set `install.crds` and
+  `upgrade.crds` to `CreateReplace` on the HelmRelease; with the Helm CLI, apply
+  `crds/volumepublications.scale-csi.io.yaml` before upgrading. The controller
+  refuses to start without the CRD or its Role rather than keep records where
+  the next start would not look.
+- Nothing to configure otherwise. The chart sets
+  `SCALE_CSI_PUBLICATION_STORE=kubernetes` on the controller; a controller run
+  without it (outside the chart) keeps records on ZFS.
+
+### Rolling back to v1.15.0
+
+- With fencing on, v1.15.0's startup reconcile rewrites the ZFS record of every
+  attached volume; with fencing off, the external-attacher republishes each
+  attached volume once, which writes it. Neither needs action.
+- **Delete the VolumePublications when you roll back**
+  (`kubectl delete vpub -n <namespace> --all`). An upgrade after a rollback
+  resolves each volume's records by age, so ZFS records written by v1.15.0 win;
+  but a volume v1.15.0 unpublished from every node leaves no trace on ZFS, and
+  its old VolumePublication would come back. With fencing on, the stale-record
+  sweep removes it after its grace period; with fencing off nothing does.
+
+## v1.15.0 — the Rust node agent, opt-in
+
+The image now carries a second node plugin, `scale-csi-node`, written in Rust.
+It serves NVMe-oF, both the kernel initiator and the userspace data path
+(nvmeublkd), and nothing else yet. The Go node plugin stays the default, and the
+controller is unchanged.
+
+- **Turning it on.** `node.implementation: rust` runs it on every node. To try
+  it on a few nodes first, `node.rustNodes: [node-a]` runs it in a second
+  DaemonSet, `<fullname>-node-rust`, on just those nodes, and the Go DaemonSet
+  avoids them. nvmeublkd keeps running on every node either way.
+- **What it does not serve yet.** The chart refuses either setting while NFS or
+  iSCSI is enabled, or NVMe-oF is not. The agent itself refuses to start with a
+  configuration that enables a protocol it does not serve.
+- **Interchangeable with the Go plugin on a live node.** It computes the same
+  node ID, reads and writes the same session registry, ublk markers and staging
+  layout, and takes the same flags and configuration. A volume staged by one is
+  published, expanded, unstaged or collected by the other, and switching back is
+  a DaemonSet change with no volume work.
+- **Behaviour.** Volume RPCs run to completion even when the caller's deadline
+  passes, so kubelet's retry finds the work done. Session GC keeps the Go
+  plugin's grace period and veto rules. NVMe controller tunables
+  (`fast_io_fail_tmo`) converge as in the Go plugin. A raw-block publish replay
+  after a restart is matched by device number.
+
+### Upgrade and rollback
+
+Nothing changes unless you set `node.implementation` or `node.rustNodes`. To go
+back from the Rust agent, remove the setting: the Go DaemonSet takes those nodes
+over and adopts what the agent staged.
+
+## v1.14.0 — fewer TrueNAS writes, faster deletes, attaches first under load
+
+The TrueNAS middleware serves the control plane largely one write at a time,
+and a property write costs 0.2-0.4 s of it, so this release makes the
+controller ask for less and in a better order. Nothing to configure for an
+upgrade from v1.13.1. The records on TrueNAS keep their format, so a rollback
+needs nothing on TrueNAS; see "Rolling back to v1.13.1" for the one chart
+value to check.
+
+### Fewer property writes
+
+- Creating an NVMe-oF volume writes the share's TrueNAS object ids together
+  with the volume's other properties, one dataset update instead of two
+  (11 TrueNAS calls instead of 12 for a single-path volume).
+- A publish that finds the volume's publication record already as it would
+  write it no longer rewrites it (a strict-fencing republish is 8 calls
+  instead of 9), unless the stale-record sweep is watching that record.
+- With fencing off (the chart default), an unpublish no longer writes the
+  "unpublishing" marker before removing the record: it has nothing to fence,
+  so it is 2 calls instead of 3. With fencing on, the marker is written as
+  before.
+- iSCSI keeps its write inside share creation: it is the evidence a crashed
+  create leaves for the retry.
+
+### Faster NVMe-oF deletes
+
+- When a volume's NVMe-oF subsystem is its own, the share is deleted with
+  one forced subsystem delete, which removes its namespace and host and port
+  associations with it, instead of one call per object.
+- A subsystem that also serves other namespaces is left alone: only this
+  volume's namespace is deleted, and the delete succeeds only once TrueNAS
+  shows the zvol exported nowhere. If the subsystem's namespaces cannot be
+  listed, the delete fails and is retried rather than guessing.
+- The two "is anything still using this dataset" scans before a dataset
+  delete (`pool.dataset.attachments`, `pool.dataset.processes`, about 0.7 s
+  of middleware time per delete) can be turned off with
+  `zfs.observeBusyBeforeDelete: false`. They never blocked a delete; they
+  only log and count (`scale_csi_dataset_busy_observations_total`). The
+  default keeps them.
+
+### Attaches first when TrueNAS is busy
+
+The controller's TrueNAS request slots used to admit waiting requests in
+arrival order, so a burst of operations shared the slots evenly and finished
+together at the end. Waiting requests are now admitted by class, then by the
+age of the CSI operation they belong to:
+
+1. attach: ControllerPublishVolume and ControllerUnpublishVolume (a pod is
+   waiting);
+2. default: provisioning, expansion, snapshots, background work;
+3. delete: DeleteVolume, DeleteSnapshot and the orphan reaper.
+
+So a node drain's re-attaches overtake provisioning and deletes, and a burst
+completes in the order it arrived. A delete that has waited 2 s moves up to
+the default class (it may hold a volume lock a publish needs); nothing
+moves into the attach class. New series, on the dashboard's backpressure
+panel: `scale_csi_truenas_request_admission_wait_seconds{class}` and
+`scale_csi_truenas_requests_waiting{class}`.
+
+The iSCSI target reload that creates and fenced publishes wait for is
+admitted as theirs (their most urgent class and oldest operation), so it is
+not queued behind their own later calls; its time limit now applies to the
+call itself once it has a slot, not to the wait for one.
+
+### Other fixes
+
+- Repeating NodePublishVolume for a raw-block volume that is already
+  published returned Internal ("unsupported type Drw-rw----"), and after a
+  node-plugin restart (an upgrade is one) AlreadyExists ("backed by udev"):
+  the node accepted only kubelet's placeholder file at the target and
+  compared mount sources, but a published target is the device node bound
+  over it, and the mount table shows its source as devtmpfs. The target is now
+  identified by its device number. Filesystem volumes were not affected.
+- A new multipath NVMe-oF share whose port associations partly failed is
+  rolled back with a forced subsystem delete. The plain delete was refused by
+  TrueNAS while the subsystem was still on a port, and the subsystem leaked.
+
+### Rolling back to v1.13.1
+
+Nothing to undo on TrueNAS. One chart value is new: if your values set
+`zfs.observeBusyBeforeDelete` at all (`true` included), remove it before
+rolling back. The v1.13.1 chart's schema rejects the key, and a v1.13.1
+controller reading a config that contains it refuses to start. The default
+render does not contain it.
+
+### Image
+
+The image is now published for linux/amd64 only. No supported install ran
+arm64, and the arm64 build cost an emulated Go build per release.
+
+
+## v1.13.1 — stop republishing every attached volume every minute
+
+A fix for the controller only; the node plugin, the chart's defaults and
+the data path are unchanged.
+
+Since v1.10.0 the controller reported each volume's publications to
+Kubernetes under a node id of its own making (the node's id plus the
+Node object's addresses), which never equals the id the node registered in
+its CSINode. The csi-attacher compares the two about once a minute for
+every VolumeAttachment, found every attached volume "not published", and
+forced a ControllerPublishVolume for each of them. Nothing broke, but each
+of those republishes cost about 15 TrueNAS API calls, one of them a ZFS
+property write of about a second, and held the volume's lock: on a cluster
+with 29 attachments that was about 440 API calls and 70 seconds of
+TrueNAS middleware time every minute at idle, and a snapshot that arrived
+during a republish was refused with "operation already in progress" and
+retried.
+
+The publication record now keeps the node id Kubernetes uses (the
+ControllerPublishVolume NodeId, or the CSINode's id when the controller
+rebuilds records at startup); fencing still uses the resolved identity
+with its addresses. Records written by earlier versions are rewritten the
+first time they are touched after the upgrade: with fencing enabled, by the
+controller's startup reconciliation, so the republishing stops when v1.13.1
+starts; with fencing off (the chart default), by one last forced republish
+per volume, so it stops within about a minute of the upgrade. To see it: the csi-attacher stops logging "VolumeAttachment
+attached status and actual state do not match", and
+`rate(scale_csi_truenas_requests_total[10m])` on the controller drops to
+near zero at idle.
+
+One behaviour goes away with the noise: the minute-by-minute republish also
+re-applied every volume's backend fence (the NVMe-oF host, iSCSI initiator
+or NFS host allowlist) from the node's current identity. A fence changed by
+hand on TrueNAS used to be reverted within a minute; it now stays as edited
+until the volume's next publish, or a controller restart when fencing is
+on. A node's new address reaches an NFS allowlist at those same points
+instead of within a minute. This is how every CSI driver behaves. A node
+that registers a new identity (a new NQN or IQN) still gets exactly one
+republish.
+
+## v1.13.0 — optional userspace NVMe/TCP data path (ublk), session GC ownership
+
+Nothing changes for an install that does not turn the new data path on: the
+default stays the kernel initiator, and chart renders without it are
+byte-identical to v1.12.0.
+
+### New: an optional userspace NVMe/TCP data path
+
+An NVMe-oF volume can now be staged through `nvmeublkd`, a per-node daemon
+that serves the namespace from userspace as `/dev/ublkbN` with its own
+multipath, instead of `nvme connect` and kernel multipath. It is chosen
+install-wide or per StorageClass:
+
+```yaml
+nvmeof:
+  dataPath: ublk          # every NVMe-oF volume, at its next NodeStage
+  # or: ublk: {enabled: true} and `nvmeof/dataPath: ublk` on a StorageClass
+```
+
+That one value deploys the daemon (a privileged host-network DaemonSet, from
+`ghcr.io/gizmotickler/scale-csi-nvmeublk`, published and signed with every
+release under the driver's tag) and mounts its socket into the node plugin.
+`nvmeof.ublk.daemon.enabled=false` is for running the daemon as a host service
+instead, and `nvmeof.ublk.daemon.image.tag` pins the daemon so that a chart
+upgrade does not roll it.
+
+When it pays off. Measured on 16-vCPU nodes over four 10 GbE paths against a
+tuned kernel initiator on the same node: about 2.5x the IOPS at about 0.6x the
+CPU per I/O on 4K random reads at depth, 1.8-2x on mixed 4K and next to a busy
+neighbour, 1.3-1.7x on 4K random writes, 1.05-1.3x on large reads, parity on
+large writes at more CPU, and more CPU per I/O at queue depth 1 and for
+synchronous writes. It is for volumes whose bottleneck is the initiator; the
+chart README has the table.
+
+Requirements: the `ublk_drv` module on every node; kernel >= 6.16 for zero
+copy (`nvmeof.ublk.zeroCopy`, default on) and 7.x (ublk batch I/O) for the
+node-wide reactor pool the figures above were measured with; NVMe/TCP; amd64.
+
+Sizing. With zero copy a node holds a bounded number of volumes, because
+every volume's queues take a range of the daemon's fixed-size io_uring buffer
+tables. `nvmeof.ublk.maxVolumesPerNode` (default 32, at most 128) says how
+many a node must hold, and the daemon sizes each volume to fit: 8 queues x
+256 tags for 16 volumes on a 16-CPU node, 8 x 128 for 32, 4 x 128 for 64,
+2 x 128 for 128. An attach past what fits is refused with an error naming the
+setting, and with `dataPath: ublk` the node plugin advertises the budget as
+the node's CSI volume limit (unless `node.maxVolumesPerNode` is set). The
+daemon locks about 80 MiB plus 6 MiB per volume.
+
+Known limits:
+
+- A staged ublk volume cannot be resized online: NodeExpand returns
+  `FailedPrecondition` until the volume is staged again.
+- Daemon attachments that have no staged volume are not garbage collected.
+- Turning the data path off removes the daemon with it. Go back through
+  `dataPath: kernel` with `ublk.enabled: true`, and set `ublk.enabled: false`
+  only when no node serves a ublk volume (chart README, "Turning the ublk data
+  path off").
+- The driver and the daemon were drilled on a Fedora CoreOS node against a
+  TrueNAS target (path kills, handover, crash recovery, a restart on a full
+  node, a verified soak) but have not yet carried production volumes. Start
+  with an opt-in StorageClass.
+
+### Session GC disconnected NVMe-oF sessions the plugin never connected
+
+Node session GC disconnected any NVMe-oF session to the configured target
+portals that no staged volume owned, including an administrator's, a
+benchmark's or another initiator's. The node plugin now records the NQNs it
+connects (beside its CSI socket: recorded before connecting, forgotten after a
+successful disconnect, re-recorded for staged sessions each pass, pruned after
+the grace period) and GC disconnects only recorded sessions. Without a usable
+registry it skips NVMe-oF GC entirely.
+
+### Also
+
+- `ublkb` devices no longer veto iSCSI session GC.
 
 ## v1.12.0 — CSI spec v1.13, NVMe failover convergence, deferred-defect closeout
 

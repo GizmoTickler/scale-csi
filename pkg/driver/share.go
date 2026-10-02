@@ -121,6 +121,7 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	}
 	if initiatorID == 0 {
 		created, err := d.truenasClient.ISCSIInitiatorCreate(ctx, iscsiOwnedAllowAllInitiatorComment)
+		d.markISCSIChanged()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create allow-all iSCSI initiator group: %w", err)
 		}
@@ -632,17 +633,18 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 // CreateVolume would otherwise write in a separate post-share update. NFS folds
 // them into the share-ID stamp (one pool.dataset.update on the same side of the
 // NFSShareCreate boundary); callers that must not change the idempotent-retry
-// path (ensureShareExists) pass nil. Block protocols ignore them and let
-// CreateVolume stamp them separately, because their in-share ID stamp is a
-// non-fatal best-effort write.
-func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
+// path (ensureShareExists) pass nil. NVMe-oF folds its resource IDs into the
+// same map instead of a separate warning-only write; iSCSI folds its extent
+// witness and geometry into it and keeps its warning-only write too, which lands
+// before the debounced target reload. CreateVolume writes the map fatally.
+func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool, finalProperties map[string]string, res *fenceResolution) error {
 	klog.Infof("Creating %s share for dataset: %s (freshlyCreated=%v, zvolReady=%v)", shareType, datasetName, freshlyCreated, zvolReady)
 
 	backend := backendForShareType(d, shareType)
 	if backend == nil {
 		return status.Errorf(codes.InvalidArgument, "unsupported share type: %s", shareType)
 	}
-	return backend.CreateShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties)
+	return backend.CreateShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties, res)
 }
 
 // deleteShare deletes the share for a dataset.

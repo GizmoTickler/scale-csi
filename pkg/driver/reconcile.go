@@ -3,7 +3,9 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"sort"
 	"strings"
@@ -1004,7 +1006,98 @@ func reconcileAge(now time.Time, creationUnix int64, minAge time.Duration) (time
 // the migration. See the LIVE-PROBE GATE on DatasetQueryByParent: the resource
 // shape is modeled, not yet live-verified, and this fallback is what makes the
 // migration safe to ship behind detection.
+//
+// Concurrent callers share one listing (managedListingCall): at startup the
+// stale-record sweep, the orphan reconcile, the publication import, the
+// unlock reconciler and the startup diff all list the parent within seconds of
+// each other, and each listing is the whole fleet, decoded. Every caller gets
+// its own copy of the datasets, so a caller may sort the slice or mirror a
+// write into a dataset without touching another caller's.
 func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset, error) {
+	datasets, _, err := d.listAllManagedDatasetsWithStart(ctx)
+	return datasets, err
+}
+
+// listAllManagedDatasetsWithStart is listAllManagedDatasets that also returns
+// when the listing it was served from began. A caller that joins a shared
+// listing gets that listing's start, not its own arrival: the rows may predate
+// anything that happened after the start.
+func (d *Driver) listAllManagedDatasetsWithStart(ctx context.Context) ([]*truenas.Dataset, time.Time, error) {
+	for {
+		d.managedListingMu.Lock()
+		call := d.managedListing
+		if call == nil {
+			call = &managedListingCall{done: make(chan struct{}), start: time.Now()}
+			d.managedListing = call
+			d.managedListingMu.Unlock()
+			d.runManagedListing(ctx, call)
+			if call.err != nil {
+				return nil, time.Time{}, call.err
+			}
+			return cloneDatasets(call.result), call.start, nil
+		}
+		call.joined++
+		d.managedListingMu.Unlock()
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return nil, time.Time{}, ctx.Err()
+		}
+		if call.err != nil && ctx.Err() == nil &&
+			(errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded)) {
+			// The caller that ran the listing gave up; this one has not.
+			continue
+		}
+		if call.err != nil {
+			return nil, time.Time{}, call.err
+		}
+		return cloneDatasets(call.result), call.start, nil
+	}
+}
+
+// managedListingCall is one listing in flight, shared by every caller that
+// arrives while it runs. start is taken before the listing is read.
+type managedListingCall struct {
+	done   chan struct{}
+	start  time.Time
+	joined int // callers that waited on it; guarded by managedListingMu
+	result []*truenas.Dataset
+	err    error
+}
+
+// runManagedListing runs call's listing and releases its waiters, however the
+// listing ends.
+func (d *Driver) runManagedListing(ctx context.Context, call *managedListingCall) {
+	defer func() {
+		d.managedListingMu.Lock()
+		if d.managedListing == call {
+			d.managedListing = nil
+		}
+		d.managedListingMu.Unlock()
+		close(call.done)
+	}()
+	call.err = errors.New("managed-dataset listing did not complete")
+	call.result, call.err = d.listAllManagedDatasetsOnce(ctx)
+}
+
+// cloneDatasets copies a listing for one caller: the slice, each dataset, and
+// its user-property maps. Property values are shared; no caller writes them.
+func cloneDatasets(datasets []*truenas.Dataset) []*truenas.Dataset {
+	out := make([]*truenas.Dataset, len(datasets))
+	for i, dataset := range datasets {
+		if dataset == nil {
+			continue
+		}
+		clone := *dataset
+		clone.UserProperties = maps.Clone(dataset.UserProperties)
+		clone.LegacyCSIProperties = maps.Clone(dataset.LegacyCSIProperties)
+		out[i] = &clone
+	}
+	return out
+}
+
+// listAllManagedDatasetsOnce is one listing, not shared.
+func (d *Driver) listAllManagedDatasetsOnce(ctx context.Context) ([]*truenas.Dataset, error) {
 	resourceDatasets, err := d.truenasClient.DatasetQueryByParent(ctx, d.config.ZFS.DatasetParentName)
 	if err == nil {
 		managed := make([]*truenas.Dataset, 0, len(resourceDatasets))
@@ -1213,7 +1306,9 @@ func (d *Driver) deleteDetectedOrphans(
 				continue
 			}
 			klog.Infof("Orphan reconcile: deleting managed snapshot %s through guarded DeleteSnapshot", orphan.ID)
-			if _, err := d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: orphan.ID}); err != nil {
+			// Orphan reaping is a delete, admitted to TrueNAS as one (see
+			// truenasAdmissionContext), not ahead of CSI deletes.
+			if _, err := d.DeleteSnapshot(truenas.WithPriority(ctx, truenas.PriorityDelete), &csi.DeleteSnapshotRequest{SnapshotId: orphan.ID}); err != nil {
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, err.Error())
 				continue
 			}
@@ -1243,7 +1338,7 @@ func (d *Driver) deleteDetectedOrphans(
 			continue
 		}
 		klog.Infof("Orphan reconcile: deleting managed volume %s through guarded DeleteVolume", orphan.ID)
-		if _, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: orphan.ID}); err != nil {
+		if _, err := d.DeleteVolume(truenas.WithPriority(ctx, truenas.PriorityDelete), &csi.DeleteVolumeRequest{VolumeId: orphan.ID}); err != nil {
 			d.recordReconcileSkip(report, "volume", orphan.ID, err.Error())
 			continue
 		}

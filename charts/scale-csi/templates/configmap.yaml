@@ -52,6 +52,14 @@ data:
       zvolEnableReservation: {{ .Values.zfs.zvolEnableReservation }}
       zvolReadyTimeout: {{ .Values.zfs.zvolReadyTimeout | default 60 }}
       destroyForeignSnapshotsOnDelete: {{ .Values.zfs.destroyForeignSnapshotsOnDelete }}
+      {{- $observeBusy := toString .Values.zfs.observeBusyBeforeDelete }}
+      {{- if and (ne $observeBusy "on-failure") (ne $observeBusy "<nil>") }}
+      {{- if or (eq $observeBusy "true") (eq $observeBusy "false") }}
+      observeBusyBeforeDelete: {{ $observeBusy }}
+      {{- else }}
+      observeBusyBeforeDelete: {{ $observeBusy | quote }}
+      {{- end }}
+      {{- end }}
       {{- if .Values.zfs.holdCsiSnapshots }}
       holdCsiSnapshots: true
       {{- end }}
@@ -83,6 +91,12 @@ data:
       {{- end }}
       shareAllowedNetworks:
         {{- toYaml .Values.nfs.shareAllowedNetworks | nindent 8 }}
+      {{- /* Renders only when set: the default ConfigMap, and so every node ID,
+           stays as before, and a rolled-back binary still parses it. */}}
+      {{- with .Values.nfs.nodeIdentityNetworks }}
+      nodeIdentityNetworks:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       shareAllowedHosts: []
       shareMaprootUser: {{ .Values.nfs.shareMaprootUser | quote }}
       shareMaprootGroup: {{ .Values.nfs.shareMaprootGroup | quote }}
@@ -208,6 +222,24 @@ data:
         {{- if not (kindIs "invalid" $nvmeofConnect.keepAliveTmo) }}
         keepAliveTmo: {{ $nvmeofConnect.keepAliveTmo }}
         {{- end }}
+      {{- end }}
+      {{- /* Userspace NVMe/TCP data path: renders ONLY when ublk is in use, so
+           a default install's ConfigMap carries neither key and stays
+           parseable by a rolled-back binary that has no such field. */}}
+      {{- if include "scale-csi.nvmeofUblkInUse" . }}
+      {{- $nvmeofUblk := $nvmeof.ublk | default dict }}
+      dataPath: {{ $nvmeof.dataPath | default "kernel" | quote }}
+      ublk:
+        enabled: {{ $nvmeofUblk.enabled | default false }}
+        {{- /* 0 (or unset) leaves queues and depth to nvmeublkd, which sizes
+             the device for the node and its volume budget. */}}
+        queues: {{ $nvmeofUblk.queues | default 0 | int }}
+        depth: {{ $nvmeofUblk.depth | default 0 | int }}
+        zeroCopy: {{ if kindIs "invalid" $nvmeofUblk.zeroCopy }}true{{ else }}{{ $nvmeofUblk.zeroCopy }}{{ end }}
+        {{- /* An explicit 0 (busy polling off) must survive; only unset is 200. */}}
+        napiUs: {{ if kindIs "invalid" $nvmeofUblk.napiUs }}200{{ else }}{{ $nvmeofUblk.napiUs | int }}{{ end }}
+        maxVolumesPerNode: {{ $nvmeofUblk.maxVolumesPerNode | default 32 | int }}
+        attachTimeout: {{ $nvmeofUblk.attachTimeout | default 60 | int }}
       {{- end }}
     {{- end }}
 

@@ -2,10 +2,14 @@ package truenas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -30,6 +34,12 @@ type NVMeoFSubsystem struct {
 	// must not collapse into an explicit false when a replay is deciding whether
 	// a requested pi_enable is already in effect.
 	PiEnable *bool `json:"pi_enable,omitempty"`
+	// Adopted is set only on NVMeoFSubsystemCreate's result, when the create
+	// found a subsystem of that name already present and returned it instead
+	// of creating one. A subsystem the call really created starts with exactly
+	// the allow_any_host and host associations it was created with; an adopted
+	// one may carry anything and must be reconciled.
+	Adopted bool `json:"-"`
 }
 
 // NVMeoFHost represents an NVMe-oF initiator host from the TrueNAS API.
@@ -117,6 +127,7 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 			existing, findErr := c.NVMeoFSubsystemFindByName(ctx, name)
 			if findErr == nil && existing != nil {
 				klog.V(4).Infof("NVMeoFSubsystemCreate: subsystem %q already exists (ID %d), returning existing", name, existing.ID)
+				existing.Adopted = true
 				return existing, nil
 			}
 			// If we got "Invalid params" but the subsystem doesn't exist, it's a genuine parameter error
@@ -223,11 +234,94 @@ func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
 	return hs, nil
 }
 
+// filterRejected is whether a filtered query's error rejects the filter
+// itself: -32602 (invalid params), or the -32001 envelope middlewared sends
+// when the datastore cannot apply it (a ValueError/KeyError, stamped EINVAL).
+// Anything else (too many concurrent calls, another errno) is transient.
+func filterRejected(apiErr *APIError) bool {
+	switch apiErr.Code {
+	case -32602:
+		return true
+	case -32001:
+		data, ok := apiErr.Data.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		errno, ok := envelopeErrno(data)
+		return ok && errno == syscall.EINVAL
+	}
+	return false
+}
+
+// subsysIDFilter is the server-side filter both association listings send.
+// NVMeoFHostSubsysFind already sends the same nested "subsys.id" filter.
+func subsysIDFilter(subsysID int) [][]interface{} {
+	return [][]interface{}{{"subsys.id", "=", subsysID}}
+}
+
+// queryBySubsystem runs an nvmet association query filtered to one subsystem
+// on the server, so the reply no longer grows with every volume on the NAS.
+// The filter is an optimisation only: callers still re-filter the rows
+// client-side, so a backend that ignores it returns the right answer. A
+// filtered call that fails with an API error (not a transport failure) is
+// retried once unfiltered. A rejection of the filter itself (filterRejected)
+// is remembered for filterRejectionTTL, so later calls skip the filtered
+// attempt; after that the filter is tried again (middlewared also reports an
+// unrelated exception as -32001 EINVAL, which must not switch the filter off
+// for the life of the controller). A transient error leaves it on.
+func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejectedAt *atomic.Int64) (interface{}, error) {
+	if filterProbeDue(rejectedAt) {
+		result, err := c.Call(ctx, method, subsysIDFilter(subsysID), map[string]interface{}{})
+		if err == nil {
+			return result, nil
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			return nil, err
+		}
+		result, unfilteredErr := c.Call(ctx, method, []interface{}{}, map[string]interface{}{})
+		if unfilteredErr != nil {
+			return nil, unfilteredErr
+		}
+		if filterRejected(apiErr) {
+			if rejectedAt.Swap(filterClock().UnixNano()) == 0 {
+				klog.Warningf("%s rejected a subsys.id filter (%v); listing the whole table and filtering client-side for %v", method, err, filterRejectionTTL)
+			}
+		}
+		return result, nil
+	}
+	return c.Call(ctx, method, []interface{}{}, map[string]interface{}{})
+}
+
+// filterProbeDue is whether this call tries the subsys.id filter: never
+// rejected, or the rejection has expired and this call is the one that won the
+// re-probe (the others list unfiltered meanwhile). An age that went negative
+// (the wall clock stepped back) counts as expired.
+func filterProbeDue(rejectedAt *atomic.Int64) bool {
+	since := rejectedAt.Load()
+	if since == 0 {
+		return true
+	}
+	now := filterClock()
+	if age := now.Sub(time.Unix(0, since)); age >= 0 && age < filterRejectionTTL {
+		return false
+	}
+	return rejectedAt.CompareAndSwap(since, now.UnixNano())
+}
+
+// filterRejectionTTL is how long a rejected subsys.id filter stays off;
+// filterClock is the clock it is measured on. Vars so tests can move them.
+var (
+	filterRejectionTTL = 10 * time.Minute
+	filterClock        = time.Now
+)
+
 // NVMeoFHostSubsysListBySubsystem lists the exact allowed-host associations
-// for one subsystem. TrueNAS does not consistently support nested-field
-// filtering across releases, so filtering is performed client-side.
+// for one subsystem. The query is filtered by subsys.id on the server; TrueNAS
+// has not consistently honored nested-field filters across releases, so the
+// rows are also filtered client-side and that check is authoritative.
 func (c *Client) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error) {
-	result, err := c.Call(ctx, "nvmet.host_subsys.query", []interface{}{}, map[string]interface{}{})
+	result, err := c.queryBySubsystem(ctx, "nvmet.host_subsys.query", subsysID, &c.hostSubsysServerFilterRejected)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list host_subsys associations: %w", err)
 	}
@@ -243,6 +337,54 @@ func (c *Client) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID i
 		}
 	}
 	return associations, nil
+}
+
+// NVMeoFHostSubsysList lists every allowed-host association on the
+// appliance in one unfiltered query: the startup diff reads the whole table
+// once instead of one filtered query per subsystem. A row that cannot be
+// parsed fails the listing: a dropped row would hide an association, and a
+// caller deciding that a subsystem's allowlist is exactly what it wants must
+// never see less than the backend holds.
+func (c *Client) NVMeoFHostSubsysList(ctx context.Context) ([]*NVMeoFHostSubsys, error) {
+	result, err := c.Call(ctx, "nvmet.host_subsys.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list host_subsys associations: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected host_subsys response type")
+	}
+	associations := make([]*NVMeoFHostSubsys, 0, len(items))
+	for _, item := range items {
+		association, parseErr := parseNVMeoFHostSubsys(item)
+		if parseErr != nil {
+			return nil, fmt.Errorf("unparseable host_subsys association: %w", parseErr)
+		}
+		associations = append(associations, association)
+	}
+	return associations, nil
+}
+
+// NVMeoFHostList lists every NVMe-oF host on the appliance in one query. A
+// row that cannot be parsed fails the listing.
+func (c *Client) NVMeoFHostList(ctx context.Context) ([]*NVMeoFHost, error) {
+	result, err := c.Call(ctx, "nvmet.host.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list NVMe-oF hosts: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected NVMe-oF host response type")
+	}
+	hosts := make([]*NVMeoFHost, 0, len(items))
+	for _, item := range items {
+		host, parseErr := parseNVMeoFHost(item)
+		if parseErr != nil {
+			return nil, fmt.Errorf("unparseable NVMe-oF host: %w", parseErr)
+		}
+		hosts = append(hosts, host)
+	}
+	return hosts, nil
 }
 
 // NVMeoFHostSubsysDelete removes one allowed-host association idempotently.
@@ -308,6 +450,26 @@ func (c *Client) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 		// Bare Invalid params is ambiguous on TrueNAS 26.0. Only an
 		// authoritative empty follow-up query may turn it into success; query
 		// failures remain delete failures.
+		if c.deleteVanishedTolerant(ctx, "nvmet.subsys.query", id) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete NVMe-oF subsystem: %w", err)
+	}
+	return nil
+}
+
+// NVMeoFSubsystemDeleteCascade deletes an NVMe-oF subsystem together with its
+// namespaces, port associations and host associations, in one call
+// (nvmet.subsys.delete with force). Verified on TrueNAS 26.0: the namespace,
+// all port and host associations go with it; host entries themselves stay.
+// Only for a subsystem known to hold nothing but what the caller means to
+// delete.
+func (c *Client) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	_, err := c.Call(ctx, "nvmet.subsys.delete", id, map[string]bool{"force": true})
+	if err != nil {
+		if IsNotFoundError(err) {
+			return nil
+		}
 		if c.deleteVanishedTolerant(ctx, "nvmet.subsys.query", id) {
 			return nil
 		}
@@ -534,11 +696,13 @@ func (c *Client) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID in
 		return nil, fmt.Errorf("unexpected NVMe-oF namespace response type")
 	}
 
+	// A row that cannot be parsed fails the listing: callers decide from it
+	// whether a subsystem serves anything else, and a dropped row would say no.
 	namespaces := make([]*NVMeoFNamespace, 0, len(items))
 	for _, item := range items {
 		namespace, parseErr := parseNVMeoFNamespace(item)
 		if parseErr != nil {
-			continue
+			return nil, fmt.Errorf("unparseable NVMe-oF namespace in subsystem %d: %w", subsysID, parseErr)
 		}
 		namespaces = append(namespaces, namespace)
 	}
@@ -807,8 +971,6 @@ func parseNVMeoFPortSubsys(data interface{}) (*NVMeoFPortSubsys, error) {
 }
 
 // NVMeoFPortSubsysFindBySubsystem checks if a subsystem is already associated with any port.
-// Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
-// so we fetch all associations and filter client-side.
 func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
 	assocs, err := c.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
 	if err != nil {
@@ -825,27 +987,30 @@ type NVMeoFPortSubsys struct {
 }
 
 // NVMeoFPortSubsysListBySubsystem returns all port-subsystem associations for a given subsystem.
-// Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
-// so we fetch all associations and filter client-side.
+// The query is filtered by subsys.id on the server (see queryBySubsystem); the
+// rows are re-filtered client-side, which stays authoritative because older
+// releases did not honor nested-field filters.
 func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
-	assocs, err := c.NVMeoFPortSubsysList(ctx)
+	result, err := c.queryBySubsystem(ctx, "nvmet.port_subsys.query", subsysID, &c.portSubsysServerFilterRejected)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query port-subsystem associations: %w", err)
 	}
-	return NVMeoFPortSubsysFilterBySubsystem(assocs, subsysID), nil
+	return NVMeoFPortSubsysFilterBySubsystem(parseNVMeoFPortSubsysList(result), subsysID), nil
 }
 
 // NVMeoFPortSubsysList returns all port-subsystem associations.
 func (c *Client) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys, error) {
-	// Fetch all port-subsystem associations (no filter - API doesn't support nested field filtering)
 	result, err := c.Call(ctx, "nvmet.port_subsys.query", []interface{}{}, map[string]interface{}{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query port-subsystem associations: %w", err)
 	}
+	return parseNVMeoFPortSubsysList(result), nil
+}
 
+func parseNVMeoFPortSubsysList(result interface{}) []*NVMeoFPortSubsys {
 	items, ok := result.([]interface{})
 	if !ok {
-		return nil, nil
+		return nil
 	}
 
 	assocs := make([]*NVMeoFPortSubsys, 0, len(items))
@@ -857,7 +1022,7 @@ func (c *Client) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys,
 		assocs = append(assocs, assoc)
 	}
 
-	return assocs, nil
+	return assocs
 }
 
 // NVMeoFPortSubsysFilterBySubsystem filters a pre-fetched association table.

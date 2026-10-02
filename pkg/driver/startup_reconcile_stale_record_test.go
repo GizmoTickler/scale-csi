@@ -270,7 +270,7 @@ func TestQuarantinedVolumeEventuallyConverges(t *testing.T) {
 
 	dataset, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Contains(t, records, staleKey, "fixture precondition: the stale record must be present")
 	require.NotContains(t, records, liveKey, "fixture precondition: the live node has no record yet")
@@ -288,7 +288,7 @@ func TestQuarantinedVolumeEventuallyConverges(t *testing.T) {
 	// inside the publication loop before persisting it.
 	dataset, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err = publicationRecordsFromDataset(dataset)
+	records, err = storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.NotContains(t, records, liveKey,
 		"the quarantined volume's own publication record must not be written until the stale record is revoked")
@@ -312,7 +312,7 @@ func TestQuarantinedVolumeEventuallyConverges(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		records, err := publicationRecordsFromDataset(dataset)
+		records, err := storedPublicationRecords(d, dataset)
 		if err != nil {
 			return false
 		}

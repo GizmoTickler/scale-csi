@@ -67,8 +67,8 @@ func (a *findByNameProbeAppliance) handler() func(*websocket.Conn) {
 				}
 			case snapshotResourceQueryMethod:
 				options := req.Params[0].(map[string]interface{})
-				paths := options["paths"].([]interface{})
-				if len(paths) == 0 {
+				if _, read := options["get_user_properties"]; !read {
+					// Capability probe (scoped, no user properties): not a read.
 					// Capability probe: not a read.
 					resp.Result = []interface{}{}
 					break

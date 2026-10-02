@@ -180,6 +180,7 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 			{NQN: "nqn.test:one", Address: "traddr=192.0.2.20,trsvcid=4420", Addresses: []string{"traddr=192.0.2.20,trsvcid=4420"}},
 			{NQN: "nqn.test:two", Address: "traddr=192.0.2.20,trsvcid=4420", Addresses: []string{"traddr=192.0.2.20,trsvcid=4420"}},
 		}
+		ownNVMeSessions(t, d, "nqn.test:one", "nqn.test:two")
 		for _, session := range sessions {
 			d.orphanedNVMeSessionsSeen.Store(session.NQN, time.Now().Add(-time.Hour))
 		}
@@ -212,6 +213,7 @@ func TestNVMeoFGCScopesByAnyMultipathPath(t *testing.T) {
 		Addresses:        []string{"192.0.2.21"},
 	}}}
 	const nqn = "nqn.test:multipath-first-path-secondary"
+	ownNVMeSessions(t, d, nqn)
 	// Paths[0] (session.Address) is the SECONDARY address; only Paths[1]
 	// (carried in Addresses) is the primary TransportAddress. Pre-fix, the GC
 	// only ever looked at Paths[0]/session.Address against a single
@@ -251,6 +253,7 @@ func TestNVMeoFGCScopesByAnyMultipathPath(t *testing.T) {
 func TestNVMeoFGCTreatsZeroPathSessionAsInScope(t *testing.T) {
 	d := &Driver{config: &Config{NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"}}}
 	const nqn = "nqn.test:zero-paths"
+	ownNVMeSessions(t, d, nqn)
 	sessions := []util.NVMeoFSessionInfo{{NQN: nqn}}
 	originalListNVMe := gcListNVMeoFSessions
 	originalDisconnectNVMe := gcDisconnectNVMeoF
@@ -309,6 +312,7 @@ func TestISCSIGCPreservesNVMeOrphanFirstSeen(t *testing.T) {
 		ISCSI:  ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
 		NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"},
 	}}
+	ownNVMeSessions(t, d, orphanNQN)
 	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) {
 		return []util.NVMeoFSessionInfo{{NQN: orphanNQN, Address: "traddr=192.0.2.20,trsvcid=4420", Addresses: []string{"traddr=192.0.2.20,trsvcid=4420"}}}, nil
 	}

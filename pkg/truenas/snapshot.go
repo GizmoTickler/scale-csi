@@ -23,7 +23,10 @@ const snapshotResourceQueryMethod = "zfs.resource.snapshot.query"
 // proved legacy backend from an unknown/transient probe result so mutation
 // callers never fall through to pool.snapshot.update on 26.0. Concurrent
 // callers share one probe.
-func (c *Client) snapshotResourceQueryStatus(ctx context.Context) (available, detected bool) {
+//
+// scope is the dataset or snapshot the caller is about to touch; the probe
+// reads only the snapshots of its pool's root dataset (resourceProbePaths).
+func (c *Client) snapshotResourceQueryStatus(ctx context.Context, scope string) (available, detected bool) {
 	c.snapshotResourceMu.Lock()
 	if c.snapshotResourceDetected {
 		cachedAvailable := c.snapshotResourceAvailable
@@ -48,7 +51,7 @@ func (c *Client) snapshotResourceQueryStatus(ctx context.Context) (available, de
 	c.snapshotResourceProbeDone = probeDone
 	c.snapshotResourceMu.Unlock()
 
-	_, err := c.Call(ctx, snapshotResourceQueryMethod, snapshotResourceQueryOptions(nil, false, nil))
+	_, err := c.Call(ctx, snapshotResourceQueryMethod, snapshotResourceProbeOptions(scope))
 	detected = err == nil || isMethodNotFoundError(err)
 	available = err == nil
 
@@ -71,9 +74,19 @@ func (c *Client) snapshotResourceQueryStatus(ctx context.Context) (available, de
 	return available, detected
 }
 
-func (c *Client) hasSnapshotResourceQuery(ctx context.Context) bool {
-	available, _ := c.snapshotResourceQueryStatus(ctx)
+func (c *Client) hasSnapshotResourceQuery(ctx context.Context, scope string) bool {
+	available, _ := c.snapshotResourceQueryStatus(ctx, scope)
 	return available
+}
+
+// snapshotResourceProbeOptions is the detection probe: the pool root
+// dataset's own snapshots (not recursive), no properties, no user properties.
+func snapshotResourceProbeOptions(scope string) map[string]interface{} {
+	return map[string]interface{}{
+		"paths":      resourceProbePaths(scope),
+		"recursive":  false,
+		"properties": nil,
+	}
 }
 
 func isMethodNotFoundError(err error) bool {
@@ -475,7 +488,7 @@ func isSnapshotCreatePropertiesValidationError(err error) bool {
 // its final clone releases the dependency.
 func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	var err error
-	if c.hasSnapshotResourceQuery(ctx) {
+	if c.hasSnapshotResourceQuery(ctx, snapshotID) {
 		// TrueNAS 26.0's live wire contract is a single object argument containing
 		// path; zfs.resource.snapshot.destroy does not accept the legacy positional
 		// snapshot id and options pair.
@@ -537,7 +550,7 @@ func (c *Client) SnapshotRename(ctx context.Context, snapshotID, newName string)
 	}
 
 	newSnapshotID := dataset + "@" + newName
-	if c.hasSnapshotResourceQuery(ctx) {
+	if c.hasSnapshotResourceQuery(ctx, snapshotID) {
 		params := map[string]interface{}{
 			"current_name": snapshotID,
 			"new_name":     newSnapshotID,
@@ -731,7 +744,7 @@ func isSnapshotNotHeldError(err error) bool {
 
 // SnapshotGet retrieves a snapshot by ID (dataset@snapshot format).
 func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error) {
-	if c.hasSnapshotResourceQuery(ctx) {
+	if c.hasSnapshotResourceQuery(ctx, snapshotID) {
 		dataset, _, ok := strings.Cut(snapshotID, "@")
 		if !ok || dataset == "" {
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
@@ -784,13 +797,21 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 // server's default projection for a property the driver's safety decision reads.
 // No extra round trip: same call, narrower payload.
 func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
-	if c.hasSnapshotResourceQuery(ctx) {
+	if c.hasSnapshotResourceQuery(ctx, dataset) {
 		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, snapshotResourceQueryProperties)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshots: %w", err)
 		}
 		filtered := snapshots[:0]
 		for _, snap := range snapshots {
+			// A row without its dataset field is still this dataset's snapshot
+			// when its ID says so: an empty listing here would read as "no
+			// snapshots", which DeleteVolume trusts.
+			if snap.Dataset == "" {
+				if datasetPart, _, ok := strings.Cut(snap.ID, "@"); ok {
+					snap.Dataset = datasetPart
+				}
+			}
 			if snap.Dataset == dataset {
 				filtered = append(filtered, snap)
 			}
@@ -809,7 +830,7 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 
 // SnapshotListAll lists all snapshots under a parent dataset (recursive).
 func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error) {
-	if c.hasSnapshotResourceQuery(ctx) {
+	if c.hasSnapshotResourceQuery(ctx, parentDataset) {
 		parentDataset = strings.TrimSuffix(parentDataset, "/")
 		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, snapshotResourceQueryProperties)
 		if err != nil {
@@ -868,7 +889,7 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 //  4. Any probe error (including method-not-found on some future build) falls
 //     back to the recursive scan below, unchanged.
 func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
-	if c.hasSnapshotResourceQuery(ctx) {
+	if c.hasSnapshotResourceQuery(ctx, parentDataset) {
 		parentDataset = strings.TrimSuffix(parentDataset, "/")
 
 		paths, probeErr := c.probeSnapshotPathsByName(ctx, parentDataset, name)
@@ -1025,7 +1046,7 @@ func paginateSnapshots(snapshots []*Snapshot, limit, offset int) []*Snapshot {
 // acknowledges the request while silently dropping it. Keep this method only
 // for older backends; 26.0 callers get an explicit unsupported error.
 func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error {
-	resourceAPI, detected := c.snapshotResourceQueryStatus(ctx)
+	resourceAPI, detected := c.snapshotResourceQueryStatus(ctx, snapshotID)
 	if !detected {
 		return fmt.Errorf("snapshot API generation could not be determined; refusing a potentially silent existing-snapshot property update")
 	}
@@ -1050,7 +1071,7 @@ func (c *Client) SnapshotRemoveUserProperties(ctx context.Context, snapshotID st
 	if len(keys) == 0 {
 		return nil
 	}
-	resourceAPI, detected := c.snapshotResourceQueryStatus(ctx)
+	resourceAPI, detected := c.snapshotResourceQueryStatus(ctx, snapshotID)
 	if !detected {
 		return fmt.Errorf("snapshot API generation could not be determined; refusing a potentially silent existing-snapshot property removal")
 	}

@@ -623,9 +623,23 @@ func findNVMeDeviceFresh(nqn string) (string, error) {
 	return findNVMeDeviceFromListSubsys(nqn)
 }
 
+// The sysfs class directories and /dev the device lookups read; variables so
+// tests can point the device wait at a fake sysfs and /dev.
+var (
+	nvmeSubsystemClassRoot  = "/sys/class/nvme-subsystem"
+	nvmeControllerClassRoot = "/sys/class/nvme"
+	nvmeDevRoot             = "/dev"
+)
+
 func findNVMeDeviceFromSysfs(nqn string) (string, error) {
-	return findNVMeDeviceFromSysfsInPaths(nqn, "/sys/class/nvme-subsystem", "/dev")
+	return findNVMeDeviceFromSysfsInPaths(nqn, nvmeSubsystemClassRoot, nvmeDevRoot)
 }
+
+// findNVMeDeviceFromSysfsInPaths finds the single namespace of the subsystem
+// with this NQN: the native multipath head (nvmeXnY, X the subsystem instance)
+// directly under the subsystem, or a namespace under one of its controllers.
+// Its /dev node must be current (see isCurrentBlockDeviceNode), checked
+// against the namespace's own sysfs dev file.
 
 func findNVMeDeviceFromSysfsInPaths(nqn, subsystemClassRoot, devRoot string) (string, error) {
 	// Look in /sys/class/nvme-subsystem
@@ -650,7 +664,7 @@ func findNVMeDeviceFromSysfsInPaths(nqn, subsystemClassRoot, devRoot string) (st
 		// A subsystem may expose namespaces directly (common for fabrics) or
 		// below controller directories (common for PCIe). Without an expected
 		// NSID, selecting among multiple namespaces is unsafe.
-		namespaceNames := make(map[string]struct{})
+		namespaceDirs := make(map[string]string)
 		patterns := []string{
 			filepath.Join(subsysDir, "nvme*n*"),
 			filepath.Join(subsysDir, "nvme*", "nvme*n*"),
@@ -659,14 +673,14 @@ func findNVMeDeviceFromSysfsInPaths(nqn, subsystemClassRoot, devRoot string) (st
 			nvmeDevices, _ := filepath.Glob(pattern)
 			for _, devPath := range nvmeDevices {
 				deviceName := filepath.Base(devPath)
-				if nvmeDeviceRegex.MatchString(deviceName) {
-					namespaceNames[deviceName] = struct{}{}
+				if _, seen := namespaceDirs[deviceName]; !seen && nvmeDeviceRegex.MatchString(deviceName) {
+					namespaceDirs[deviceName] = devPath
 				}
 			}
 		}
 
-		names := make([]string, 0, len(namespaceNames))
-		for name := range namespaceNames {
+		names := make([]string, 0, len(namespaceDirs))
+		for name := range namespaceDirs {
 			names = append(names, name)
 		}
 		sort.Strings(names)
@@ -675,7 +689,7 @@ func findNVMeDeviceFromSysfsInPaths(nqn, subsystemClassRoot, devRoot string) (st
 		}
 		if len(names) == 1 {
 			devicePath := filepath.Join(devRoot, names[0])
-			if _, err := os.Stat(devicePath); err == nil {
+			if isCurrentBlockDeviceNode(devicePath, filepath.Join(namespaceDirs[names[0]], "dev")) {
 				return devicePath, nil
 			}
 		}
@@ -713,7 +727,7 @@ func findNVMeDeviceFromSubsystems(nqn string, subsystems []NVMeSubsystem) (strin
 			// namespace IDs are not guaranteed to start at 1.
 			for _, path := range subsys.Paths {
 				if path.Name != "" {
-					devicePath, findErr := findNVMeNamespaceForController(path.Name, "/sys/class/nvme", "/dev")
+					devicePath, findErr := findNVMeNamespaceForController(path.Name, nvmeControllerClassRoot, nvmeDevRoot)
 					if findErr == nil {
 						return devicePath, nil
 					}
@@ -728,6 +742,8 @@ func findNVMeDeviceFromSubsystems(nqn string, subsystems []NVMeSubsystem) (strin
 	return "", fmt.Errorf("device not found for nqn=%s", nqn)
 }
 
+// findNVMeNamespaceForController finds the single namespace below a controller
+// whose /dev node is current (see isCurrentBlockDeviceNode).
 func findNVMeNamespaceForController(controller, nvmeClassRoot, devRoot string) (string, error) {
 	if !nvmeControllerRegex.MatchString(controller) {
 		return "", fmt.Errorf("invalid NVMe controller name: %s", controller)
@@ -752,7 +768,7 @@ func findNVMeNamespaceForController(controller, nvmeClassRoot, devRoot string) (
 	}
 	if len(deviceNames) == 1 {
 		devicePath := filepath.Join(devRoot, deviceNames[0])
-		if _, statErr := os.Stat(devicePath); statErr == nil {
+		if isCurrentBlockDeviceNode(devicePath, filepath.Join(nvmeClassRoot, controller, deviceNames[0], "dev")) {
 			return devicePath, nil
 		}
 	}

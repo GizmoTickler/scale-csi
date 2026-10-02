@@ -25,7 +25,7 @@ func (b iscsiShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset,
 	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false, nil)
 }
 
-func (b iscsiShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
+func (b iscsiShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string, _ *fenceResolution) error {
 	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties)
 }
 
@@ -34,10 +34,10 @@ func (b iscsiShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset,
 }
 
 func (b iscsiShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, hasDeferredActiveISCSI bool, res *fenceResolution) error {
-	return b.d.applyISCSIFence(ctx, ds, datasetName, enforceable, hasDeferredActiveISCSI, res)
+	return b.d.applyISCSIFence(ctx, ds, datasetName, enforceable, hasDeferredActiveISCSI, len(removing) > 0, res)
 }
 
-func (b iscsiShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {
+func (b iscsiShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, _ *fenceResolution) error {
 	return b.d.iscsiVolumeContext(ctx, ds, datasetName, volumeContext)
 }
 
@@ -185,7 +185,9 @@ func (d *Driver) convergeISCSIMultipathTargetGroups(ctx context.Context, target 
 // Every iSCSI CreateVolume and publish on such a target failed with -32602.
 // Route new callers through these wrappers instead of the client methods.
 func (d *Driver) iscsiTargetUpdateGroups(ctx context.Context, id int, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
-	return d.truenasClient.ISCSITargetUpdate(ctx, id, dedupeISCSITargetGroupsByPortal(groups))
+	target, err := d.truenasClient.ISCSITargetUpdate(ctx, id, dedupeISCSITargetGroupsByPortal(groups))
+	d.markISCSIChanged()
+	return target, err
 }
 
 func (d *Driver) iscsiTargetCreateGroups(
@@ -194,7 +196,43 @@ func (d *Driver) iscsiTargetCreateGroups(
 	groups []truenas.ISCSITargetGroup,
 	opts truenas.ISCSITargetCreateOptions,
 ) (*truenas.ISCSITarget, error) {
-	return d.truenasClient.ISCSITargetCreate(ctx, name, alias, mode, dedupeISCSITargetGroupsByPortal(groups), opts)
+	target, err := d.truenasClient.ISCSITargetCreate(ctx, name, alias, mode, dedupeISCSITargetGroupsByPortal(groups), opts)
+	d.markISCSIChanged()
+	return target, err
+}
+
+// markISCSIChanged records that this process wrote (or tried to write) an
+// iSCSI object, so the iscsitarget reload is owed until one that starts after
+// now succeeds. Called after the write returns, whatever its result: a failed
+// call may still have been applied.
+func (d *Driver) markISCSIChanged() {
+	if d.serviceReloadDebouncer != nil {
+		d.serviceReloadDebouncer.MarkChanged("iscsitarget")
+	}
+}
+
+// requestISCSIReloadIfOwed reloads iscsitarget only when an iSCSI change is
+// owed a reload: this pass's own writes, or an earlier one whose reload failed
+// or was never reached, or anything before this process started. A pass that
+// changed nothing on a service that has loaded everything reloads nothing.
+func (d *Driver) requestISCSIReloadIfOwed(ctx context.Context) error {
+	if d.serviceReloadDebouncer == nil {
+		return nil
+	}
+	return d.serviceReloadDebouncer.RequestReloadIfOwed(ctx, "iscsitarget")
+}
+
+// datasetHasLocalUserProperties reports whether every key already carries
+// exactly this value, set locally on the dataset. An inherited or unknown
+// source is not a match: the write is then made.
+func datasetHasLocalUserProperties(ds *truenas.Dataset, properties map[string]string) bool {
+	for key, value := range properties {
+		property, ok := datasetUserPropertyProjection(ds, key)
+		if !ok || !isLocalUserPropertySource(property.Source) || property.Value != value {
+			return false
+		}
+	}
+	return true
 }
 
 func containsISCSIGroupTemplate(groups []truenas.ISCSITargetGroup, candidate truenas.ISCSITargetGroup) bool {
@@ -442,6 +480,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				dynamicGroup, groupErr = d.truenasClient.ISCSIInitiatorCreateWithInitiators(
 					ctx, iscsiDenyAllInitiators(), "scale-csi fencing: "+datasetName,
 				)
+				d.markISCSIChanged()
 			}
 			if groupErr != nil {
 				return status.Errorf(codes.Internal, "failed to create strict iSCSI initiator group: %v", groupErr)
@@ -531,6 +570,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				d.config.ISCSI.ExtentRpm,
 				opts.iscsiExtentCreateOpts(),
 			)
+			d.markISCSIChanged()
 			if createErr == nil {
 				// ISCSIExtentCreate itself falls back to find-by-name on an ambiguous
 				// "already exists"/"invalid params", so even a nil error can hand back
@@ -568,7 +608,9 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 		if extent == nil {
 			// Cleanup target on failure
-			if delErr := d.truenasClient.ISCSITargetDelete(ctx, targetID, true); delErr != nil {
+			delErr := d.truenasClient.ISCSITargetDelete(ctx, targetID, true)
+			d.markISCSIChanged()
+			if delErr != nil {
 				klog.Warningf("Failed to cleanup iSCSI target after extent creation failure: %v", delErr)
 			}
 			return status.Errorf(codes.Internal, "failed to create iSCSI extent after %d attempts: %v", defaultShareRetryAttempts, lastErr)
@@ -593,6 +635,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	if targetExtent == nil {
 		var err error
 		targetExtent, err = d.truenasClient.ISCSITargetExtentCreate(ctx, targetID, extentID, 0)
+		d.markISCSIChanged()
 		if err != nil {
 			if freshlyCreated && truenas.IsAlreadyExistsError(err) {
 				targetExtent, _ = d.truenasClient.ISCSITargetExtentFind(ctx, targetID, extentID)
@@ -602,10 +645,14 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			// Cleanup orphaned target and extent on association failure
 			// These resources are useless without the association and will block future provisioning
 			klog.Errorf("Failed to create target-extent association, cleaning up orphaned resources: %v", err)
-			if delErr := d.truenasClient.ISCSIExtentDelete(ctx, extentID, false, true); delErr != nil {
+			delErr := d.truenasClient.ISCSIExtentDelete(ctx, extentID, false, true)
+			d.markISCSIChanged()
+			if delErr != nil {
 				klog.Warningf("Failed to cleanup orphaned iSCSI extent %d: %v", extentID, delErr)
 			}
-			if delErr := d.truenasClient.ISCSITargetDelete(ctx, targetID, true); delErr != nil {
+			delErr = d.truenasClient.ISCSITargetDelete(ctx, targetID, true)
+			d.markISCSIChanged()
+			if delErr != nil {
 				klog.Warningf("Failed to cleanup orphaned iSCSI target %d: %v", targetID, delErr)
 			}
 			return status.Errorf(codes.Internal, "failed to create target-extent association: %v", err)
@@ -653,16 +700,31 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// linkage is instead folded into CreateVolume's FATAL managed-property update
 	// (controller.go), which rolls back the share+dataset on failure. The group
 	// authmethod+auth are still applied to the live target groups above.
-	if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceProps); err != nil {
-		klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
+	//
+	// An existing volume whose IDs (and geometry stamp) are already set locally
+	// to these values is not rewritten: an unchanged republish makes no dataset
+	// write. The create-time stamp is always written.
+	if freshlyCreated || finalProperties != nil || !datasetHasLocalUserProperties(ds, resourceProps) {
+		if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceProps); err != nil {
+			klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
+		}
 	}
 
 	// Request iSCSI service reload using debouncer to prevent reload storms
 	// during bulk volume provisioning. Multiple requests within the debounce
-	// window will be coalesced into a single reload operation.
+	// window will be coalesced into a single reload operation. A create always
+	// reloads. An existing volume reloads only when an iSCSI change is owed one
+	// (this pass's own writes mark it): an unchanged republish reloads nothing,
+	// while a change whose earlier reload failed is still reloaded.
 	klog.V(4).Infof("Requesting debounced iSCSI service reload to ensure target is discoverable")
 	if d.serviceReloadDebouncer != nil {
-		if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
+		var reloadErr error
+		if freshlyCreated {
+			reloadErr = d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget")
+		} else {
+			reloadErr = d.requestISCSIReloadIfOwed(ctx)
+		}
+		if err := reloadErr; err != nil {
 			if d.config.ISCSI.Multipath {
 				// A multi-portal publish must not advertise until SCST has loaded
 				// every target-group association. Single-path retains its historical
@@ -732,22 +794,30 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 	var errs []error
 	for _, association := range associations {
-		if deleteErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("target-extent %d: %w", association.ID, deleteErr))
 		}
 	}
 	if extent != nil {
-		if deleteErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("extent %d: %w", extent.ID, deleteErr))
 		}
 	}
 	if target != nil {
-		if deleteErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("target %d: %w", target.ID, deleteErr))
 		}
 	}
 	if initiatorGroup != nil {
-		if deleteErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+		deleteErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID)
+		d.markISCSIChanged()
+		if deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
 			errs = append(errs, fmt.Errorf("initiator group %d: %w", initiatorGroup.ID, deleteErr))
 		}
 	}

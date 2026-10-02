@@ -162,6 +162,9 @@ func TestReconcileOrphansGuardedDeleteRefusesDependentVolume(t *testing.T) {
 	old := time.Now().Add(-48 * time.Hour)
 	addReconcileDataset(client, "a-source", old, true, 100)
 	clone := addReconcileDataset(client, "z-clone", old, true, 100)
+	// The clone's origin snapshot exists on the source, as it must in ZFS.
+	_, snapErr := client.SnapshotCreate(context.Background(), "pool/parent/a-source", "dependency", nil)
+	require.NoError(t, snapErr)
 	clone.Origin = truenas.DatasetProperty{
 		Parsed: "pool/parent/a-source@dependency", Rawvalue: "pool/parent/a-source@dependency",
 	}
@@ -179,6 +182,36 @@ func TestReconcileOrphansGuardedDeleteRefusesDependentVolume(t *testing.T) {
 	require.NoError(t, getErr, "guarded DeleteVolume must leave the dependent-bearing source intact")
 	for _, call := range client.DatasetDeleteCalls {
 		assert.NotEqual(t, "pool/parent/a-source", call.Name, "reconcile must never bypass the pre-delete dependency guard")
+	}
+}
+
+// The orphan reaper calls DeleteVolume and DeleteSnapshot directly, outside
+// the gRPC interceptor that classes CSI deletes, so it must mark its own
+// requests as deletes: otherwise a reconcile pass competes with publishes as
+// default work.
+func TestReconcileOrphanDeletesAreAdmittedAsDeletes(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false,
+		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")},
+		[]runtime.Object{reconcileSnapshotContent("live-content", "storage", "live-snapshot", "live-handle", "csi.scale.io")},
+	)
+	old := time.Now().Add(-48 * time.Hour)
+	addReconcileDataset(client, "live-volume", old, true, 100)
+	addReconcileSnapshot(t, client, "live-volume", "live-handle", old, true, 20)
+	addReconcileDataset(client, "orphan-volume", old, true, 100)
+	addReconcileSnapshot(t, client, "orphan-source", "orphan-handle", old, true, 20)
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Contains(t, report.DeletedVolumes, "orphan-volume")
+	require.NotEmpty(t, report.DeletedSnapshots)
+
+	require.NotEmpty(t, client.DatasetDeleteCalls)
+	for _, call := range client.DatasetDeleteCalls {
+		assert.Equal(t, truenas.PriorityDelete, call.Priority, "dataset delete %s", call.Name)
+	}
+	require.NotEmpty(t, client.SnapshotDeleteCalls)
+	for _, call := range client.SnapshotDeleteCalls {
+		assert.Equal(t, truenas.PriorityDelete, call.Priority, "snapshot delete %s", call.ID)
 	}
 }
 
@@ -809,7 +842,7 @@ func TestStalePublicationRechecksGenerationAtDestructiveBoundary(t *testing.T) {
 	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, t0.Add(time.Second))
 	fresh, err := base.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Contains(t, records, key)
 	assert.Equal(t, replacement.UpdatedAt, records[key].UpdatedAt,
@@ -938,7 +971,7 @@ func TestStalePublicationMassAbsenceBrakeDefersAllRecords(t *testing.T) {
 	for _, dataset := range datasets {
 		fresh, err := client.DatasetGet(ctx, dataset.Name)
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(d, fresh)
 		require.NoError(t, err)
 		assert.Len(t, records, 1)
 	}

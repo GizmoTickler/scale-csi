@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,39 +82,74 @@ func publicationPropertyCount(datasets []*truenas.Dataset) int {
 	return count
 }
 
-// reconcileStalePublicationRecords repairs the operator force-finalizer escape
-// hatch. A finalizer-removed VolumeAttachment never reaches external-attacher's
-// normal ControllerUnpublishVolume call, so its durable record otherwise blocks
-// SINGLE_NODE volumes forever. Absence must be continuous for the configured
-// grace period and is proved again under the same per-volume lock used by CSI.
-func (d *Driver) reconcileStalePublicationRecords(
-	ctx context.Context,
-	datasets []*truenas.Dataset,
-	state *kubernetesReconcileState,
-	now time.Time,
-) {
-	if state == nil {
-		return
+// staleSweepCandidate is one dataset's records for the stale-record sweep.
+type staleSweepCandidate struct {
+	datasetName string
+	records     map[string]publicationRecord
+}
+
+// staleSweep is what one sweep pass classifies.
+type staleSweep struct {
+	candidates []staleSweepCandidate
+	// recordCount is what the mass-absence brake weighs; negative means the
+	// records could not be listed and the pass does nothing.
+	recordCount int
+}
+
+// staleSweepCandidates reads the records the sweep classifies.
+func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.Dataset) staleSweep {
+	switch store := d.publications().(type) {
+	case kubernetesPublicationStore:
+		return d.kubernetesStaleSweepCandidates(ctx, store, datasets)
+	case importingPublicationStore:
+		// One list of the VolumePublications, and the records not yet imported
+		// from the datasets' own properties; Kubernetes wins per key, as reads do.
+		current := d.kubernetesStaleSweepCandidates(ctx, store.kube, datasets)
+		if current.recordCount < 0 {
+			return current
+		}
+		return mergeStaleSweeps(d.zfsStaleSweepCandidates(ctx, store.legacy, datasets), current)
+	default:
+		return d.zfsStaleSweepCandidates(ctx, store, datasets)
 	}
+}
+
+// mergeStaleSweeps resolves each dataset's ZFS and Kubernetes records as every
+// read does (resolvePublicationRecords), so the record a revoke re-reads under
+// the lock is the one the sweep classified. The brake weighs both counts: a
+// record caught in both stores by a crash counts twice, which only makes the
+// brake engage sooner.
+func mergeStaleSweeps(legacy, current staleSweep) staleSweep {
+	legacyBy := make(map[string]map[string]publicationRecord, len(legacy.candidates))
+	currentBy := make(map[string]map[string]publicationRecord, len(current.candidates))
+	order := make([]string, 0, len(legacy.candidates))
+	for _, sweep := range []struct {
+		candidates []staleSweepCandidate
+		into       map[string]map[string]publicationRecord
+	}{{legacy.candidates, legacyBy}, {current.candidates, currentBy}} {
+		for _, candidate := range sweep.candidates {
+			if _, seen := legacyBy[candidate.datasetName]; !seen {
+				if _, seen := currentBy[candidate.datasetName]; !seen {
+					order = append(order, candidate.datasetName)
+				}
+			}
+			sweep.into[candidate.datasetName] = candidate.records
+		}
+	}
+	merged := staleSweep{candidates: make([]staleSweepCandidate, 0, len(order)), recordCount: legacy.recordCount + current.recordCount}
+	for _, name := range order {
+		records := resolvePublicationRecords(legacyBy[name], currentBy[name])
+		if records == nil {
+			records = map[string]publicationRecord{}
+		}
+		merged.candidates = append(merged.candidates, staleSweepCandidate{datasetName: name, records: records})
+	}
+	return merged
+}
+
+// zfsStaleSweepCandidates reads the records the datasets carry as properties.
+func (d *Driver) zfsStaleSweepCandidates(ctx context.Context, store publicationStore, datasets []*truenas.Dataset) staleSweep {
 	recordCount := publicationPropertyCount(datasets)
-	if state.volumeAttachmentCount == 0 && recordCount >= staleRecordMassAbsenceThreshold {
-		// A zero-result VA list while several backend records exist is the shape of
-		// an etcd restore or informer/API discontinuity, not evidence for mass
-		// revocation. Restart every observation's grace window after recovery.
-		d.stalePublicationRecordsSeen.Range(func(key, _ interface{}) bool {
-			d.stalePublicationRecordsSeen.Delete(key)
-			return true
-		})
-		RecordFencingStaleDeferred()
-		klog.Warningf("Stale fencing record reconcile deferred: VolumeAttachment list is empty while %d records exist (brake threshold=%d)",
-			recordCount, staleRecordMassAbsenceThreshold)
-		return
-	}
-	grace, err := d.config.Fencing.StaleRecordGracePeriodDuration()
-	if err != nil || grace <= 0 {
-		d.recordReconcileObjectFailure("stale_publication_configuration", "fencing.staleRecordGracePeriod", err)
-		return
-	}
 	// The zfs.resource.query listing returns user_properties as a flat, SOURCELESS
 	// map on TrueNAS 26.0, but publicationRecordsFromDataset must distinguish a
 	// dataset's own (source=="local") records from clone-inherited ones by source:
@@ -138,6 +174,7 @@ func (d *Driver) reconcileStalePublicationRecords(
 	if len(sourcelessNames) > 0 {
 		sourceBearing, failedSourceBearing = d.datasetGetByNamesChunked(ctx, sourcelessNames)
 	}
+	candidates := make([]staleSweepCandidate, 0)
 	for _, dataset := range datasets {
 		if dataset == nil {
 			continue
@@ -157,34 +194,145 @@ func (d *Driver) reconcileStalePublicationRecords(
 			}
 			recordSource = sourceBearingDataset
 		}
-		records, parseErr := publicationRecordsFromDataset(recordSource)
+		records, parseErr := store.records(ctx, recordSource.Name, recordSource)
 		if parseErr != nil {
 			d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name, parseErr)
 			continue
 		}
-		volumeID := path.Base(dataset.Name)
+		candidates = append(candidates, staleSweepCandidate{datasetName: dataset.Name, records: records})
+	}
+	return staleSweep{candidates: candidates, recordCount: recordCount}
+}
+
+// kubernetesStaleSweepCandidates lists this instance's VolumePublications. A
+// record whose dataset is not in the listing is removed once a fresh read
+// under the volume lock shows the dataset is gone (its volume was deleted and
+// the delete's own removal did not happen); anything else about it is left.
+func (d *Driver) kubernetesStaleSweepCandidates(ctx context.Context, store kubernetesPublicationStore, datasets []*truenas.Dataset) staleSweep {
+	listing, err := store.all(ctx)
+	if err != nil {
+		d.recordReconcileObjectFailure("stale_publication_classification", "volumepublications", err)
+		return staleSweep{recordCount: -1}
+	}
+	all := listing.byDataset
+	for _, badErr := range listing.unreadable {
+		d.recordReconcileObjectFailure("stale_publication_classification", "volumepublications", badErr)
+	}
+	listed := make(map[string]struct{}, len(datasets))
+	for _, dataset := range datasets {
+		if dataset != nil {
+			listed[dataset.Name] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(all))
+	for name := range all {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	candidates := make([]staleSweepCandidate, 0, len(names))
+	missing := make([]string, 0)
+	for _, name := range names {
+		if _, ok := listed[name]; ok {
+			candidates = append(candidates, staleSweepCandidate{datasetName: name, records: all[name]})
+			continue
+		}
+		missing = append(missing, name)
+	}
+	// DeleteVolume removes a volume's records itself, so a dataset missing
+	// here is a leak of one interrupted delete. Many at once, or an empty
+	// listing, is the shape of a pool not yet imported (each dataset then
+	// reads NotFound too), not of deletes: leave them for a later pass.
+	if len(missing) > 0 && (len(listed) == 0 || len(missing) > max(staleRecordMassAbsenceThreshold, len(listed)/10)) {
+		RecordFencingStaleDeferred()
+		klog.Warningf("Stale fencing record reconcile: %d datasets with publication records are missing from a listing of %d; not forgetting them this pass",
+			len(missing), len(listed))
+	} else {
+		for _, name := range missing {
+			d.forgetPublicationsOfDeletedDataset(ctx, store, name)
+		}
+	}
+	return staleSweep{candidates: candidates, recordCount: listing.objects}
+}
+
+func (d *Driver) forgetPublicationsOfDeletedDataset(ctx context.Context, store kubernetesPublicationStore, datasetName string) {
+	lockKey := volumeLockKey(path.Base(datasetName))
+	if !d.acquireOperationLock(lockKey) {
+		return
+	}
+	defer d.releaseOperationLock(lockKey)
+	if _, err := d.truenasClient.DatasetGet(ctx, datasetName); !truenas.IsNotFoundError(err) {
+		return // present, or unknown: leave its records alone
+	}
+	if err := store.forget(ctx, datasetName); err != nil {
+		d.recordReconcileObjectFailure("stale_publication_cleanup", datasetName, err)
+		return
+	}
+	klog.Infof("Stale fencing record reconcile removed the publication records of deleted dataset %s", datasetName)
+}
+
+// reconcileStalePublicationRecords repairs the operator force-finalizer escape
+// hatch. A finalizer-removed VolumeAttachment never reaches external-attacher's
+// normal ControllerUnpublishVolume call, so its durable record otherwise blocks
+// SINGLE_NODE volumes forever. Absence must be continuous for the configured
+// grace period and is proved again under the same per-volume lock used by CSI.
+func (d *Driver) reconcileStalePublicationRecords(
+	ctx context.Context,
+	datasets []*truenas.Dataset,
+	state *kubernetesReconcileState,
+	now time.Time,
+) {
+	defer d.healStartupQuarantines(ctx)
+	if state == nil {
+		return
+	}
+	sweep := d.staleSweepCandidates(ctx, datasets)
+	candidates, recordCount := sweep.candidates, sweep.recordCount
+	if recordCount < 0 {
+		return
+	}
+	if state.volumeAttachmentCount == 0 && recordCount >= staleRecordMassAbsenceThreshold {
+		// A zero-result VA list while several backend records exist is the shape of
+		// an etcd restore or informer/API discontinuity, not evidence for mass
+		// revocation. Restart every observation's grace window after recovery.
+		d.stalePublicationRecordsSeen.Range(func(key, _ interface{}) bool {
+			d.stalePublicationRecordsSeen.Delete(key)
+			return true
+		})
+		RecordFencingStaleDeferred()
+		klog.Warningf("Stale fencing record reconcile deferred: VolumeAttachment list is empty while %d records exist (brake threshold=%d)",
+			recordCount, staleRecordMassAbsenceThreshold)
+		return
+	}
+	grace, err := d.config.Fencing.StaleRecordGracePeriodDuration()
+	if err != nil || grace <= 0 {
+		d.recordReconcileObjectFailure("stale_publication_configuration", "fencing.staleRecordGracePeriod", err)
+		return
+	}
+	for _, candidate := range candidates {
+		records := candidate.records
+		volumeID := path.Base(candidate.datasetName)
 		for propertyKey := range records {
 			record := records[propertyKey]
-			observationKey := stalePublicationObservationKey(dataset.Name, propertyKey)
+			observationKey := stalePublicationObservationKey(candidate.datasetName, propertyKey)
 			if _, live := state.liveVolumeAttachments[volumeAttachmentKey(volumeID, record.Node)]; live {
 				d.stalePublicationRecordsSeen.Delete(observationKey)
 				continue
 			}
 			firstMissing := now
 			if record.State != publicationStateRemoving {
-				candidate := newStalePublicationObservation(now, record)
-				actual, loaded := d.stalePublicationRecordsSeen.LoadOrStore(observationKey, candidate)
+				candidateObservation := newStalePublicationObservation(now, record)
+				actual, loaded := d.stalePublicationRecordsSeen.LoadOrStore(observationKey, candidateObservation)
 				observation, valid := actual.(stalePublicationObservation)
 				if !loaded || !valid || !observation.matches(record) {
-					d.stalePublicationRecordsSeen.Store(observationKey, candidate)
-					observation = candidate
+					d.stalePublicationRecordsSeen.Store(observationKey, candidateObservation)
+					observation = candidateObservation
 				}
 				firstMissing = observation.FirstMissing
 				if now.Sub(firstMissing) < grace {
 					continue
 				}
 			}
-			revoked, err := d.revokeStalePublicationRecord(ctx, dataset.Name, volumeID, propertyKey, record, recordCount)
+			revoked, err := d.revokeStalePublicationRecord(ctx, candidate.datasetName, volumeID, propertyKey, record, recordCount)
 			if err != nil {
 				d.recordReconcileObjectFailure("stale_publication_cleanup", volumeID+"/"+record.Node, err)
 				continue
@@ -232,6 +380,28 @@ func (d *Driver) revokeStalePublicationRecord(
 	detected publicationRecord,
 	recordCount int,
 ) (bool, error) {
+	revoked, err := d.revokeStalePublicationRecordLocked(ctx, datasetName, volumeID, propertyKey, detected, recordCount)
+	if revoked {
+		// (C11 fix) This revoke may be exactly what a quarantined startup fencing
+		// volume (quarantineStaleStartupFencingVolume) was waiting on: that
+		// carve-out exists BECAUSE this same stale record made the volume's own
+		// publication fail validatePublicationCompatibility. Revoking it removes
+		// that block, but nothing else re-evaluates the volume: the startup
+		// reconcile goroutine (if still running) is idling on its signal, not
+		// polling. The signal names this volume, and only this volume is re-run.
+		// It is sent after the volume lock is released, so the re-run never
+		// finds the lock still held by this revoke.
+		d.requestStartupAttachmentReconcile(datasetName)
+	}
+	return revoked, err
+}
+
+func (d *Driver) revokeStalePublicationRecordLocked(
+	ctx context.Context,
+	datasetName, volumeID, propertyKey string,
+	detected publicationRecord,
+	recordCount int,
+) (bool, error) {
 	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return false, fmt.Errorf("volume operation is in progress")
@@ -242,7 +412,7 @@ func (d *Driver) revokeStalePublicationRecord(
 	if err != nil {
 		return false, fmt.Errorf("fresh dataset read: %w", err)
 	}
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := d.publications().lockedRecords(ctx, datasetName, dataset)
 	if err != nil {
 		return false, fmt.Errorf("fresh publication record read: %w", err)
 	}
@@ -271,17 +441,5 @@ func (d *Driver) revokeStalePublicationRecord(
 	if err := d.unpublishFencedVolume(ctx, dataset, datasetName, shareType, nodeID, nil); err != nil {
 		return false, fmt.Errorf("revoke backend grant and publication record: %w", err)
 	}
-	// (C11 fix) This revoke may be exactly what a quarantined startup fencing
-	// volume (quarantineStaleStartupFencingVolume) was waiting on: that carve-out
-	// exists BECAUSE this same stale record made the volume's own publication
-	// fail validatePublicationCompatibility. Revoking it removes that block, but
-	// nothing else re-evaluates the volume — the startup reconcile goroutine (if
-	// still running; reconcileStalePublicationRecords only calls this when
-	// fencing is enabled, same gate that goroutine runs under) is idling on
-	// startupAttachmentReconcileSignal, not polling. Signal it unconditionally:
-	// the write is dropped harmlessly if that goroutine already exited (fully
-	// converged, nothing quarantined) and merely schedules one extra, cheap pass
-	// if this particular revoke did not concern a quarantined volume.
-	d.requestStartupAttachmentReconcile()
 	return true, nil
 }

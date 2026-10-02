@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // ServiceReloadDebouncer coalesces multiple service reload requests into a single
@@ -34,9 +36,28 @@ type ServiceReloadDebouncer struct {
 // serviceReloadState tracks the debounce state for a single service
 type serviceReloadState struct {
 	timer    *time.Timer
-	pending  []chan error // channels waiting for reload result
+	pending  []reloadWaiter // callers waiting for the reload's result
 	lastCall time.Time
 	count    int // number of coalesced requests
+
+	// changedGen counts the backend changes reported for this service
+	// (MarkChanged, and every RequestReload); reloadedGen is the highest
+	// changedGen a SUCCESSFUL reload is known to cover. A reload is owed while
+	// changedGen > reloadedGen. A new state starts owed (changedGen 1): after a
+	// controller start nothing is known about what the service has loaded.
+	changedGen  uint64
+	reloadedGen uint64
+}
+
+// reloadWaiter is one caller of a batch, with the admission class and the
+// operation start of the work it belongs to: the reload is admitted to
+// TrueNAS as the work of the callers still waiting when it fires, so it is
+// not queued behind their own later calls (or, for a publish waiting on it,
+// behind provisioning).
+type reloadWaiter struct {
+	result   chan error
+	priority truenas.Priority
+	start    time.Time
 }
 
 // NewServiceReloadDebouncer creates a new debouncer with the given delay.
@@ -61,17 +82,18 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 
 	d.mu.Lock()
 
-	state, exists := d.services[service]
-	if !exists {
-		state = &serviceReloadState{
-			pending: make([]chan error, 0),
-		}
-		d.services[service] = state
-	}
+	state := d.stateLocked(service)
+	state.changedGen++
 
-	state.pending = append(state.pending, resultCh)
+	now := time.Now()
+	priority := truenas.PriorityOf(ctx)
+	start, stamped := truenas.OperationStartOf(ctx)
+	if !stamped {
+		start = now
+	}
+	state.pending = append(state.pending, reloadWaiter{result: resultCh, priority: priority, start: start})
 	state.count++
-	state.lastCall = time.Now()
+	state.lastCall = now
 
 	// Leading-window batching: arm the timer only for the FIRST request of a
 	// batch. Requests that arrive while the timer is already running coalesce
@@ -99,8 +121,8 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 		// Remove ourselves from pending list
 		d.mu.Lock()
 		if st, ok := d.services[service]; ok {
-			for i, ch := range st.pending {
-				if ch == resultCh {
+			for i, waiter := range st.pending {
+				if waiter.result == resultCh {
 					st.pending = append(st.pending[:i], st.pending[i+1:]...)
 					break
 				}
@@ -109,6 +131,47 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 		d.mu.Unlock()
 		return ctx.Err()
 	}
+}
+
+// stateLocked returns the service's state, creating it (owed) if absent. d.mu
+// must be held.
+func (d *ServiceReloadDebouncer) stateLocked(service string) *serviceReloadState {
+	state, exists := d.services[service]
+	if !exists {
+		state = &serviceReloadState{changedGen: 1}
+		d.services[service] = state
+	}
+	return state
+}
+
+// MarkChanged records that a backend change for service has been written (or
+// attempted: call it after the write returns, whatever its result), so a
+// reload is owed until one that starts after this call succeeds. A caller
+// that changed nothing calls RequestReloadIfOwed instead of RequestReload.
+func (d *ServiceReloadDebouncer) MarkChanged(service string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stateLocked(service).changedGen++
+}
+
+// ReloadOwed reports whether a change to service has not yet been covered by a
+// successful reload (always true before the first one).
+func (d *ServiceReloadDebouncer) ReloadOwed(service string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	state := d.stateLocked(service)
+	return state.changedGen > state.reloadedGen
+}
+
+// RequestReloadIfOwed reloads service only when a change is owed one: an
+// earlier change whose reload failed, was never reached, or predates this
+// process. A caller whose own pass changed nothing uses it, so an unchanged
+// republish reloads nothing while a change is never left unloaded.
+func (d *ServiceReloadDebouncer) RequestReloadIfOwed(ctx context.Context, service string) error {
+	if !d.ReloadOwed(service) {
+		return nil
+	}
+	return d.RequestReload(ctx, service)
 }
 
 // executeReload performs the actual service reload and notifies all pending callers
@@ -131,9 +194,21 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 	// Capture pending channels and reset state
 	pendingChannels := state.pending
 	coalescedCount := state.count
-	state.pending = make([]chan error, 0)
+	priority, start := pendingChannels[0].priority, pendingChannels[0].start
+	for _, waiter := range pendingChannels[1:] {
+		if waiter.priority < priority {
+			priority = waiter.priority
+		}
+		if waiter.start.Before(start) {
+			start = waiter.start
+		}
+	}
+	state.pending = nil
 	state.count = 0
 	state.timer = nil
+	// Every change marked before this point was written before the reload
+	// starts, so a successful reload covers it.
+	coveredGen := state.changedGen
 
 	d.mu.Unlock()
 
@@ -142,22 +217,32 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 		klog.Infof("Service reload debouncer: coalesced %d reload requests for %s into single reload", coalescedCount, service)
 	}
 
-	// Perform the actual reload with a background context
-	// (the original contexts may have timed out, but we still want to reload)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// The reload runs detached from its callers' contexts (some may have
+	// timed out; the reload is still wanted), but is admitted to TrueNAS with
+	// their class and oldest operation start. It carries no deadline of its
+	// own: the client bounds the call itself, after a request slot is granted,
+	// by its request timeout. A deadline here would also have counted the wait
+	// for a slot, which under a burst of the callers' own operations can
+	// exceed any fixed budget.
+	ctx := truenas.WithOperationStart(truenas.WithPriority(context.Background(), priority), start)
 
 	err := d.reloadFunc(ctx, service)
 	if err != nil {
 		klog.Warningf("Service reload debouncer: reload of %s failed: %v", service, err)
 	} else {
 		klog.V(4).Infof("Service reload debouncer: successfully reloaded %s", service)
+		d.mu.Lock()
+		// Stop may have replaced the map; record against the live state only.
+		if live, ok := d.services[service]; ok && live == state && coveredGen > live.reloadedGen {
+			live.reloadedGen = coveredGen
+		}
+		d.mu.Unlock()
 	}
 
 	// Notify all pending callers
-	for _, ch := range pendingChannels {
+	for _, waiter := range pendingChannels {
 		select {
-		case ch <- err:
+		case waiter.result <- err:
 		default:
 			// Channel was already closed or full (context canceled)
 		}
@@ -174,9 +259,9 @@ func (d *ServiceReloadDebouncer) Stop() {
 			state.timer.Stop()
 		}
 		// Notify pending callers that we're shutting down
-		for _, ch := range state.pending {
+		for _, waiter := range state.pending {
 			select {
-			case ch <- context.Canceled:
+			case waiter.result <- context.Canceled:
 			default:
 			}
 		}

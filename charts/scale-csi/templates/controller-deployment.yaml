@@ -119,6 +119,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Publication records are VolumePublications (crds/) in the
+            # service account's namespace. Environment, not config: a
+            # rolled-back binary ignores it and still parses the ConfigMap.
+            - name: SCALE_CSI_PUBLICATION_STORE
+              value: kubernetes
             {{- if or .Values.truenas.apiKey .Values.truenas.existingSecret }}
             - name: TRUENAS_API_KEY
               valueFrom:

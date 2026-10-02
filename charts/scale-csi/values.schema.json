@@ -576,7 +576,7 @@
       "oneOf": [
         {
           "type": "string",
-          "pattern": "^(0|0s|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$"
+          "pattern": "^(0|0s|([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+)$"
         },
         {
           "type": "integer",
@@ -851,6 +851,18 @@
         "enabled": {
           "type": "boolean"
         },
+        "implementation": {
+          "type": "string",
+          "enum": ["go", "rust"]
+        },
+        "rustNodes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
         "priorityClassName": {
           "type": "string"
         },
@@ -1019,6 +1031,20 @@
         },
         "destroyForeignSnapshotsOnDelete": {
           "type": "boolean"
+        },
+        "observeBusyBeforeDelete": {
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "enum": [
+            true,
+            false,
+            "always",
+            "on-failure",
+            "never"
+          ],
+          "default": "on-failure"
         },
         "holdCsiSnapshots": {
           "type": "boolean",
@@ -1189,6 +1215,14 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "nodeIdentityNetworks": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1
           }
         },
         "shareMaprootUser": {
@@ -1463,6 +1497,102 @@
           "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",
           "type": "integer",
           "minimum": 1
+        },
+        "dataPath": {
+          "description": "Node data path for NVMe-oF volumes whose StorageClass does not set nvmeof/dataPath.",
+          "type": "string",
+          "enum": [
+            "kernel",
+            "ublk"
+          ]
+        },
+        "ublk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "maxVolumesPerNode": {
+              "description": "Volumes one node must be able to serve through the ublk data path at once (at most 128; 64 on a node with fewer than 16 CPUs).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            },
+            "queues": {
+              "description": "ublk queues per device; 0 lets nvmeublkd size it for the node.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            },
+            "depth": {
+              "description": "Per-queue ublk depth; 0 lets nvmeublkd choose.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            },
+            "zeroCopy": {
+              "type": "boolean"
+            },
+            "napiUs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "attachTimeout": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "daemon": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "digest": {
+                      "type": "string"
+                    },
+                    "pullPolicy": {
+                      "type": "string",
+                      "enum": [
+                        "Always",
+                        "IfNotPresent",
+                        "Never"
+                      ]
+                    }
+                  }
+                },
+                "terminationGracePeriodSeconds": {
+                  "type": "integer",
+                  "minimum": 6
+                },
+                "priorityClassName": {
+                  "type": "string"
+                },
+                "resources": {
+                  "type": "object"
+                },
+                "extraEnv": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

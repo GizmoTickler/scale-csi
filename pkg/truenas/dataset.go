@@ -154,8 +154,12 @@ func datasetKeyFormat(raw interface{}) string {
 type DatasetProperty struct {
 	Value    interface{} `json:"value"`
 	Rawvalue string      `json:"rawvalue"`
-	Parsed   interface{} `json:"parsed"`
-	Source   string      `json:"source"`
+	// Raw is zfs.resource.query's exact string form of the value
+	// ({"raw": "<digits>", "value": <number>, "source": {...}}); pool.dataset.query
+	// sends rawvalue instead.
+	Raw    string      `json:"raw"`
+	Parsed interface{} `json:"parsed"`
+	Source string      `json:"source"`
 }
 
 // UserProperty represents a user-defined ZFS property.
@@ -713,7 +717,7 @@ func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) 
 		},
 	}
 
-	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	raw, err := c.callRaw(ctx, "pool.dataset.query", filters, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
@@ -723,15 +727,17 @@ func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) 
 	// error: IsNotFoundError matches the plain "dataset not found" text, so
 	// DatasetExists reported a false absence and DatasetDelete returned nil —
 	// the PV is released while the dataset and its data live on.
-	datasets, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected pool.dataset.query response for %s: got %T, want a list", name, result)
+	datasets, err := decodePoolDatasetRows(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected pool.dataset.query response for %s: %w", name, err)
 	}
 	if len(datasets) == 0 {
 		return nil, fmt.Errorf("dataset not found: %s", name)
 	}
-
-	return parseDataset(datasets[0])
+	if datasets[0] == nil {
+		return nil, fmt.Errorf("unexpected dataset format")
+	}
+	return datasets[0], nil
 }
 
 // DatasetGetByNames retrieves multiple datasets by name in a single
@@ -753,18 +759,16 @@ func (c *Client) DatasetGetByNames(ctx context.Context, names []string) (map[str
 		},
 	}
 
-	response, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	raw, err := c.callRaw(ctx, "pool.dataset.query", filters, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get datasets: %w", err)
 	}
-
-	items, ok := response.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
+	datasets, err := decodePoolDatasetRows(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected response type: %w", err)
 	}
-	for _, item := range items {
-		dataset, parseErr := parseDataset(item)
-		if parseErr != nil || dataset == nil {
+	for _, dataset := range datasets {
+		if dataset == nil {
 			continue
 		}
 		result[dataset.Name] = dataset
@@ -774,12 +778,12 @@ func (c *Client) DatasetGetByNames(ctx context.Context, names []string) (map[str
 
 // DatasetUpdate updates a dataset's properties.
 func (c *Client) DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error) {
-	result, err := c.Call(ctx, "pool.dataset.update", name, params)
+	raw, err := c.callRaw(ctx, "pool.dataset.update", name, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update dataset: %w", err)
 	}
 
-	return parseDataset(result)
+	return decodePoolDatasetRow(raw)
 }
 
 // DatasetList lists CSI-managed datasets below the given parent.
@@ -823,7 +827,10 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 // (zfs.resource.query). It mirrors snapshotResourceQueryStatus: successful and
 // method-not-found probes are cached, transient failures are retried on the
 // next call, and concurrent callers share one probe.
-func (c *Client) datasetResourceQueryStatus(ctx context.Context) (available, detected bool) {
+//
+// scope is the dataset the caller is about to read; the probe reads only the
+// root dataset of its pool (see resourceProbePaths).
+func (c *Client) datasetResourceQueryStatus(ctx context.Context, scope string) (available, detected bool) {
 	c.datasetResourceMu.Lock()
 	if c.datasetResourceDetected {
 		cachedAvailable := c.datasetResourceAvailable
@@ -848,7 +855,7 @@ func (c *Client) datasetResourceQueryStatus(ctx context.Context) (available, det
 	c.datasetResourceProbeDone = probeDone
 	c.datasetResourceMu.Unlock()
 
-	_, err := c.Call(ctx, datasetResourceQueryMethod, datasetResourceQueryOptions(nil, false))
+	_, err := c.Call(ctx, datasetResourceQueryMethod, datasetResourceProbeOptions(scope))
 	detected = err == nil || isMethodNotFoundError(err)
 	available = err == nil
 
@@ -871,9 +878,37 @@ func (c *Client) datasetResourceQueryStatus(ctx context.Context) (available, det
 	return available, detected
 }
 
-func (c *Client) hasDatasetResourceQuery(ctx context.Context) bool {
-	available, _ := c.datasetResourceQueryStatus(ctx)
+func (c *Client) hasDatasetResourceQuery(ctx context.Context, scope string) bool {
+	available, _ := c.datasetResourceQueryStatus(ctx, scope)
 	return available
+}
+
+// resourceProbePaths scopes a capability probe to the root dataset of the
+// pool that scope (a dataset or snapshot path) lives in. The probe only has
+// to show that the method exists; with "paths": [] the appliance answered it
+// for every dataset (or snapshot) on the system, which on a large NAS is tens
+// of megabytes decoded and dropped. An empty scope keeps the unscoped form.
+func resourceProbePaths(scope string) []string {
+	pool := strings.TrimPrefix(scope, "/")
+	if i := strings.IndexAny(pool, "/@"); i >= 0 {
+		pool = pool[:i]
+	}
+	if pool == "" {
+		return []string{}
+	}
+	return []string{pool}
+}
+
+// datasetResourceProbeOptions is the detection probe: one row (the pool's
+// root dataset, no children) and no user properties. get_user_properties and
+// get_source are left out rather than set false; leaving them out is the
+// live-verified shape that returns user_properties as null.
+func datasetResourceProbeOptions(scope string) map[string]interface{} {
+	return map[string]interface{}{
+		"paths":        resourceProbePaths(scope),
+		"get_children": false,
+		"properties":   datasetResourceQueryProperties,
+	}
 }
 
 // datasetResourceQueryOptions builds the zfs.resource.query options object.
@@ -915,10 +950,10 @@ func datasetResourceQueryOptions(paths []string, getChildren bool) map[string]in
 // user property. Detection gates the call: if the resource API is not detected
 // available, it returns an error so callers fall back to pool.dataset.query.
 func (c *Client) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error) {
-	if !c.hasDatasetResourceQuery(ctx) {
+	parent := strings.TrimSuffix(parentDataset, "/")
+	if !c.hasDatasetResourceQuery(ctx, parent) {
 		return nil, fmt.Errorf("dataset resource API (zfs.resource.query) is not available")
 	}
-	parent := strings.TrimSuffix(parentDataset, "/")
 	var raw []*rawDataset
 	if err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{parent}, true)); err != nil {
 		return nil, fmt.Errorf("failed to query datasets by parent: %w", err)
@@ -1019,15 +1054,17 @@ func parseDatasetResource(data interface{}) (*Dataset, error) {
 	return ds, nil
 }
 
-// DatasetHasDependentClones reports whether any dataset in the same CSI parent was
-// cloned from a snapshot of datasetName. Snapshot clone projections are absent
-// on TrueNAS 26.0, but pool.dataset.query still exposes the origin property.
+// DatasetHasDependentClones reports whether any dataset was cloned from a
+// snapshot of datasetName. Snapshot clone projections are absent on TrueNAS
+// 26.0, so the answer comes from the datasets' origin property: across the
+// whole pool where the resource API is available (a clone can live anywhere in
+// its origin's pool), else across the CSI parent (see queryDatasetOrigins).
 func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
 	parent := path.Dir(datasetName)
 	if parent == "." || parent == "/" {
 		return false, fmt.Errorf("invalid dataset name %q", datasetName)
 	}
-	origins, err := c.queryDatasetOrigins(ctx, parent)
+	origins, err := c.queryDatasetOrigins(ctx, datasetName, parent)
 	if err != nil {
 		return false, err
 	}
@@ -1130,12 +1167,13 @@ func datasetPropertyInt64(property DatasetProperty) int64 {
 // (an admin's `zfs clone`, a replication/VolSync target, another driver
 // instance's volume) is still counted (GF2-fix/H3).
 //
-// Scope note, documented honestly: TrueNAS 26.0 exposes no `clones` property on
-// snapshots, so the only available authority is a dataset-origin query. It
-// covers the whole CSI PARENT subtree — every clone that can exist under the
-// driver's parent, managed or not. A clone living OUTSIDE the parent subtree is
-// invisible to every 26.0 API, so callers that mutate dependency structure
-// (promote) must treat that as a residual documented risk, not proven absence.
+// Scope note: TrueNAS 26.0 exposes no `clones` property on snapshots
+// (live-checked: requested, it is silently dropped), so the authority is a
+// dataset-origin query. Where zfs.resource.query is available it covers the
+// whole POOL, hidden internal datasets included, which is every place a clone
+// can live (ZFS clones never cross pools). Without it, pool.dataset.query
+// covers only the CSI PARENT subtree, and a clone outside the parent remains a
+// residual documented risk for callers that mutate dependency structure.
 func (c *Client) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
 	return c.snapshotDependentClones(ctx, snapshotID)
 }
@@ -1149,7 +1187,7 @@ func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string)
 	if !found || parent == "." || parent == "/" {
 		return nil, fmt.Errorf("invalid snapshot id %q", snapshotID)
 	}
-	origins, err := c.queryDatasetOrigins(ctx, parent)
+	origins, err := c.queryDatasetOrigins(ctx, datasetName, parent)
 	if err != nil {
 		return nil, err
 	}
@@ -1162,9 +1200,44 @@ func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string)
 	return clones, nil
 }
 
-// queryDatasetOrigins returns dataset name → origin (empty for non-clones) for
-// datasets below the configured CSI parent, using the projected origin property.
-func (c *Client) queryDatasetOrigins(ctx context.Context, parent string) (map[string]string, error) {
+// queryDatasetOrigins returns dataset name → origin (empty for non-clones).
+//
+// Where the dataset resource API is available it reads every dataset of
+// datasetName's POOL with only the origin property: one zfs.resource.query of
+// the pool root with get_children. Live-checked read-only on a TrueNAS 26.0
+// appliance: it returns the pool's internal datasets that pool.dataset.query
+// hides, among them a real clone whose origin is in another parent, at about
+// the cost of the parent-scoped pool.dataset.query it replaces (78 datasets in
+// 0.39 s against 47 in 0.45 s, most of it per-call overhead). pool.dataset.query
+// filtered on origin is not used: it hides those datasets, and it filters after
+// listing, so it costs the same. A failure here is returned (fail closed): a
+// narrower fallback could miss the very clone the caller asks about.
+//
+// The read stays the parent-scoped pool.dataset.query only when the resource
+// API is DETECTED absent (method not found). A capability probe that failed
+// transiently, or that this caller gave up waiting on, is not detection: the
+// scan then fails rather than quietly narrowing to the parent.
+func (c *Client) queryDatasetOrigins(ctx context.Context, datasetName, parent string) (map[string]string, error) {
+	available, detected := c.datasetResourceQueryStatus(ctx, datasetName)
+	if !detected {
+		return nil, fmt.Errorf("failed to query dataset origins: cannot tell whether the dataset resource API (zfs.resource.query) is available; refusing a parent-scoped scan that could miss a clone")
+	}
+	if available {
+		options := map[string]interface{}{
+			"paths":        resourceProbePaths(datasetName),
+			"get_children": true,
+			"properties":   []string{"origin"},
+		}
+		var raw []*rawDataset
+		if err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, options); err != nil {
+			return nil, fmt.Errorf("failed to query dataset origins: %w", err)
+		}
+		origins := make(map[string]string, len(raw))
+		for _, dataset := range rawDatasetsToDatasets(raw, true) {
+			origins[dataset.Name] = datasetPropertyString(dataset.Origin)
+		}
+		return origins, nil
+	}
 	filters := [][]interface{}{{"name", "^", strings.TrimSuffix(parent, "/") + "/"}}
 	options := map[string]interface{}{
 		"extra": map[string]interface{}{
@@ -1277,7 +1350,7 @@ func (c *Client) DatasetGetUserProperty(ctx context.Context, name, key string) (
 // pool.dataset.query with an empty properties list (identity core plus
 // user_properties still come back).
 func (c *Client) DatasetGetUserProperties(ctx context.Context, name string) (*Dataset, error) {
-	if c.hasDatasetResourceQuery(ctx) {
+	if c.hasDatasetResourceQuery(ctx, name) {
 		var raw []*rawDataset
 		err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{name}, false))
 		if err == nil {
@@ -1482,6 +1555,9 @@ func parseProperty(data interface{}) DatasetProperty {
 		prop.Value = m["value"]
 		if v, ok := m["rawvalue"].(string); ok {
 			prop.Rawvalue = v
+		}
+		if v, ok := m["raw"].(string); ok {
+			prop.Raw = v
 		}
 		prop.Parsed = m["parsed"]
 		if v, ok := m["source"].(string); ok {

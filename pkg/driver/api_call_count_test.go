@@ -528,6 +528,11 @@ func (c *apiCallCountingClient) NVMeoFSubsystemDelete(ctx context.Context, id in
 	return c.MockClient.NVMeoFSubsystemDelete(ctx, id)
 }
 
+func (c *apiCallCountingClient) NVMeoFSubsystemDeleteCascade(ctx context.Context, id int) error {
+	c.record("NVMeoFSubsystemDeleteCascade")
+	return c.MockClient.NVMeoFSubsystemDeleteCascade(ctx, id)
+}
+
 func (c *apiCallCountingClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*truenas.NVMeoFSubsystem, error) {
 	c.record("NVMeoFSubsystemGet")
 	return c.MockClient.NVMeoFSubsystemGet(ctx, id)
@@ -601,6 +606,16 @@ func (c *apiCallCountingClient) NVMeoFPortSubsysCreate(ctx context.Context, port
 func (c *apiCallCountingClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
 	c.record("NVMeoFPortSubsysFindBySubsystem")
 	return c.MockClient.NVMeoFPortSubsysFindBySubsystem(ctx, subsysID)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostSubsysList(ctx context.Context) ([]*truenas.NVMeoFHostSubsys, error) {
+	c.record("NVMeoFHostSubsysList")
+	return c.MockClient.NVMeoFHostSubsysList(ctx)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostList(ctx context.Context) ([]*truenas.NVMeoFHost, error) {
+	c.record("NVMeoFHostList")
+	return c.MockClient.NVMeoFHostList(ctx)
 }
 
 func (c *apiCallCountingClient) NVMeoFPortSubsysList(ctx context.Context) ([]*truenas.NVMeoFPortSubsys, error) {
@@ -922,7 +937,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the in-share
 		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
 		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
-		// managed/ownership/provision/name stamp (DatasetSetUserProperties).
+		// managed/ownership/provision/name stamp (DatasetSetUserProperties). The
+		// in-share stamp stays although the final one repeats it: it lands before
+		// the debounced reload, so a crash in that wait cannot lose the extent-ID
+		// witness and geometry (NVMe-oF folds its IDs instead; its repair is fatal).
 		{name: "CreateVolume fresh iSCSI", want: 14, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
@@ -954,7 +972,12 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		}},
 		// NFS deletion validates the cached share ID's export-path backreference
 		// before the dependency guards and destructive calls.
-		{name: "DeleteVolume NFS", want: 8, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume NFS", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-nfs", "nfs"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -963,17 +986,27 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		}},
 		// iSCSI deletion validates target, extent, and association backreferences
 		// before cleanup, then retains the two dataset dependency guards.
-		{name: "DeleteVolume iSCSI", want: 12, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume iSCSI", want: 9, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi"})
 			require.NoError(t, err)
 		}},
-		// Twelve calls: identical to the non-CHAP iSCSI delete. The shared CHAP auth
+		// Identical to the non-CHAP iSCSI delete. The shared CHAP auth
 		// peer is intentionally NOT deleted per-volume (other volumes of the
 		// StorageClass reference it), so DeleteVolume adds +0 CHAP round trips.
-		{name: "DeleteVolume iSCSI CHAP", want: 12, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume iSCSI CHAP", want: 9, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("delete-iscsi-chap"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -1052,7 +1085,12 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		//   +1 DatasetGet. The corroboration record is now VERIFIED with a
 		//     source-bearing re-read before the task is destroyed (B1-e), because
 		//     an assumed write is exactly what wedges a retry forever.
-		{name: "DeleteVolume NFS scheduled", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Batch 4.1 MOVEMENT -1: the volume has no snapshots of its own, so the
+		// parent-wide dataset-origin scan (DatasetHasDependentClones) is skipped.
+		// Batch 4.2 MOVEMENT -2: zfs.observeBusyBeforeDelete defaults to
+		// on-failure, so the two busy scans (DatasetAttachments,
+		// DatasetProcesses) no longer precede a delete that succeeds.
+		{name: "DeleteVolume NFS scheduled", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			_, err := d.CreateVolume(context.Background(), req)
@@ -1199,13 +1237,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// keys, AND the ownership stamp into a single atomic pool.dataset.update (one
 		// ZFS txg — this removes the old content-source-vs-ownership crash window by
 		// making the two durable simultaneously rather than weakening it); marker
-		// retirement after that durable write; NFS share resolution + create; and a
+		// retirement after that durable write; the NFS share create; and a
 		// single post-share update that folds the share-ID stamp together with the
 		// managed/provision/name stamps. The remaining writes are separated by crash
-		// boundaries or are the protected marker mechanism, so 10 is the safe floor
+		// boundaries or are the protected marker mechanism, so 9 is the safe floor
 		// without weakening crash consistency. (Zvol clones still pay one bounded
-		// readiness get to confirm volsize; this NFS golden does not.)
-		{name: "CreateVolume clone from snapshot", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// readiness get to confirm volsize; this NFS golden does not.) Was 10 while
+		// the share create first looked up a share for a clone this call had just
+		// made; CreateVolume now treats such a clone as fresh, as it does a new
+		// dataset.
+		{name: "CreateVolume clone from snapshot", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
@@ -1233,14 +1274,15 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// the total is unchanged); a filesystem refquota update (ensureCloneCapacity);
 		// ONE content-source write that folds the content-source keys, the
 		// origin-snapshot key, AND the ownership stamp into a single atomic
-		// pool.dataset.update (L2a); marker retirement; NFS share resolution + create;
+		// pool.dataset.update (L2a); marker retirement; the NFS share create (12 since
+		// a clone this call made counts as fresh, so no share lookup precedes it);
 		// and the post-share managed/provision/name fold. The Sprint 3 fix made this
 		// fold response-verifying (ownership must be durable before the marker is
 		// retired) WITHOUT adding a call: verification reads the update RESPONSE, and
 		// the one-time post-connect paranoia re-read is already consumed by the marker
-		// write above, so the count stays 13 (the write simply moves from
+		// write above, so the count stayed 13 (the write simply moves from
 		// DatasetSetUserProperties to DatasetUpdate, both one high-level call).
-		{name: "CreateVolume clone from volume", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "CreateVolume clone from volume", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
@@ -1353,6 +1395,7 @@ func iscsiPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRe
 // ServiceReload can issue both service.reload and service.control), all folded
 // into one count here.
 func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
+	skipWithRecordsInKubernetes(t, "pins the record writes TrueNAS serves; see api_call_count_kubernetes_test.go")
 	ctx := context.Background()
 
 	// (a) fencing OFF + NFS — the records-only floor. Backend allowlist
@@ -1390,15 +1433,14 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-nfs-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Three calls:
+		// Two calls:
 		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
-		// 2. DatasetSetUserProperties        — flip the record to "unpublishing"
-		//                                      BEFORE access is removed (crash-safe
-		//                                      tombstone; a restart can never re-add).
-		// 3. DatasetRemoveUserProperties     — removePublicationRecords clears the
-		//                                      durable record (off mode never touches
-		//                                      a backend allowlist).
-		assertAPICallCount(t, "off NFS unpublish", client, 3)
+		// 2. DatasetRemoveUserProperties     — removePublicationRecords clears the
+		//                                      durable record. Off mode never touches
+		//                                      a backend allowlist, so there is no
+		//                                      access removal for an "unpublishing"
+		//                                      tombstone to guard and none is written.
+		assertAPICallCount(t, "off NFS unpublish", client, 2)
 	})
 
 	// (b) additive + NFS — backend enforcement on, static policy preserved. The
@@ -1455,10 +1497,10 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 	// (c) strict + NVMe-oF single node — the live hot path P1 optimizes. The
 	// measured publish is a steady-state republish: the setup publish associates
 	// the node and warms the per-driver host-ID cache. Namespace/subsystem
-	// identity remains memoized within the request, but enforcement deliberately
-	// fresh-lists at its mutation boundary, unconditionally asserts the desired
-	// association, and fresh-lists again before removals. The unpublish uses the
-	// same enforcement-boundary freshness before revoking the association.
+	// identity remains memoized within the request. Enforcement creates only an
+	// association the classification read lacks, and always lists again after
+	// the writes before any removal; an unpublish has no classification read,
+	// so its one enforcement read is that post-write list.
 	t.Run("strict NVMe-oF publish", func(t *testing.T) {
 		client := newAPICallCountingClient()
 		d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
@@ -1473,23 +1515,30 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
 		require.NoError(t, err)
-		// Nine calls (steady-state republish; ~13 before P1):
+		// Five calls (steady-state republish; ~13 before P1, 9 while an unchanged
+		// record was rewritten, 8 while enforcement re-listed at a boundary whose
+		// result nothing read and re-created an association it had just seen):
 		// 1. DatasetGet                      — ControllerPublishVolume volume read.
 		// 2. NVMeoFNamespaceGet              — ensureShare resolves the namespace
 		//                                      (memoized for the rest of the request).
 		// 3. NVMeoFSubsystemGet              — ensureShare resolves the subsystem.
 		//    (repair-stamp write SKIPPED: the dataset already carries both IDs.)
-		// 4. NVMeoFHostFindByNQN             — validateBackend resolves the exempt
-		//                                      node NQN to a host ID.
-		// 5. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
-		//                                      for compatibility/classification.
-		// 6. DatasetSetUserProperties        — storePublicationRecord.
-		// 7. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
-		//                                      compatibility state is not reused.
-		// 8. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
-		//                                      of the desired association.
-		// 9. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
-		assertAPICallCount(t, "strict NVMe-oF publish", client, 9)
+		// 4. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
+		//                                      for compatibility/classification. The
+		//                                      expanded host NQNs are matched
+		//                                      directly, so no host lookup.
+		//    (record write SKIPPED: the stored record already says exactly this.)
+		//    (association create SKIPPED: the classification read already has it.)
+		// 5. NVMeoFHostSubsysListBySubsystem — fresh post-write removal view; it
+		//                                      also re-checks that the desired
+		//                                      association is still there.
+		assertAPICallCount(t, "strict NVMe-oF publish", client, 5)
+		assertAPICallMethodMap(t, "strict NVMe-oF publish", client, map[string]int{
+			"DatasetGet":                      1,
+			"NVMeoFNamespaceGet":              1,
+			"NVMeoFSubsystemGet":              1,
+			"NVMeoFHostSubsysListBySubsystem": 2,
+		})
 	})
 	t.Run("strict NVMe-oF unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -1503,19 +1552,27 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-nvme-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Nine calls:
+		// Seven calls (nine while enforcement re-listed at a dead boundary and
+		// looked up the removed node's host ID that the list already names):
 		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
 		// 2. DatasetSetUserProperties        — flip the record to "unpublishing".
 		// 3. NVMeoFNamespaceGet              — applyNVMeFence resolves the namespace
 		//                                      (fresh memo for this request).
 		// 4. NVMeoFSubsystemGet              — applyNVMeFence resolves the subsystem.
-		// 5. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read.
-		// 6. NVMeoFHostFindByNQN             — resolve the removing NQN to a host ID.
-		// 7. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view
-		//                                      (there are no desired creates here).
-		// 8. NVMeoFHostSubsysDelete          — revoke worker-a's association.
-		// 9. DatasetRemoveUserProperties     — removePublicationRecords.
-		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 9)
+		// 5. NVMeoFHostSubsysListBySubsystem — the enforcement read; nothing is
+		//                                      created, so it is also the removal view.
+		// 6. NVMeoFHostSubsysDelete          — revoke worker-a's association.
+		// 7. DatasetRemoveUserProperties     — removePublicationRecords.
+		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 7)
+		assertAPICallMethodMap(t, "strict NVMe-oF unpublish", client, map[string]int{
+			"DatasetGet":                      1,
+			"DatasetSetUserProperties":        1,
+			"NVMeoFNamespaceGet":              1,
+			"NVMeoFSubsystemGet":              1,
+			"NVMeoFHostSubsysListBySubsystem": 1,
+			"NVMeoFHostSubsysDelete":          1,
+			"DatasetRemoveUserProperties":     1,
+		})
 	})
 
 	// (d) fencing OFF + iSCSI — the block-protocol records-only floor. The share
@@ -1532,29 +1589,27 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi", nodeA))
 		require.NoError(t, err)
-		// Eight calls:
+		// Six calls:
 		// 1. DatasetGet                  — ControllerPublishVolume volume read.
 		// 2. ISCSITargetGet              — ensureShare resolves the stored target.
 		// 3. WaitForZvolReady            — zvol readiness gate before extent work.
 		// 4. ISCSIExtentGet              — ensureShare resolves the stored extent.
 		// 5. ISCSITargetExtentGet        — ensureShare resolves the target-extent
 		//                                  association.
-		// 6. DatasetSetUserProperties    — ensureShare re-stamps the target/extent/
-		//                                  association IDs.
-		// 7. ServiceReload               — debounced iscsitarget reload so the target
-		//                                  is discoverable.
-		// 8. DatasetSetUserProperties    — storePublicationRecord (off mode skips
+		// 6. DatasetSetUserProperties    — storePublicationRecord (off mode skips
 		//                                  validateBackend/applyBackendFence, so this
 		//                                  is the floor).
-		assertAPICallCount(t, "off iSCSI publish", client, 8)
+		// Batch 4.3 MOVEMENT 8 -> 6: the IDs are already stamped locally with
+		// these values, so ensureShare no longer re-stamps them, and nothing
+		// changed since CreateVolume's reload succeeded, so no ServiceReload.
+		assertAPICallCount(t, "off iSCSI publish", client, 6)
 		assertAPICallMethodMap(t, "off iSCSI publish", client, map[string]int{
 			"DatasetGet":               1,
 			"ISCSITargetGet":           1,
 			"WaitForZvolReady":         1,
 			"ISCSIExtentGet":           1,
 			"ISCSITargetExtentGet":     1,
-			"DatasetSetUserProperties": 2,
-			"ServiceReload":            1,
+			"DatasetSetUserProperties": 1,
 		})
 	})
 	t.Run("off iSCSI multipath publish", func(t *testing.T) {
@@ -1573,10 +1628,11 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		response, err := d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi-multipath", nodeA))
 		require.NoError(t, err)
 		assert.Equal(t, `["192.0.2.10:3260","192.0.2.11:3260"]`, response.GetPublishContext()["portals"])
-		// Ten calls: the eight-call single-path floor above plus exactly one
+		// Eight calls: the six-call single-path floor above plus exactly one
 		// ISCSIPortalList and one ISCSIInitiatorGet for the single distinct
 		// initiator template inspected by publish-time multipath convergence.
-		assertAPICallCount(t, "off iSCSI multipath publish", client, 10)
+		// Batch 4.3 MOVEMENT 10 -> 8, as for single path.
+		assertAPICallCount(t, "off iSCSI multipath publish", client, 8)
 		assertAPICallMethodMap(t, "off iSCSI multipath publish", client, map[string]int{
 			"DatasetGet":               1,
 			"ISCSITargetGet":           1,
@@ -1585,8 +1641,7 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 			"WaitForZvolReady":         1,
 			"ISCSIExtentGet":           1,
 			"ISCSITargetExtentGet":     1,
-			"DatasetSetUserProperties": 2,
-			"ServiceReload":            1,
+			"DatasetSetUserProperties": 1,
 		})
 	})
 	t.Run("off iSCSI unpublish", func(t *testing.T) {
@@ -1601,16 +1656,13 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-iscsi-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Three calls (mirror of off NFS unpublish; off mode never touches a backend
-		// allowlist):
+		// Two calls (mirror of off NFS unpublish; off mode never touches a backend
+		// allowlist, so no "unpublishing" tombstone is written):
 		// 1. DatasetGet                  — ControllerUnpublishVolume volume read.
-		// 2. DatasetSetUserProperties    — flip the record to "unpublishing" BEFORE
-		//                                  access is removed (crash-safe tombstone).
-		// 3. DatasetRemoveUserProperties — removePublicationRecords clears the record.
-		assertAPICallCount(t, "off iSCSI unpublish", client, 3)
+		// 2. DatasetRemoveUserProperties — removePublicationRecords clears the record.
+		assertAPICallCount(t, "off iSCSI unpublish", client, 2)
 		assertAPICallMethodMap(t, "off iSCSI unpublish", client, map[string]int{
 			"DatasetGet":                  1,
-			"DatasetSetUserProperties":    1,
 			"DatasetRemoveUserProperties": 1,
 		})
 	})
@@ -1630,34 +1682,35 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("strict-iscsi", nodeA))
 		require.NoError(t, err)
-		// Sixteen calls, per-method tally:
+		// Twelve calls, per-method tally:
 		//   DatasetGet                x1 — ControllerPublishVolume volume read.
 		//   ISCSITargetGet            x2 — ensureShare resolves the target; the fence
 		//                                  re-resolves it at its mutation boundary.
 		//   WaitForZvolReady          x1 — zvol readiness gate before extent work.
 		//   ISCSIExtentGet            x1 — ensureShare resolves the extent.
 		//   ISCSITargetExtentGet      x1 — ensureShare resolves the association.
-		//   DatasetSetUserProperties  x3 — ensureShare ID re-stamp, strict per-volume
-		//                                  initiator-group ID stamp, storePublicationRecord.
-		//   ServiceReload             x2 — ensureShare reload + post-fence reload.
+		//   DatasetSetUserProperties  x1 — storePublicationRecord.
+		//   ServiceReload             x1 — post-fence reload (the allowlist changed).
 		//   ISCSIPortalList           x1 — fence resolves the portal group IDs.
 		//   ISCSIInitiatorGet         x2 — fence reads the per-volume initiator group.
 		//   ISCSIInitiatorUpdate      x1 — fence converges the initiator allowlist.
-		//   ISCSITargetUpdate         x1 — fence rebinds the target to the converged
-		//                                  initiator group.
-		assertAPICallCount(t, "strict iSCSI publish", client, 16)
+		// Batch 4.3 MOVEMENT 16 -> 12: ensureShare's ID re-stamp and the strict
+		// initiator-group ID stamp are already set locally with these values; the
+		// target is already bound to the per-volume group on every portal (so no
+		// ISCSITargetUpdate); and ensureShare changed nothing, so only the
+		// post-fence reload remains.
+		assertAPICallCount(t, "strict iSCSI publish", client, 12)
 		assertAPICallMethodMap(t, "strict iSCSI publish", client, map[string]int{
 			"DatasetGet":               1,
 			"ISCSITargetGet":           2,
 			"WaitForZvolReady":         1,
 			"ISCSIExtentGet":           1,
 			"ISCSITargetExtentGet":     1,
-			"DatasetSetUserProperties": 3,
-			"ServiceReload":            2,
+			"DatasetSetUserProperties": 1,
+			"ServiceReload":            1,
 			"ISCSIPortalList":          1,
 			"ISCSIInitiatorGet":        2,
 			"ISCSIInitiatorUpdate":     1,
-			"ISCSITargetUpdate":        1,
 		})
 	})
 	t.Run("strict iSCSI unpublish", func(t *testing.T) {
@@ -1672,24 +1725,24 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-iscsi-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Nine calls, per-method tally:
+		// Seven calls, per-method tally:
 		//   DatasetGet                  x1 — ControllerUnpublishVolume volume read.
-		//   DatasetSetUserProperties    x2 — flip the record to "unpublishing", then
-		//                                    the fence's record update.
+		//   DatasetSetUserProperties    x1 — flip the record to "unpublishing".
 		//   ISCSITargetGet              x1 — fence resolves the target.
 		//   ISCSIInitiatorGet           x1 — fence reads the per-volume initiator group.
 		//   ISCSIInitiatorUpdate        x1 — fence revokes the node's initiator.
-		//   ISCSITargetUpdate           x1 — fence rebinds the target after the revoke.
 		//   ServiceReload               x1 — post-fence iscsitarget reload.
 		//   DatasetRemoveUserProperties x1 — removePublicationRecords clears the record.
-		assertAPICallCount(t, "strict iSCSI unpublish", client, 9)
+		// Batch 4.3 MOVEMENT 9 -> 7: the fence's initiator-group ID stamp is
+		// already set locally, and the target's groups already reference the
+		// per-volume group, so neither is rewritten.
+		assertAPICallCount(t, "strict iSCSI unpublish", client, 7)
 		assertAPICallMethodMap(t, "strict iSCSI unpublish", client, map[string]int{
 			"DatasetGet":                  1,
-			"DatasetSetUserProperties":    2,
+			"DatasetSetUserProperties":    1,
 			"ISCSITargetGet":              1,
 			"ISCSIInitiatorGet":           1,
 			"ISCSIInitiatorUpdate":        1,
-			"ISCSITargetUpdate":           1,
 			"ServiceReload":               1,
 			"DatasetRemoveUserProperties": 1,
 		})
@@ -1823,6 +1876,7 @@ func TestGF2FeaturesDefaultOffMakeNoNewAPICalls(t *testing.T) {
 // job wait, AND one extra core.get_jobs (fetchJobResult). These goldens count
 // ClientInterface calls, not wire RTTs (see the header of the publish goldens).
 func TestControllerPublishEncryptedGoldenAPICallCounts(t *testing.T) {
+	skipWithRecordsInKubernetes(t, "pins the record writes TrueNAS serves")
 	ctx := context.Background()
 	const passphrase = "enc-passphrase-1"
 	const rotatedPassphrase = "enc-passphrase-2"
@@ -2082,9 +2136,9 @@ func TestControllerSnapshotLookupGoldenAPICallCounts(t *testing.T) {
 	// with the delete pins above: a qualified content-source handle resolves the
 	// clone point via ONE targeted SnapshotList (SnapshotFindByName == 0), a
 	// legacy short handle keeps its ONE SnapshotFindByName scan (SnapshotList ==
-	// 0), and everything else about the ten-call restore is byte-identical (see
+	// 0), and everything else about the nine-call restore is byte-identical (see
 	// the "CreateVolume clone from snapshot" golden above for the per-call
-	// rationale of the shared ten). A regression looks like the two rows below
+	// rationale of the shared nine). A regression looks like the two rows below
 	// converging — either the scan leaking back into the qualified path or the
 	// targeted read being (uselessly) attempted for a datasetless handle.
 	t.Run("CreateVolume from snapshot", func(t *testing.T) {
@@ -2117,16 +2171,161 @@ func TestControllerSnapshotLookupGoldenAPICallCounts(t *testing.T) {
 					"DatasetUpdate":               2, // in-flight marker write; the merged refquota/content-source/ownership fold
 					"SnapshotClone":               1,
 					"DatasetRemoveUserProperties": 1, // marker retirement after the durable fold
-					"NFSShareFindByPath":          1, // share resolution
-					"NFSShareCreate":              1,
+					"NFSShareCreate":              1, // no lookup first: the clone is new
 					"DatasetSetUserProperties":    1, // post-share managed/provision/name + share-ID stamp
 				}
 				for method, count := range tc.resolution {
 					want[method] = count
 				}
-				assertAPICallCount(t, tc.name, client, 10)
+				assertAPICallCount(t, tc.name, client, 9)
 				assertAPICallMethodMap(t, tc.name, client, want)
 			})
 		}
 	})
+}
+
+// TestNVMeoFCreateAndCloneGoldenAPICallCounts pins strict NVMe-oF create and
+// clone, single path and multipath (four addresses). Before this golden the
+// counts were: create 13 (multipath 19), retry 5 (8), clone from snapshot 20
+// (26), clone from volume 21 (27). The calls that went:
+//   - NVMeoFSubsystemUpdateAllowAnyHost + NVMeoFHostSubsysListBySubsystem: the
+//     host reconcile of a subsystem the create had just made closed and empty.
+//     An ADOPTED subsystem (the name already existed) is still reconciled.
+//   - NVMeoFNamespaceGet + NVMeoFSubsystemGet: the volume context read back the
+//     objects the create had just made (on a retry: the ones the ensure had
+//     just resolved). It now reuses them from the request's memo.
+//   - On a clone, NVMeoFNamespaceGet + NamespaceFindByDevicePath +
+//     NVMeoFSubsystemGet + SubsystemFindByName: lookups that chased the share
+//     IDs the clone inherited from its source. A clone this call made counts as
+//     fresh, as a new dataset does.
+func TestNVMeoFCreateAndCloneGoldenAPICallCounts(t *testing.T) {
+	const addresses = 4
+	ports := func(multipath bool) int {
+		if multipath {
+			return addresses
+		}
+		return 1
+	}
+	// The shared tail of every create: the port(s), their associations, the
+	// subsystem, the namespace, and the one fatal property write that carries
+	// the share IDs with the managed/ownership stamps.
+	shareCreate := func(multipath bool) map[string]int {
+		return map[string]int{
+			"NVMeoFSubsystemCreate":    1,
+			"NVMeoFGetOrCreatePort":    ports(multipath),
+			"NVMeoFPortSubsysCreate":   ports(multipath),
+			"NVMeoFNamespaceCreate":    1,
+			"DatasetSetUserProperties": 1,
+		}
+	}
+	with := func(base map[string]int, extra map[string]int) map[string]int {
+		out := make(map[string]int, len(base)+len(extra))
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] += v
+		}
+		return out
+	}
+	total := func(m map[string]int) int {
+		n := 0
+		for _, v := range m {
+			n += v
+		}
+		return n
+	}
+	for _, multipath := range []bool{false, true} {
+		for _, tc := range []struct {
+			name string
+			want map[string]int
+			req  func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest
+		}{
+			{
+				// existence read; DatasetCreate; the ownership stamp and the
+				// one-time verifying re-read; the share; nothing read back.
+				name: "create",
+				want: with(shareCreate(multipath), map[string]int{"DatasetGet": 2, "DatasetCreate": 1, "DatasetUpdate": 1}),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					return apiCallCountVolumeRequest("golden-nvme-new", "nvmeof")
+				},
+			},
+			{
+				// A retry of a complete volume: the dataset, the namespace and
+				// subsystem the ensure resolves (reused for the context), and with
+				// multipath one port-association listing that finds them all.
+				name: "retry",
+				want: func() map[string]int {
+					m := map[string]int{"DatasetGet": 1, "NVMeoFNamespaceGet": 1, "NVMeoFSubsystemGet": 1}
+					if multipath {
+						m["NVMeoFGetOrCreatePort"] = addresses
+						m["NVMeoFPortSubsysListBySubsystem"] = 1
+					}
+					return m
+				}(),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					return apiCallCountVolumeRequest("golden-nvme-src", "nvmeof")
+				},
+			},
+			{
+				// existence read; the targeted snapshot read; the in-flight marker
+				// and the merged content-source/ownership write (DatasetUpdate x2);
+				// the clone; the bounded zvol readiness read; marker retirement.
+				name: "clone from snapshot",
+				want: with(shareCreate(multipath), map[string]int{
+					"DatasetGet": 2, "SnapshotList": 1, "DatasetUpdate": 2, "SnapshotClone": 1, "DatasetRemoveUserProperties": 1,
+				}),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					_, err := client.MockClient.SnapshotCreate(context.Background(), "pool/parent/golden-nvme-src", "clone-point", nil)
+					require.NoError(t, err)
+					req := apiCallCountVolumeRequest("golden-nvme-restored", "nvmeof")
+					req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+						Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "pool/parent/golden-nvme-src@clone-point"},
+					}}
+					return req
+				},
+			},
+			{
+				// as above, with the source-volume read and the temporary source
+				// snapshot instead of the snapshot lookup.
+				name: "clone from volume",
+				want: with(shareCreate(multipath), map[string]int{
+					"DatasetGet": 3, "SnapshotCreate": 1, "DatasetUpdate": 2, "SnapshotClone": 1, "DatasetRemoveUserProperties": 1,
+				}),
+				req: func(t *testing.T, client *apiCallCountingClient) *csi.CreateVolumeRequest {
+					req := apiCallCountVolumeRequest("golden-nvme-copied", "nvmeof")
+					req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+						Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "golden-nvme-src"},
+					}}
+					return req
+				},
+			},
+		} {
+			name := tc.name
+			if multipath {
+				name += " multipath"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				client := newAPICallCountingClient()
+				d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
+				if multipath {
+					d.config.NVMeoF.Multipath = true
+					d.config.NVMeoF.Addresses = []string{"192.0.2.21", "192.0.2.22", "192.0.2.23"}
+				}
+				_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+				require.NoError(t, err)
+				if tc.name != "create" {
+					_, err = d.CreateVolume(ctx, apiCallCountVolumeRequest("golden-nvme-src", "nvmeof"))
+					require.NoError(t, err)
+				}
+				req := tc.req(t, client)
+				client.resetCalls()
+				_, err = d.CreateVolume(ctx, req)
+				require.NoError(t, err)
+				assertAPICallCount(t, name, client, total(tc.want))
+				assertAPICallMethodMap(t, name, client, tc.want)
+			})
+		}
+	}
 }

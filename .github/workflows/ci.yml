@@ -55,6 +55,26 @@ jobs:
       - name: Test repo-specific analyzers
         run: go test ./hack/lint/repolint/...
 
+  node-agent:
+    name: Rust Node Agent
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/scale-csi-node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # rust-toolchain.toml pins the compiler, clippy and rustfmt. The node-id
+      # vectors the agent is checked against are generated and checked by the
+      # Go tests (pkg/driver/testdata/node_identity_vectors.json).
+      - name: Toolchain
+        run: rustup toolchain install
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -73,6 +93,11 @@ jobs:
         # (GF5/H1 shipped exactly that way). Kept as its own step so a
         # shuffle-only failure is easy to spot separately from the coverage run.
         run: go test -count=1 -shuffle=on ./pkg/driver/
+      - name: Run driver tests with records in Kubernetes
+        # The record, fencing and reconcile tests again, every driver keeping
+        # publication records as VolumePublications (with the import from ZFS)
+        # instead of ZFS properties, as the chart runs the controller.
+        run: SCALE_CSI_TEST_PUBLICATION_STORE=kubernetes go test -race -count=1 ./pkg/driver/
       - name: Check coverage threshold
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
@@ -376,9 +401,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
@@ -410,7 +432,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           provenance: true
           sbom: true
@@ -423,6 +445,68 @@ jobs:
             COMMIT=${{ github.sha }}
             # Busts the `apk upgrade` layer's cache every build; see Dockerfile.
             APK_REFRESH=${{ github.run_id }}
+
+  nvmeublk-image:
+    name: nvmeublkd Image
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, helm-lint, secret-scan]
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}-nvmeublk" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+
+      # amd64 only: the daemon image is built and measured on x86_64.
+      - name: Build and push nvmeublkd image
+        id: build-image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: experimental/nvmeublk
+          platforms: linux/amd64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          provenance: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=nvmeublk
+          cache-to: type=gha,mode=max,scope=nvmeublk
+
+      - name: Install cosign
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Keyless-sign the pushed manifest
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build-image.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
   sign-image:
     name: Sign Release Image
@@ -481,7 +565,7 @@ jobs:
     name: GitHub Release
     runs-on: ubuntu-latest
     # trivy is satisfied transitively through sign-image.
-    needs: [sign-image]
+    needs: [sign-image, nvmeublk-image]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write

@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -167,7 +168,7 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.Empty(t, associations)
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, retained := ds.UserProperties[publicationPropertyKey("worker-a")]
+	_, retained := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-a")]
 	assert.False(t, retained)
 
 	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
@@ -189,7 +190,7 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.Contains(t, err.Error(), hostA.HostNQN)
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, retained = ds.UserProperties[publicationPropertyKey("worker-b")]
+	_, retained = mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-b")]
 	assert.False(t, retained, "backend conflict must be detected before persisting a new publication")
 }
 
@@ -246,17 +247,12 @@ type allowlistCountingClient struct {
 
 type nvmeAssociationInterleavingClient struct {
 	*truenas.MockClient
-	listCalls  int
-	afterFirst func()
+	listCalls int
 }
 
 func (c *nvmeAssociationInterleavingClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
-	associations, err := c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
 	c.listCalls++
-	if c.listCalls == 1 && c.afterFirst != nil {
-		c.afterFirst()
-	}
-	return associations, err
+	return c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
 }
 
 func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T) {
@@ -298,7 +294,52 @@ func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T
 		assert.Equal(t, nqn, associations[0].HostNQN)
 	})
 
-	t.Run("foreign association created after boundary read is removed", func(t *testing.T) {
+	// The classification read is not enforcement evidence: an association that
+	// appears after it must still be revoked, from the list read after the
+	// writes.
+	t.Run("foreign association created after the classification read is removed", func(t *testing.T) {
+		ctx := context.Background()
+		base := truenas.NewMockClient()
+		d := &Driver{
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeStrict},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			},
+			truenasClient: base, nvmeResolvedHosts: make(map[string]int),
+		}
+		dataset, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/classified-remove", Type: "VOLUME", Volsize: testGiB,
+		})
+		require.NoError(t, err)
+		subsystem, err := base.NVMeoFSubsystemCreate(ctx, "classified-remove", false, nil)
+		require.NoError(t, err)
+		namespace, err := base.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+		require.NoError(t, err)
+		desiredNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+		desired, err := base.NVMeoFHostCreate(ctx, desiredNQN)
+		require.NoError(t, err)
+		association, err := base.NVMeoFHostSubsysCreate(ctx, desired.ID, subsystem.ID)
+		require.NoError(t, err)
+		res := &fenceResolution{
+			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
+			nvmeAssociations: []*truenas.NVMeoFHostSubsys{association}, nvmeAssocLoaded: true,
+		}
+		foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
+		require.NoError(t, err)
+		_, err = base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+		require.NoError(t, err, "foreign association lands after classification cached its list")
+
+		require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+			[]NodeIdentity{{Name: "worker-a", NVMeNQN: desiredNQN}}, nil, nil, nil, res))
+		associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		require.NoError(t, err)
+		require.Len(t, associations, 1)
+		assert.Equal(t, desiredNQN, associations[0].HostNQN)
+	})
+
+	// Without a classification read (unpublish, stale revoke) the one fresh
+	// read IS the post-write list: nothing is created before it.
+	t.Run("foreign association present at the enforcement read is removed", func(t *testing.T) {
 		ctx := context.Background()
 		base := truenas.NewMockClient()
 		client := &nvmeAssociationInterleavingClient{MockClient: base}
@@ -324,10 +365,8 @@ func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T
 		require.NoError(t, err)
 		foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
 		require.NoError(t, err)
-		client.afterFirst = func() {
-			_, createErr := base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
-			require.NoError(t, createErr)
-		}
+		_, err = base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+		require.NoError(t, err)
 		res := &fenceResolution{
 			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
 		}
@@ -338,6 +377,7 @@ func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T
 		require.NoError(t, err)
 		require.Len(t, associations, 1)
 		assert.Equal(t, desiredNQN, associations[0].HostNQN)
+		assert.Equal(t, 1, client.listCalls, "no write happened, so the enforcement read is the only list")
 	})
 }
 
@@ -429,7 +469,7 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	require.NoError(t, err)
 	dataset, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasRecord := dataset.UserProperties[publicationPropertyKey("worker-a")]
+	_, hasRecord := mustStoredRecords(t, d, dataset)[publicationPropertyKey("worker-a")]
 	assert.True(t, hasRecord, "off mode must still write a durable publication record")
 
 	// Same-node republish is idempotent.
@@ -443,7 +483,7 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	assert.Contains(t, err.Error(), "worker-a")
 	dataset, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasB := dataset.UserProperties[publicationPropertyKey("worker-b")]
+	_, hasB := mustStoredRecords(t, d, dataset)[publicationPropertyKey("worker-b")]
 	assert.False(t, hasB, "a rejected publish must not persist a record")
 
 	// No backend allowlist mutation may happen in off mode.
@@ -454,7 +494,7 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	require.NoError(t, err)
 	dataset, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	assert.Empty(t, records, "unpublish-all must clear the durable records in off mode")
 	assert.Zero(t, client.allowlistCalls(), "off mode unpublish must not mutate any backend transport allowlist")
@@ -529,7 +569,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 	require.NoError(t, err)
 	ds, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasRecord := ds.UserProperties[publicationPropertyKey("worker-a")]
+	_, hasRecord := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-a")]
 	assert.True(t, hasRecord, "off mode must still write a durable publication record for NVMe-oF")
 	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF publish must not touch nvmet host_subsys/allowlist")
 
@@ -545,7 +585,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 	assert.Contains(t, err.Error(), "worker-a")
 	ds, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	_, hasB := ds.UserProperties[publicationPropertyKey("worker-b")]
+	_, hasB := mustStoredRecords(t, d, ds)[publicationPropertyKey("worker-b")]
 	assert.False(t, hasB, "a rejected publish must not persist a record")
 	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF rejected publish must not touch nvmet host_subsys/allowlist")
 
@@ -554,7 +594,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 	require.NoError(t, err)
 	ds, err = mock.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	assert.Empty(t, records, "unpublish-all must clear the durable records in off mode")
 	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF unpublish must not touch nvmet host_subsys/allowlist")
@@ -670,7 +710,7 @@ func TestControllerUnpublishVolumeEmptyNodeIDRevokesAllPublications(t *testing.T
 	require.NoError(t, err, "CSI v1.12 requires an empty node_id to unpublish from every node")
 	dataset, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	assert.Empty(t, records)
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -726,7 +766,7 @@ func TestAdditivePublishDefersMissingAndOutOfCIDRIdentityWhilePreservingNFSNetwo
 
 	dataset, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 3, "deferred publishes retain durable ownership while enforceable peers converge")
 
@@ -764,7 +804,7 @@ func TestAdditiveSingleNodeDeferredOwnershipRejectsSecondLegacyNode(t *testing.T
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	dataset, err = client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("legacy-a"))
@@ -806,7 +846,7 @@ func TestAdditiveDeferredAndValidNFSPublishesPreserveBroadAllowAll(t *testing.T)
 	assert.Empty(t, share.Networks, "additive must not narrow a legacy allow-all share")
 	dataset, err = client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	assert.Len(t, records, 2)
 }
@@ -866,7 +906,7 @@ func TestAdditiveNFSUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 			require.NoError(t, err)
 			fresh, err := client.DatasetGet(ctx, dataset.Name)
 			require.NoError(t, err)
-			records, err := publicationRecordsFromDataset(fresh)
+			records, err := storedPublicationRecords(d, fresh)
 			require.NoError(t, err)
 			require.Len(t, records, 1)
 			assert.Equal(t, test.wantOwned, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -982,7 +1022,7 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 		// backend-live provenance entry survives for future revocation.
 		fresh, err := client.DatasetGet(ctx, "pool/parent/nfs-provenance-overflow")
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(d, fresh)
 		require.NoError(t, err)
 		assert.Equal(t, liveHosts, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts,
 			"backend-live provenance must be fully preserved by a refused publish")
@@ -1034,7 +1074,7 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 		require.NoError(t, publish(d, "nfs-provenance-compacts"))
 		fresh, err := client.DatasetGet(ctx, "pool/parent/nfs-provenance-compacts")
 		require.NoError(t, err)
-		records, err := publicationRecordsFromDataset(fresh)
+		records, err := storedPublicationRecords(d, fresh)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"192.0.2.1"},
 			records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -1083,7 +1123,7 @@ func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.12"},
 		records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -1318,7 +1358,7 @@ func TestClonedVolumeInheritsNoPublicationRecordsAndPublishesCleanly(t *testing.
 	inherited, ok := clone.UserProperties[publicationPropertyKey("worker-a")]
 	require.True(t, ok, "precondition: the clone inherited the source's publication property")
 	require.NotEqual(t, "local", inherited.Source, "precondition: inheritance is reported with an origin-name source")
-	records, err := publicationRecordsFromDataset(clone)
+	records, err := storedPublicationRecords(d, clone)
 	require.NoError(t, err)
 	assert.Empty(t, records, "a freshly cloned volume must own zero publication records")
 
@@ -1341,7 +1381,7 @@ func TestClonedVolumeInheritsNoPublicationRecordsAndPublishesCleanly(t *testing.
 	require.NoError(t, err)
 	fresh, err := client.DatasetGet(ctx, clone.Name)
 	require.NoError(t, err)
-	cloneRecords, err := publicationRecordsFromDataset(fresh)
+	cloneRecords, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Len(t, cloneRecords, 1)
 	_, published := cloneRecords[publicationPropertyKey("worker-b")]
@@ -1402,7 +1442,7 @@ func TestAdditiveNVMeUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 			require.NoError(t, err)
 			fresh, err := client.DatasetGet(ctx, dataset.Name)
 			require.NoError(t, err)
-			records, err := publicationRecordsFromDataset(fresh)
+			records, err := storedPublicationRecords(d, fresh)
 			require.NoError(t, err)
 			require.Len(t, records, 1)
 			assert.Equal(t, test.wantOwned, records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs)
@@ -1458,7 +1498,7 @@ func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T)
 	assert.Equal(t, newNQN, associations[0].HostNQN)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Equal(t, []string{newNQN},
 		records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs)
@@ -1585,7 +1625,7 @@ func TestStartupReconcileBackfillsAttachedNFSNodeAndEnforcesFence(t *testing.T) 
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Equal(t, "worker-a", records[publicationPropertyKey("worker-a")].Node)
@@ -1597,7 +1637,17 @@ func TestStartupReconcileBackfillsAttachedNFSNodeAndEnforcesFence(t *testing.T) 
 	assert.True(t, share.Enabled)
 }
 
+// The initial snapshot only schedules work: the per-volume pass re-reads each
+// VolumeAttachment by name under the lock, and one that is gone or being
+// deleted by then is never granted.
 func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing.T) {
+	for _, change := range []string{"deleted", "being deleted", "no longer attached"} {
+		t.Run(change, func(t *testing.T) { testStartupReconcileIgnoresAttachmentChangedAfterSnapshot(t, change) })
+	}
+}
+
+func testStartupReconcileIgnoresAttachmentChangedAfterSnapshot(t *testing.T, change string) {
+	t.Helper()
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/stale-startup", Type: "FILESYSTEM"})
@@ -1626,12 +1676,18 @@ func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing
 		Drivers: []storagev1.CSINodeDriver{{Name: "csi.scale.io", NodeID: nodeID}},
 	}}
 	kube := kubernetesfake.NewSimpleClientset(pv, attachment, csiNode)
-	var attachmentLists atomic.Int32
-	kube.PrependReactor("list", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
-		if attachmentLists.Add(1) == 1 {
-			return false, nil, nil
+	kube.PrependReactor("get", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
+		changed := attachment.DeepCopy()
+		switch change {
+		case "deleted":
+			return true, nil, apierrors.NewNotFound(storagev1.Resource("volumeattachments"), attachment.Name)
+		case "being deleted":
+			now := metav1.Now()
+			changed.DeletionTimestamp = &now
+		case "no longer attached":
+			changed.Status.Attached = false
 		}
-		return true, &storagev1.VolumeAttachmentList{}, nil
+		return true, changed, nil
 	})
 	d := &Driver{
 		name: "csi.scale.io",
@@ -1645,7 +1701,7 @@ func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "the under-lock VA refresh must veto a stale startup grant")
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -1698,7 +1754,7 @@ func TestStartupReconcileMixedDeferredAndKnownSingleNodeFailsBeforeMutation(t *t
 	require.Error(t, d.reconcilePublishedAttachments(ctx))
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "all compatibility checks must pass before startup persists either owner")
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -1754,7 +1810,7 @@ func TestStartupReconcileAdditiveConvergesKnownPeerWhileLegacyPeerDefers(t *test
 	assert.ErrorIs(t, reconcileErr, errFenceDeferred)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Len(t, records, 2)
 	assert.Equal(t, []string{"192.0.2.11"},
@@ -1842,7 +1898,7 @@ func TestStartupReconcileAdditivePreservesNFSGrantDuringIdentityGapThenRotates(t
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.11", "192.0.2.12"},
 		records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
@@ -1931,7 +1987,7 @@ func TestStartupReconcileAdditivePreservesNVMeGrantDuringIdentityGapThenRotates(
 	assert.Equal(t, newNQN, associations[0].HostNQN)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	// oldNQN is still associated on the subsystem when the rotation publish reads
 	// the backend, so both are retained; provenance now preserves first-seen order
@@ -1980,7 +2036,7 @@ func TestStartupReconcileRejectsUnknownBackendSingleNodeGrant(t *testing.T) {
 	assert.Contains(t, err.Error(), "published elsewhere")
 	fresh, getErr := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, getErr)
-	records, recordErr := publicationRecordsFromDataset(fresh)
+	records, recordErr := storedPublicationRecords(d, fresh)
 	require.NoError(t, recordErr)
 	assert.Empty(t, records)
 }
@@ -2054,7 +2110,7 @@ func TestStartupReconcileStrictRejectsConflictingSingleNodeAttachmentsBeforeMuta
 	assert.Contains(t, err.Error(), "already published")
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	assert.Empty(t, records, "strict conflict preflight must run before the first backend write")
 	share, err = client.NFSShareGet(ctx, share.ID)
@@ -2070,7 +2126,7 @@ func TestStartupReconcileStrictRejectsConflictingSingleNodeAttachmentsBeforeMuta
 	require.NoError(t, d.reconcilePublishedAttachments(ctx))
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err = publicationRecordsFromDataset(ds)
+	records, err = storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-a"))
@@ -2188,7 +2244,7 @@ func TestISCSILastUnpublishReattachesDenyGroupToExistingTargetPortals(t *testing
 		truenasClient: client,
 	}
 
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, false, nil))
 	target, err = client.ISCSITargetGet(ctx, target.ID)
 	require.NoError(t, err)
 	require.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, target.Groups,
@@ -2227,7 +2283,7 @@ func TestISCSIFenceZeroActiveIdentitiesWritesDenyAllSentinelGroup(t *testing.T) 
 	}
 
 	// Last unpublish: zero active identities.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, false, nil))
 
 	initiator, err := client.ISCSIInitiatorGet(ctx, dynamic.ID)
 	require.NoError(t, err)
@@ -2280,15 +2336,15 @@ func TestISCSIFenceRepublishReplacesSentinelWithRealIQN(t *testing.T) {
 	}
 
 	// Publish to A.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, false, false, nil))
 	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-a"}, allowlist())
 
 	// Last unpublish: deny-all sentinel replaces A.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, false, nil))
 	assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, allowlist())
 
 	// Republish to B: the update must REPLACE the sentinel, not append to it.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, false, false, nil))
 	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-b"}, allowlist(),
 		"republish must replace the sentinel, never accumulate it alongside a real IQN")
 }
@@ -2446,7 +2502,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 	// initiator would match, which is why publish must fail closed.
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, false, nil))
 
 	// Real node-side discovery: initiatorname.iscsi carries the reserved sentinel.
 	origRead := nodeReadIdentityFile
@@ -2467,7 +2523,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 		}
 		return nil, errors.New("no such file")
 	}
-	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	identity := discoverNodeIdentity(ctx, "worker-sentinel", nil)
 	require.Empty(t, identity.ISCSIIQN, "discovery must blank the sentinel out of the IQN field")
 	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision as a distinct signal")
 	nodeID, err := encodeNodeIdentity(identity)
@@ -2486,7 +2542,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 
 	fresh, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "a hard-rejected sentinel-reporting node must persist NO publication record")
 }
@@ -2528,7 +2584,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 	// matches, which is why publishing it must fail closed.
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, false, nil))
 
 	// Real node-side discovery reads the reserved sentinel; this is the identity
 	// encoded into the CURRENT CSINode registration.
@@ -2550,7 +2606,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 		}
 		return nil, errors.New("no such file")
 	}
-	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	identity := discoverNodeIdentity(ctx, "worker-sentinel", nil)
 	require.Empty(t, identity.ISCSIIQN, "discovery must blank the sentinel out of the IQN field")
 	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision")
 	encodedCurrent, err := encodeNodeIdentity(identity)
@@ -2579,7 +2635,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 
 	fresh, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "an enriched sentinel-reporting node must persist NO publication record")
 }
@@ -2633,7 +2689,7 @@ func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T
 		}
 		return nil, errors.New("no such file")
 	}
-	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	identity := discoverNodeIdentity(ctx, "worker-sentinel", nil)
 	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision")
 	nodeID, err := encodeNodeIdentity(identity)
 	require.NoError(t, err)
@@ -2651,7 +2707,7 @@ func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T
 
 	fresh, err := client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "off-mode sentinel-reporting node must persist NO publication record")
 }
@@ -2799,7 +2855,7 @@ func TestStartupReconcileAdditiveDefersLegacyNodeWithoutStrippingStaticNVMeHost(
 	assert.Equal(t, host.ID, associations[0].HostID)
 	ds, err = client.DatasetGet(ctx, ds.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(ds)
+	records, err := storedPublicationRecords(d, ds)
 	require.NoError(t, err)
 	require.Len(t, records, 1, "additive mode must retain ownership while waiting for node identity")
 	assert.Equal(t, "legacy-worker", records[publicationPropertyKey("legacy-worker")].Node)
@@ -3156,7 +3212,7 @@ func TestStartupReconcileIsolatesPerVolumeFailures(t *testing.T) {
 	assert.Contains(t, err.Error(), "missing")
 	goodDataset, err = client.DatasetGet(ctx, goodDataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(goodDataset)
+	records, err := storedPublicationRecords(d, goodDataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1, "one broken volume must not prevent another worker from converging")
 }
@@ -3240,18 +3296,18 @@ func TestBackgroundStartupAdditiveWaitsForDeferredTrigger(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	assert.Empty(t, records, "new attachments are reconciled only after a real deferral signals work")
 
-	d.recordFencingDeferred(NodeIdentity{Name: "worker-later"}, ShareTypeNFS, "missing_identity", "test trigger")
+	d.recordFencingDeferred(dataset.Name, NodeIdentity{Name: "worker-later"}, ShareTypeNFS, "missing_identity", "test trigger")
 
 	require.Eventually(t, func() bool {
 		fresh, getErr := client.DatasetGet(ctx, dataset.Name)
 		if getErr != nil {
 			return false
 		}
-		records, recordErr := publicationRecordsFromDataset(fresh)
+		records, recordErr := storedPublicationRecords(d, fresh)
 		return recordErr == nil && len(records) == 1
 	}, time.Second, 10*time.Millisecond,
 		"a deferred publish must trigger additive startup convergence without polling")
@@ -3273,17 +3329,32 @@ func TestStrictStartupGateBlocksGrantRPCButKeepsProbeAndTeardownUsable(t *testin
 		return &csi.ControllerPublishVolumeResponse{}, nil
 	}
 
-	_, err := d.logInterceptor(context.Background(), &csi.ControllerPublishVolumeRequest{},
-		&grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ControllerPublishVolume"}, handler)
+	_, err := d.logInterceptor(context.Background(), &csi.CreateVolumeRequest{},
+		&grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/CreateVolume"}, handler)
 	require.Error(t, err)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
-	assert.False(t, handlerCalled, "strict startup must gate grants at the Unix-socket RPC boundary")
+	assert.False(t, handlerCalled, "strict startup must gate provisioning at the Unix-socket RPC boundary")
+
+	// ControllerPublishVolume is gated per volume inside the handler
+	// (startupPublishGate), so it passes the boundary...
+	_, err = d.logInterceptor(context.Background(), &csi.ControllerPublishVolumeRequest{},
+		&grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ControllerPublishVolume"}, handler)
+	require.NoError(t, err)
+	assert.True(t, handlerCalled)
+	// ...and the handler refuses it until startup has taken its snapshot.
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:a"})
+	require.NoError(t, err)
+	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId: "pvc-gated", NodeId: nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER}},
+	})
+	assert.Equal(t, codes.Unavailable, status.Code(err), "no snapshot yet: no publish")
 
 	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Identity/Probe"))
 	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/ControllerUnpublishVolume"),
 		"teardown must remain available to drain a transient duplicate VolumeAttachment")
 	d.ready.Store(true)
-	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/ControllerPublishVolume"))
+	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/CreateVolume"))
 }
 
 // FIX 4 regression: on a backend that omits the expanded hostnqn field, a
@@ -3331,7 +3402,7 @@ func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testin
 	require.NoError(t, err)
 	fresh, err := client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(fresh)
+	records, err := storedPublicationRecords(d, fresh)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Equal(t, []string{nqn}, records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs,
@@ -3397,7 +3468,7 @@ func TestControllerPublishSameNodeRepublishIsIdempotent(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts)
 	dataset, err = client.DatasetGet(ctx, dataset.Name)
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-a"))
@@ -3517,7 +3588,7 @@ func TestControllerPublishTakesOverStaleSingleNodeRecord(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts, "worker-a's allowlist entry must be revoked and worker-b granted")
 	dataset, err := client.DatasetGet(ctx, "pool/parent/takeover-stale")
 	require.NoError(t, err)
-	records, err := publicationRecordsFromDataset(dataset)
+	records, err := storedPublicationRecords(d, dataset)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-b"))
@@ -3549,7 +3620,7 @@ func TestControllerPublishKeepsConflictWhenBlockingNodeStillAttached(t *testing.
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts, "a live blocking attachment must not be revoked")
 	dataset, getErr := client.DatasetGet(ctx, "pool/parent/takeover-live")
 	require.NoError(t, getErr)
-	records, recErr := publicationRecordsFromDataset(dataset)
+	records, recErr := storedPublicationRecords(d, dataset)
 	require.NoError(t, recErr)
 	require.Len(t, records, 1)
 	assert.Contains(t, records, publicationPropertyKey("worker-a"))
@@ -3594,4 +3665,48 @@ func TestControllerPublishFailsSafeWhenAttachmentListUnavailable(t *testing.T) {
 	share, err := client.NFSShareGet(ctx, shareID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts, "fail-safe must leave the blocking grant intact")
+}
+
+// On a backend that does not expand an association's host NQN, strict
+// enforcement falls back to host IDs: the desired association is recognized by
+// ID (no duplicate create) and a foreign one is still revoked.
+func TestStrictNVMeFenceWithoutExpandedHostNQNFallsBackToHostIDs(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	client := &allowlistCountingClient{MockClient: base}
+	d := &Driver{
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+	}
+	dataset, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/nqnless-strict", Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+	subsystem, err := base.NVMeoFSubsystemCreate(ctx, "nqnless-strict", false, nil)
+	require.NoError(t, err)
+	namespace, err := base.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+	require.NoError(t, err)
+	desiredNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+	desired, err := base.NVMeoFHostCreate(ctx, desiredNQN)
+	require.NoError(t, err)
+	_, err = base.NVMeoFHostSubsysCreate(ctx, desired.ID, subsystem.ID)
+	require.NoError(t, err)
+	foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
+	require.NoError(t, err)
+	_, err = base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+	require.NoError(t, err)
+	base.EmptyNVMeHostNQN = true
+	res := &fenceResolution{nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true}
+
+	require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+		[]NodeIdentity{{Name: "worker-a", NVMeNQN: desiredNQN}}, nil, nil, nil, res))
+	associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+	require.NoError(t, err)
+	require.Len(t, associations, 1)
+	assert.Equal(t, desired.ID, associations[0].HostID)
+	assert.Equal(t, int64(0), client.nvmeHostSubsysCreate.Load(), "the desired association exists by host ID")
+	assert.Equal(t, int64(1), client.nvmeHostSubsysDelete.Load())
 }

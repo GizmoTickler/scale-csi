@@ -20,7 +20,7 @@ func (b nfsShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset, d
 	return b.d.ensureNFSShareExists(ctx, ds, datasetName, volumeName)
 }
 
-func (b nfsShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
+func (b nfsShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string, _ *fenceResolution) error {
 	return b.d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, finalProperties)
 }
 
@@ -32,7 +32,7 @@ func (b nfsShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, da
 	return b.d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts), res)
 }
 
-func (b nfsShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {
+func (b nfsShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, _ *fenceResolution) error {
 	return b.d.nfsVolumeContext(ds, volumeContext)
 }
 

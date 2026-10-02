@@ -292,7 +292,7 @@ func TestPendingDepthRecorderTracksCallLifecycle(t *testing.T) {
 	client := &Client{
 		config:    cfg,
 		pool:      []*Connection{connection},
-		semaphore: make(chan struct{}, 1),
+		semaphore: newAdmissionGate(1),
 		pendingDepthRecorder: func(depth int) {
 			callbackCount.Add(1)
 			lastDepth.Store(int32(depth))
@@ -343,7 +343,7 @@ func TestCallRawIsSharedByTypedAndGenericDecoders(t *testing.T) {
 	client := &Client{
 		config:    cfg,
 		pool:      []*Connection{connection},
-		semaphore: make(chan struct{}, 1),
+		semaphore: newAdmissionGate(1),
 		metricsRecorder: func(string, float64, error) {
 			metrics.Add(1)
 		},
@@ -377,7 +377,7 @@ func TestCallRawIsSharedByTypedAndGenericDecoders(t *testing.T) {
 	assert.Equal(t, "generic", generic.(map[string]interface{})["name"])
 	assert.Equal(t, float64(43), generic.(map[string]interface{})["count"])
 	assert.Equal(t, int32(2), metrics.Load(), "both decoders must traverse the same metrics pipeline")
-	assert.Empty(t, client.semaphore)
+	assert.Zero(t, client.semaphore.inFlight())
 }
 
 var (

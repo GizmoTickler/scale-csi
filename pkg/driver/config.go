@@ -8,12 +8,15 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 var configWarningf = klog.Warningf
@@ -212,6 +215,17 @@ type ZFSConfig struct {
 	// snapshots that were not created by the CSI driver (default: false)
 	DestroyForeignSnapshotsOnDelete bool `yaml:"destroyForeignSnapshotsOnDelete"`
 
+	// ObserveBusyBeforeDelete controls the observation-only
+	// pool.dataset.attachments and pool.dataset.processes scans around a dataset
+	// delete. They never block the delete; they log and count what still used
+	// the dataset. "on-failure" (the default) runs them only after a delete
+	// fails with anything but a plain snapshot/children dependency, so the
+	// record exists when it can explain a failure. "always" (or true, the
+	// behavior before v1.24.0) runs them before every delete, which is the only
+	// record that a forced delete took a dataset that was still in use, at about
+	// 1.3 s of TrueNAS middleware time per delete. "never" (or false) skips them.
+	ObserveBusyBeforeDelete BusyObservationMode `yaml:"observeBusyBeforeDelete"`
+
 	// HoldCSISnapshots places a deletion-proof ZFS hold (the fixed `truenas` tag)
 	// on every CSI VolumeSnapshot at create so foreign actors — a box-wide
 	// periodic-snapshot task's pruning, an admin, replication retention — cannot
@@ -275,6 +289,15 @@ type NFSConfig struct {
 
 	// ShareAllowedNetworks is a list of allowed networks (CIDR notation)
 	ShareAllowedNetworks []string `yaml:"shareAllowedNetworks"`
+
+	// NodeIdentityNetworks lists the storage networks (CIDRs, or single IPs)
+	// a node plugin reaches the NFS server over. Each node adds its interface
+	// addresses inside them to the IPs of its node_id, so fencing grants the
+	// address the NAS actually sees when a node mounts over a storage fabric
+	// rather than its Kubernetes (status.hostIP) address. Empty, the default,
+	// keeps every node_id exactly as before; setting it changes the node_id of
+	// every node with an address in a listed network (kubelet re-registers it).
+	NodeIdentityNetworks []string `yaml:"nodeIdentityNetworks"`
 
 	// ShareAllowedHosts is a list of allowed hosts
 	ShareAllowedHosts []string `yaml:"shareAllowedHosts"`
@@ -871,6 +894,223 @@ type NVMeoFConfig struct {
 	// configures a shared TrueNAS port object, these apply per-connection on
 	// every node that stages a volume.
 	Connect NVMeoFConnectConfig `yaml:"connect"`
+
+	// DataPath is how the node plugin attaches an NVMe-oF volume whose
+	// StorageClass does not choose one with the nvmeof/dataPath parameter:
+	// "kernel" (the default, and the only behavior before this field existed)
+	// connects with `nvme connect` and native kernel multipath; "ublk" asks
+	// the per-node nvmeublkd daemon for a userspace NVMe/TCP device instead.
+	// Empty means "kernel". The choice is made per volume at NodeStage and
+	// recorded in the PV's volume context when the StorageClass sets it, so a
+	// later change here never moves an already-provisioned volume that pinned
+	// its data path.
+	DataPath string `yaml:"dataPath"`
+
+	// Ublk configures the userspace data path. It is consulted only for
+	// volumes that use it.
+	Ublk NVMeoFUblkConfig `yaml:"ublk"`
+}
+
+// Data paths an NVMe-oF volume can be staged through.
+const (
+	NVMeoFDataPathKernel = "kernel"
+	NVMeoFDataPathUblk   = "ublk"
+)
+
+// NVMeoFUblkConfig configures the userspace NVMe/TCP data path served by the
+// per-node nvmeublkd daemon. Zero values mean "use the default" so a config
+// that never mentions ublk loads exactly as before.
+type NVMeoFUblkConfig struct {
+	// Enabled makes the ublk data path available to StorageClasses that opt in
+	// with nvmeof/dataPath: ublk while DataPath (the default) stays "kernel".
+	// DataPath: ublk implies it.
+	Enabled bool `yaml:"enabled"`
+
+	// SocketPath is the daemon's control socket (default
+	// /run/nvmeublk/nvmeublkd.sock).
+	SocketPath string `yaml:"socketPath"`
+
+	// Queues is the number of ublk queues per device. 0 (the default) lets
+	// nvmeublkd size the device for its node: one queue per two CPUs (2..8),
+	// or fewer when that is what fits MaxVolumesPerNode volumes. A positive
+	// value pins it for every volume this install attaches.
+	Queues int `yaml:"queues"`
+
+	// Depth is the per-queue ublk depth. 0 (the default) lets nvmeublkd choose
+	// (256, or 128 when that is what fits MaxVolumesPerNode volumes; 64 without
+	// zero copy, where every tag holds a locked I/O buffer).
+	Depth int `yaml:"depth"`
+
+	// ZeroCopy asks the daemon for ublk zero copy (UBLK_F_AUTO_BUF_REG). It
+	// needs kernel >= 6.16; the daemon refuses the attach on an older kernel.
+	// Nil means the default, true.
+	ZeroCopy *bool `yaml:"zeroCopy"`
+
+	// NapiUs is the NAPI busy-poll budget in microseconds while a queue has
+	// I/O in flight. Nil means the default, 200, which the data path was
+	// measured and drilled with; 0 disables busy polling (lower CPU, higher
+	// latency at low queue depth).
+	NapiUs *int `yaml:"napiUs"`
+
+	// MaxVolumesPerNode is how many volumes one node must be able to serve
+	// through the ublk data path at once (default 32). nvmeublkd sizes each
+	// volume's default layout so that this many fit in its zero-copy buffer
+	// tables (the chart passes it to the daemon as NVMEUBLK_MAX_VOLUMES), and
+	// when ublk with zero copy is the install's default data path the node
+	// plugin advertises it as the CSI volume limit unless
+	// node.maxVolumesPerNode is set, so the scheduler does not place more
+	// volumes on a node than its daemon takes. At most 128 (64 on a node with
+	// fewer than 16 CPUs): what the smallest layout fits.
+	MaxVolumesPerNode int `yaml:"maxVolumesPerNode"`
+
+	// AttachTimeout bounds one attach call in seconds (default 60). An attach
+	// connects every path, so it can take longer than a daemon list/detach.
+	AttachTimeout int `yaml:"attachTimeout"`
+}
+
+// Defaults for NVMeoFUblkConfig.
+const (
+	defaultNVMeUblkNapiUs            = 200
+	defaultNVMeUblkMaxVolumesPerNode = 32
+	defaultNVMeUblkAttachTimeout     = 60
+	// ublk's own limits (UBLK_MAX_NR_QUEUES / UBLK_MAX_QUEUE_DEPTH).
+	maxNVMeUblkQueues = 4096
+	maxNVMeUblkDepth  = 4096
+	// One second of busy polling per wakeup is already far past any useful
+	// budget; anything larger is a typo.
+	maxNVMeUblkNapiUs = 1000000
+	// What a node's buffer tables hold in the smallest layout (2 queues x
+	// 128 tags) on eight reactors, the most a daemon runs by default. A node
+	// with fewer than 16 CPUs has fewer reactors and holds 64.
+	maxNVMeUblkMaxVolumesPerNode = 128
+)
+
+// withDefaults returns c with every unset field at its default. The node
+// reads the ublk settings through this, so a Config built without LoadConfig
+// still behaves like a loaded one. Queues and Depth stay 0 when unset: the
+// daemon sizes the device.
+func (c NVMeoFUblkConfig) withDefaults() NVMeoFUblkConfig {
+	if c.SocketPath == "" {
+		c.SocketPath = util.DefaultNVMeUblkSocket
+	}
+	if c.ZeroCopy == nil {
+		zeroCopy := true
+		c.ZeroCopy = &zeroCopy
+	}
+	if c.NapiUs == nil {
+		napiUs := defaultNVMeUblkNapiUs
+		c.NapiUs = &napiUs
+	}
+	if c.MaxVolumesPerNode == 0 {
+		c.MaxVolumesPerNode = defaultNVMeUblkMaxVolumesPerNode
+	}
+	if c.AttachTimeout == 0 {
+		c.AttachTimeout = defaultNVMeUblkAttachTimeout
+	}
+	return c
+}
+
+// normalizeNVMeoFDataPath canonicalizes a data-path value. Empty is the
+// kernel path. ok is false for anything that is not a known data path.
+func normalizeNVMeoFDataPath(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", NVMeoFDataPathKernel:
+		return NVMeoFDataPathKernel, true
+	case NVMeoFDataPathUblk:
+		return NVMeoFDataPathUblk, true
+	default:
+		return "", false
+	}
+}
+
+// defaultDataPath is the data path for a volume that did not choose one. An
+// invalid value (rejected by validateConfig on a loaded config) reads as the
+// kernel path.
+func (c NVMeoFConfig) defaultDataPath() string {
+	if dataPath, ok := normalizeNVMeoFDataPath(c.DataPath); ok {
+		return dataPath
+	}
+	return NVMeoFDataPathKernel
+}
+
+// ublkAvailable reports whether this install may stage volumes through the
+// userspace data path at all.
+func (c NVMeoFConfig) ublkAvailable() bool {
+	return c.Ublk.Enabled || c.defaultDataPath() == NVMeoFDataPathUblk
+}
+
+// BusyObservationMode is zfs.observeBusyBeforeDelete: when the observation-only
+// busy scans run around a dataset delete.
+type BusyObservationMode string
+
+const (
+	// BusyObservationOnFailure scans only after a delete fails (the default).
+	BusyObservationOnFailure BusyObservationMode = "on-failure"
+	// BusyObservationAlways scans before every delete (true; the behavior
+	// before v1.24.0).
+	BusyObservationAlways BusyObservationMode = "always"
+	// BusyObservationNever never scans (false).
+	BusyObservationNever BusyObservationMode = "never"
+)
+
+// UnmarshalYAML accepts the boolean form earlier releases used (true is
+// "always", false is "never") as well as the three mode names.
+func (m *BusyObservationMode) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("zfs.observeBusyBeforeDelete: expected true, false, %q, %q or %q",
+			BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever)
+	}
+	switch mode := BusyObservationMode(node.Value); {
+	case node.Tag == "!!str" && (mode == BusyObservationAlways || mode == BusyObservationOnFailure || mode == BusyObservationNever):
+		*m = mode
+		return nil
+	default:
+		// Every boolean the earlier *bool field took: true/false, and the
+		// YAML 1.1 forms (yes/no/on/off, y/n) that yaml.v3 still decodes into
+		// a bool.
+		var on bool
+		if node.Decode(&on) == nil {
+			if on {
+				*m = BusyObservationAlways
+			} else {
+				*m = BusyObservationNever
+			}
+			return nil
+		}
+		return fmt.Errorf("zfs.observeBusyBeforeDelete: %q is not one of true, false, %q, %q, %q",
+			node.Value, BusyObservationAlways, BusyObservationOnFailure, BusyObservationNever)
+	}
+}
+
+// busyObservationMode reports when dataset deletes run the busy observation
+// scans (zfs.observeBusyBeforeDelete, default on-failure).
+func (c *Config) busyObservationMode() BusyObservationMode {
+	if c == nil || c.ZFS.ObserveBusyBeforeDelete == "" {
+		return BusyObservationOnFailure
+	}
+	return c.ZFS.ObserveBusyBeforeDelete
+}
+
+// nodeVolumeLimit is the volume count NodeGetInfo advertises (0: none).
+// node.maxVolumesPerNode wins when set. Otherwise an install whose NVMe-oF
+// volumes use the ublk data path by default advertises the number of volumes
+// each node's nvmeublkd is sized for: past it the daemon refuses the attach,
+// and a pod the scheduler never placed there is better than one stuck in
+// ContainerCreating. The CSI limit counts every volume of this driver on the
+// node, whatever its protocol or data path, so it errs towards fewer volumes.
+// An install that only lets classes opt in advertises nothing: most of its
+// volumes do not count against the daemon.
+func (c *Config) nodeVolumeLimit() int64 {
+	if c.Node.MaxVolumesPerNode > 0 {
+		return c.Node.MaxVolumesPerNode
+	}
+	ublk := c.NVMeoF.Ublk.withDefaults()
+	// Without zero copy a volume takes nothing from the buffer tables, so
+	// the daemon has no such bound to advertise.
+	if c.NVMeoF.Enabled && c.NVMeoF.defaultDataPath() == NVMeoFDataPathUblk && *ublk.ZeroCopy {
+		return int64(ublk.MaxVolumesPerNode)
+	}
+	return 0
 }
 
 // NVMeoFConnectConfig holds node-side `nvme connect` CLI knobs (N4), mirroring
@@ -952,7 +1192,9 @@ type NodeConfig struct {
 	SessionCleanupDelay int `yaml:"sessionCleanupDelay"`
 
 	// MaxVolumesPerNode is the maximum number of volumes the node can publish.
-	// Zero means unlimited and is not advertised (default: 0)
+	// Zero means unlimited and is not advertised (default: 0), except on an
+	// install whose default NVMe-oF data path is ublk, which then advertises
+	// nvmeof.ublk.maxVolumesPerNode (see Config.nodeVolumeLimit).
 	MaxVolumesPerNode int64 `yaml:"maxVolumesPerNode"`
 }
 
@@ -1309,6 +1551,7 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.NVMeoF.DeviceWaitTimeout == 0 {
 		cfg.NVMeoF.DeviceWaitTimeout = 60 // Default 60 seconds
 	}
+	cfg.NVMeoF.Ublk = cfg.NVMeoF.Ublk.withDefaults()
 	if cfg.Reconcile.Interval == "" {
 		cfg.Reconcile.Interval = "1h"
 	}
@@ -1555,6 +1798,9 @@ func validateConfig(cfg *Config) error {
 	if err := validateNFSExportConfig(&cfg.NFS); err != nil {
 		return err
 	}
+	if err := validateNodeIdentityNetworks(&cfg.NFS); err != nil {
+		return err
+	}
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
 		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
 	}
@@ -1631,6 +1877,45 @@ func validateConfig(cfg *Config) error {
 		if v := cfg.NVMeoF.Connect.KeepAliveTmo; v != nil && *v < 1 {
 			return fmt.Errorf("nvmeof.connect.keepAliveTmo must be positive (got %d)", *v)
 		}
+		if err := validateNVMeoFDataPathConfig(&cfg.NVMeoF); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateNVMeoFDataPathConfig checks nvmeof.dataPath and the ublk settings,
+// and canonicalizes dataPath in place.
+func validateNVMeoFDataPathConfig(nvmeof *NVMeoFConfig) error {
+	dataPath, ok := normalizeNVMeoFDataPath(nvmeof.DataPath)
+	if !ok {
+		return fmt.Errorf("nvmeof.dataPath must be %q or %q (got %q)", NVMeoFDataPathKernel, NVMeoFDataPathUblk, nvmeof.DataPath)
+	}
+	nvmeof.DataPath = dataPath
+	// Unset fields validate as their defaults, so a Config assembled without
+	// LoadConfig's defaulting is judged on what the node would actually use.
+	ublk := nvmeof.Ublk.withDefaults()
+	if !filepath.IsAbs(ublk.SocketPath) {
+		return fmt.Errorf("nvmeof.ublk.socketPath must be an absolute path (got %q)", ublk.SocketPath)
+	}
+	if ublk.Queues < 0 || ublk.Queues > maxNVMeUblkQueues {
+		return fmt.Errorf("nvmeof.ublk.queues must be between 0 (sized by nvmeublkd) and %d (got %d)", maxNVMeUblkQueues, ublk.Queues)
+	}
+	if ublk.Depth < 0 || ublk.Depth > maxNVMeUblkDepth {
+		return fmt.Errorf("nvmeof.ublk.depth must be between 0 (sized by nvmeublkd) and %d (got %d)", maxNVMeUblkDepth, ublk.Depth)
+	}
+	if *ublk.NapiUs < 0 || *ublk.NapiUs > maxNVMeUblkNapiUs {
+		return fmt.Errorf("nvmeof.ublk.napiUs must be between 0 and %d (got %d)", maxNVMeUblkNapiUs, *ublk.NapiUs)
+	}
+	if ublk.MaxVolumesPerNode < 1 || ublk.MaxVolumesPerNode > maxNVMeUblkMaxVolumesPerNode {
+		return fmt.Errorf("nvmeof.ublk.maxVolumesPerNode must be between 1 and %d (got %d)", maxNVMeUblkMaxVolumesPerNode, ublk.MaxVolumesPerNode)
+	}
+	if ublk.AttachTimeout < 1 {
+		return fmt.Errorf("nvmeof.ublk.attachTimeout must be positive (got %d)", ublk.AttachTimeout)
+	}
+	// nvmeublkd speaks NVMe/TCP only.
+	if nvmeof.ublkAvailable() && !strings.EqualFold(strings.TrimSpace(nvmeof.Transport), "tcp") {
+		return fmt.Errorf("the ublk data path supports only nvmeof.transport=tcp (got %q)", nvmeof.Transport)
 	}
 	return nil
 }
