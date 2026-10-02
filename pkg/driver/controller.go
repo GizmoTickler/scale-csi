@@ -2413,7 +2413,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 			if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" { //nolint:gocritic // compatibility pre-filter only; not the authoritative check
 				continue
 			}
-			capacity = d.getDatasetCapacity(ds)
+			capacity = d.listedCapacity(ds)
 		}
 
 		entries = append(entries, &csi.ListVolumesResponse_Entry{
@@ -2495,7 +2495,7 @@ func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, 
 	for i, dataset := range all {
 		volumes[i] = listedVolume{
 			name:       dataset.Name,
-			capacity:   listedDatasetCapacity(dataset),
+			capacity:   d.listedCapacity(dataset),
 			recordKeys: datasetHasPublicationRecordKeys(dataset),
 		}
 	}
@@ -2534,32 +2534,51 @@ func (d *Driver) listedVolumeDeleted(datasetName string) bool {
 	return deleted
 }
 
+// listedCapacity is a ListVolumes entry's capacity (listedDatasetCapacity).
+// A zvol whose volsize cannot be read is reported as 0, unknown, and logged
+// once per volume.
+func (d *Driver) listedCapacity(ds *truenas.Dataset) int64 {
+	capacity, known := listedDatasetCapacity(ds)
+	if !known {
+		if _, logged := d.unknownVolsizeLogged.LoadOrStore(ds.Name, struct{}{}); !logged {
+			klog.Warningf("ListVolumes: the volsize of zvol %s is unreadable; reporting its capacity as unknown (0)", ds.Name)
+		}
+	}
+	return capacity
+}
+
 // listedDatasetCapacity is getDatasetCapacity over a listing's dataset. The
 // zfs.resource.query listing reports a property as {value, raw} with no
 // parsed field: value is the number, raw its string. A pool.dataset.query row
-// (the listing's fallback) has parsed. Each is read in that order.
-func listedDatasetCapacity(ds *truenas.Dataset) int64 {
+// (the listing's fallback, and the re-read) has parsed. Each is read in that
+// order. A zvol's capacity is its volsize and nothing else: when volsize is
+// unreadable the capacity is unknown (0, which CSI allows for capacity_bytes)
+// and known is false. Falling through to available would report the pool's
+// free space as the zvol's size.
+func listedDatasetCapacity(ds *truenas.Dataset) (capacity int64, known bool) {
 	if ds.Type == "VOLUME" {
 		if bytes, ok := listedPropertyBytes(ds.Volsize); ok {
-			return bytes
+			return bytes, true
 		}
+		return 0, false
 	}
 	if bytes, ok := listedPropertyBytes(ds.Refquota); ok && bytes > 0 {
-		return bytes
+		return bytes, true
 	}
 	if requestedSize := datasetUserProperty(ds, PropRequestedSizeBytes); requestedSize != "" && requestedSize != "-" {
 		if parsed, err := strconv.ParseInt(requestedSize, 10, 64); err == nil && parsed > 0 {
-			return parsed
+			return parsed, true
 		}
 	}
 	if bytes, ok := listedPropertyBytes(ds.Available); ok {
-		return bytes
+		return bytes, true
 	}
-	return 0
+	return 0, true
 }
 
 // listedPropertyBytes reads a numeric property from parsed, then value, then
-// the raw string.
+// the rawvalue string (pool.dataset.query), then the raw string
+// (zfs.resource.query).
 func listedPropertyBytes(property truenas.DatasetProperty) (int64, bool) {
 	if parsed, ok := property.Parsed.(float64); ok {
 		return int64(parsed), true
@@ -2572,8 +2591,10 @@ func listedPropertyBytes(property truenas.DatasetProperty) (int64, bool) {
 			return parsed, true
 		}
 	}
-	if parsed, err := strconv.ParseInt(property.Rawvalue, 10, 64); err == nil {
-		return parsed, true
+	for _, text := range []string{property.Rawvalue, property.Raw} {
+		if parsed, err := strconv.ParseInt(text, 10, 64); err == nil {
+			return parsed, true
+		}
 	}
 	return 0, false
 }

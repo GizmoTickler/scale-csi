@@ -33,7 +33,7 @@ type listingShapeAppliance struct {
 // volumes: every third one a filesystem with a refquota, volume legacy (if
 // >= 0) carrying a ZFS publication record (flat in the listing, LOCAL in the
 // pool row).
-func listingShapeRows(t *testing.T, n, legacy int) ([]byte, map[string][]byte) {
+func listingShapeRows(t *testing.T, n, legacy int, mutate func(i int, resource, pool map[string]interface{})) ([]byte, map[string][]byte) {
 	t.Helper()
 	rows := make([]map[string]interface{}, n)
 	pool := make(map[string][]byte, n)
@@ -56,6 +56,9 @@ func listingShapeRows(t *testing.T, n, legacy int) ([]byte, map[string][]byte) {
 			poolRow["user_properties"].(map[string]interface{})[key] = map[string]interface{}{
 				"value": string(record), "rawvalue": string(record), "parsed": string(record), "source": "LOCAL"}
 		}
+		if mutate != nil {
+			mutate(i, resource, poolRow)
+		}
 		rows[i] = resource
 		encoded, err := json.Marshal(poolRow)
 		require.NoError(t, err)
@@ -68,7 +71,14 @@ func listingShapeRows(t *testing.T, n, legacy int) ([]byte, map[string][]byte) {
 
 func newListingShapeDriver(t *testing.T, n, legacy int) (*Driver, *listingShapeAppliance) {
 	t.Helper()
-	listing, pool := listingShapeRows(t, n, legacy)
+	return newListingShapeDriverWith(t, n, legacy, nil)
+}
+
+// newListingShapeDriverWith is newListingShapeDriver with each row passed
+// through mutate before it is served.
+func newListingShapeDriverWith(t *testing.T, n, legacy int, mutate func(i int, resource, pool map[string]interface{})) (*Driver, *listingShapeAppliance) {
+	t.Helper()
+	listing, pool := listingShapeRows(t, n, legacy, mutate)
 	appliance := &listingShapeAppliance{}
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -234,4 +244,67 @@ func TestListedPropertyBytesShapes(t *testing.T) {
 		assert.Equal(t, tc.ok, ok, name)
 		assert.Equal(t, tc.want, got, name)
 	}
+}
+
+// zfs.resource.query sends {"raw": "<digits>", "value": <number>, "source":
+// {...}} (the shape captured live). raw is read when value carries no number.
+func TestListedPropertyBytesReadsTheResourceQueryRaw(t *testing.T) {
+	production := truenas.DatasetProperty{Value: float64(21474836480), Raw: "21474836480"}
+	got, ok := listedPropertyBytes(production)
+	assert.True(t, ok)
+	assert.Equal(t, int64(21474836480), got)
+
+	rawOnly := truenas.DatasetProperty{Value: nil, Raw: "21474836480"}
+	got, ok = listedPropertyBytes(rawOnly)
+	assert.True(t, ok, "raw is the fallback when value is null")
+	assert.Equal(t, int64(21474836480), got)
+
+	none := truenas.DatasetProperty{Value: nil, Raw: "none"}
+	_, ok = listedPropertyBytes(none)
+	assert.False(t, ok)
+}
+
+// A zvol whose volsize is unreadable has an unknown capacity (0), never the
+// pool's free space from available.
+func TestListedDatasetCapacityOfAZvolWithoutVolsizeIsUnknown(t *testing.T) {
+	available := truenas.DatasetProperty{Value: float64(15051461210048), Raw: "15051461210048"}
+	for name, volsize := range map[string]truenas.DatasetProperty{
+		"absent":     {},
+		"null value": {Value: nil, Raw: "-"},
+	} {
+		capacity, known := listedDatasetCapacity(&truenas.Dataset{Name: "pool/parent/zvol", Type: "VOLUME", Volsize: volsize, Available: available})
+		assert.False(t, known, name)
+		assert.Zero(t, capacity, name)
+	}
+	// A filesystem with no quota and no requested size still reports
+	// available, as before.
+	capacity, known := listedDatasetCapacity(&truenas.Dataset{Name: "pool/parent/fs", Type: "FILESYSTEM", Available: available})
+	assert.True(t, known)
+	assert.Equal(t, int64(15051461210048), capacity)
+}
+
+// End to end on the live row shape: a zvol whose volsize comes as raw only
+// is listed with that size, and one whose volsize is null is listed with
+// capacity 0, not the pool's available bytes.
+func TestListVolumesZvolCapacityFromTheResourceQueryRow(t *testing.T) {
+	d, _ := newListingShapeDriverWith(t, 3, -1, func(i int, resource, _ map[string]interface{}) {
+		properties := resource["properties"].(map[string]interface{})
+		switch i {
+		case 0:
+			properties["volsize"] = map[string]interface{}{"raw": "21474836480", "value": nil,
+				"source": map[string]interface{}{"type": "LOCAL", "value": nil}}
+		case 1:
+			properties["volsize"] = nil
+		}
+	})
+	entries := walkListVolumes(t, d, 100)
+	require.Len(t, entries, 3)
+	capacities := map[string]int64{}
+	for _, entry := range entries {
+		capacities[entry.GetVolume().GetVolumeId()] = entry.GetVolume().GetCapacityBytes()
+	}
+	assert.Equal(t, int64(21474836480), capacities[scaleDriverVolume(0)], "volsize read from raw")
+	assert.Zero(t, capacities[scaleDriverVolume(1)], "a null volsize is unknown, not the pool's free space")
+	_, logged := d.unknownVolsizeLogged.Load(scaleDriverParent + "/" + scaleDriverVolume(1))
+	assert.True(t, logged)
 }

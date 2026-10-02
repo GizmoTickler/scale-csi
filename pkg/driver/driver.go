@@ -163,6 +163,9 @@ type Driver struct {
 	// frozen listing was taken; its later pages leave them out.
 	volumePageDeleted   map[string]struct{}
 	volumePageCacheTime time.Time
+	// unknownVolsizeLogged is the zvols ListVolumes has warned about once
+	// for an unreadable volsize.
+	unknownVolsizeLogged sync.Map
 
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
