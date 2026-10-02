@@ -1041,6 +1041,123 @@ async fn a_stale_block_link_claimed_by_another_volume_is_refused() {
     assert_eq!(err.code(), tonic::Code::AlreadyExists, "{err:?}");
 }
 
+/// A reboot dropped this volume's session.
+fn drop_session(n: &Node) {
+    fake(n, |f| {
+        let i = f.sessions.iter().position(|s| s.iqn == IQN).unwrap();
+        f.sessions.remove(i);
+    });
+}
+
+/// After the reboot the raw-block link names `device`; the stage record is
+/// gone too.
+fn relink(n: &Node, req: &csi::NodeStageVolumeRequest, device: &str) {
+    std::fs::remove_file(&req.staging_target_path).unwrap();
+    std::os::unix::fs::symlink(device, &req.staging_target_path).unwrap();
+    n.state.records.delete_stage(&req.staging_target_path);
+}
+
+/// A link to the disk of an iSCSI target the driver did not create is not
+/// proof of staleness (it may be an operator's LUN): refused, never re-staged.
+#[tokio::test]
+async fn a_block_link_to_a_foreign_target_is_refused_not_restaged() {
+    let foreign = "iqn.2000-01.com.example:storage.lun7";
+    let n = iscsi_node(CONFIG);
+    let req = stage_request(&n, block());
+    node_stage(&n.state, &req, None).await.unwrap();
+    drop_session(&n);
+    let theirs = fake(&n, |f| {
+        f.targets.insert(foreign.into(), f.targets[IQN].clone());
+        f.add_session(PORTAL, foreign)
+    });
+    relink(&n, &req, &theirs);
+    let before = logins(&n).len();
+
+    let err = node_stage(&n.state, &req, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists, "{err:?}");
+    assert_eq!(
+        std::fs::read_link(&req.staging_target_path).unwrap().to_string_lossy(),
+        theirs
+    );
+    assert_eq!(logins(&n).len(), before, "nothing was logged in");
+    assert_eq!(fake(&n, |f| f.sessions.iter().filter(|s| s.iqn == foreign).count()), 1);
+}
+
+/// A link to a local disk (no iSCSI session above it) is positively stale:
+/// re-staged.
+#[tokio::test]
+async fn a_block_link_to_a_local_disk_is_restaged() {
+    let n = iscsi_node(CONFIG);
+    let req = stage_request(&n, block());
+    node_stage(&n.state, &req, None).await.unwrap();
+    let local = fake(&n, |f| {
+        let scsi = f.sys.join("devices/pci0000:00/ata1/host0/target0:0:0/0:0:0:0");
+        std::fs::create_dir_all(&scsi).unwrap();
+        std::fs::create_dir_all(f.sys.join("block/sdz")).unwrap();
+        std::os::unix::fs::symlink(&scsi, f.sys.join("block/sdz/device")).unwrap();
+        let local = f.dev.join("sdz");
+        std::fs::write(&local, "").unwrap();
+        local.to_string_lossy().into_owned()
+    });
+    drop_session(&n);
+    relink(&n, &req, &local);
+
+    node_stage(&n.state, &req, None)
+        .await
+        .expect("a link to a local disk is re-staged");
+    let linked = std::fs::read_link(&req.staging_target_path).unwrap();
+    assert_ne!(linked.to_string_lossy(), local);
+    crate::iscsi_stage::verify_stage_source(&n.state, &linked.to_string_lossy(), &req.volume_context)
+        .await
+        .expect("the link names this volume's disk");
+}
+
+/// A disk whose session cannot be identified (its sysfs entry unreadable) is
+/// not proof of staleness: never re-staged.
+#[tokio::test]
+async fn a_block_link_to_an_unidentifiable_disk_is_never_restaged() {
+    let n = iscsi_node(CONFIG);
+    let req = stage_request(&n, block());
+    node_stage(&n.state, &req, None).await.unwrap();
+    let unknown = fake(&n, |f| {
+        let unknown = f.dev.join("sdq");
+        std::fs::write(&unknown, "").unwrap();
+        unknown.to_string_lossy().into_owned()
+    });
+    drop_session(&n);
+    relink(&n, &req, &unknown);
+    let before = logins(&n).len();
+
+    let err = node_stage(&n.state, &req, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::Internal, "{err:?}");
+    assert_eq!(
+        std::fs::read_link(&req.staging_target_path).unwrap().to_string_lossy(),
+        unknown
+    );
+    assert_eq!(logins(&n).len(), before, "nothing was logged in");
+}
+
+/// The same when the session listing fails: unknown, never re-staged.
+#[tokio::test]
+async fn a_block_link_is_never_restaged_when_the_sessions_cannot_be_listed() {
+    let n = iscsi_node(CONFIG);
+    let req = stage_request(&n, block());
+    node_stage(&n.state, &req, None).await.unwrap();
+    let device = std::fs::read_link(&req.staging_target_path).unwrap();
+    n.state.records.delete_stage(&req.staging_target_path);
+    n.host.0.lock().unwrap().failing.push("iscsiadm -m session".into());
+    let before = logins(&n).len();
+
+    let err = node_stage(&n.state, &req, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::Internal, "{err:?}");
+    assert!(
+        err.message().contains("failed to identify staged iSCSI device"),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_link(&req.staging_target_path).unwrap(), device);
+    assert_eq!(logins(&n).len(), before, "nothing was logged in");
+}
+
 /// A multipath filesystem is mounted from /dev/mapper/<name>: expansion
 /// rescans every path of the dm map, then has multipathd resize the map; the
 /// map only grows on that resize, as on a real host.
