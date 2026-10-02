@@ -104,32 +104,6 @@ func TestConcurrentManagedListingsShareOneRead(t *testing.T) {
 	}
 }
 
-// A caller that needs a listing no older than a point of its own does not
-// take one that started before it.
-func TestManagedListingSinceStartsItsOwnRead(t *testing.T) {
-	d, client := newGatedListingDriver(t)
-	ctx := context.Background()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, err := d.listAllManagedDatasets(ctx)
-		assert.NoError(t, err)
-	}()
-	<-client.entered
-	since := time.Now()
-	sinceDone := make(chan struct{})
-	go func() {
-		defer close(sinceDone)
-		_, err := d.listAllManagedDatasetsSince(ctx, since)
-		assert.NoError(t, err)
-	}()
-	<-client.entered
-	close(client.release)
-	<-done
-	<-sinceDone
-	assert.Equal(t, int32(2), client.calls.Load())
-}
-
 // A caller whose listing was cancelled under it runs its own.
 func TestManagedListingJoinerOutlivesACancelledLeader(t *testing.T) {
 	d, client := newGatedListingDriver(t)

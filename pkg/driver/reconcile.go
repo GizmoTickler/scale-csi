@@ -1013,28 +1013,11 @@ func reconcileAge(now time.Time, creationUnix int64, minAge time.Duration) (time
 // its own copy of the datasets, so a caller may sort the slice or mirror a
 // write into a dataset without touching another caller's.
 func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset, error) {
-	return d.listAllManagedDatasetsSince(ctx, time.Time{})
-}
-
-// managedListingCall is one listing in flight, shared by every caller that
-// arrives while it runs.
-type managedListingCall struct {
-	started time.Time
-	done    chan struct{}
-	result  []*truenas.Dataset
-	err     error
-}
-
-// listAllManagedDatasetsSince is listAllManagedDatasets that joins only a
-// listing started at or after notBefore: a caller that needs a listing no
-// older than some point of its own (the startup diff) starts a new one rather
-// than take an older read.
-func (d *Driver) listAllManagedDatasetsSince(ctx context.Context, notBefore time.Time) ([]*truenas.Dataset, error) {
 	for {
 		d.managedListingMu.Lock()
 		call := d.managedListing
-		if call == nil || call.started.Before(notBefore) {
-			call = &managedListingCall{started: time.Now(), done: make(chan struct{})}
+		if call == nil {
+			call = &managedListingCall{done: make(chan struct{})}
 			d.managedListing = call
 			d.managedListingMu.Unlock()
 			d.runManagedListing(ctx, call)
@@ -1059,6 +1042,14 @@ func (d *Driver) listAllManagedDatasetsSince(ctx context.Context, notBefore time
 		}
 		return cloneDatasets(call.result), nil
 	}
+}
+
+// managedListingCall is one listing in flight, shared by every caller that
+// arrives while it runs.
+type managedListingCall struct {
+	done   chan struct{}
+	result []*truenas.Dataset
+	err    error
 }
 
 // runManagedListing runs call's listing and releases its waiters, however the
