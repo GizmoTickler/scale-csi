@@ -1358,6 +1358,68 @@ func TestNodeExpandVolumeRawBlockRescansWithoutFilesystemResize(t *testing.T) {
 	assert.NotContains(t, commands, "btrfs ")
 }
 
+// A raw-block NVMe-oF volume on a native-multipath head (nvme3n7) whose
+// founding controller nvme3 went away while nvme5 stays live: the ownership
+// check reads the NQN through the head's block device (it used to fail with
+// Internal), and the rescan goes to nvme5 (/dev/nvme3 no longer exists).
+func TestNodeExpandVolumeRawBlockSurvivesLossOfTheFoundingController(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "nvme", "blkid", "resize2fs", "xfs_growfs", "btrfs")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
+
+	sys := t.TempDir()
+	subsys := filepath.Join(sys, "devices", "virtual", "nvme-subsystem", "nvme-subsys3")
+	head := filepath.Join(subsys, "nvme3n7")
+	live := filepath.Join(sys, "class", "nvme", "nvme5")
+	require.NoError(t, os.MkdirAll(head, 0o750))
+	require.NoError(t, os.MkdirAll(live, 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(sys, "block"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(subsys, "subsysnqn"), []byte("nqn.test:block-vol\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(live, "state"), []byte("live\n"), 0o600))
+	require.NoError(t, os.Symlink(subsys, filepath.Join(head, "device")))
+	require.NoError(t, os.Symlink(live, filepath.Join(subsys, "nvme5")))
+	require.NoError(t, os.Symlink(head, filepath.Join(sys, "block", "nvme3n7")))
+
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	originalDeviceSize := nodeGetDeviceSize
+	originalGetNVMeInfo := nodeGetNVMeInfo
+	originalRescan := nodeNVMeRescan
+	originalPollInterval := nodeDeviceSizePollInterval
+	t.Cleanup(func() {
+		nodeGetDeviceSize = originalDeviceSize
+		nodeGetNVMeInfo = originalGetNVMeInfo
+		nodeNVMeRescan = originalRescan
+		nodeDeviceSizePollInterval = originalPollInterval
+	})
+	nodeDeviceSizePollInterval = time.Millisecond
+	sizeReads := 0
+	nodeGetDeviceSize = func(string) (int64, error) {
+		sizeReads++
+		if sizeReads <= 1 {
+			return 2 << 30, nil
+		}
+		return 4 << 30, nil
+	}
+	nodeGetNVMeInfo = func(device string) (string, error) { return util.GetNVMeInfoFromDeviceAt(sys, device) }
+	nodeNVMeRescan = func(ctx context.Context, device string) error { return util.NVMeRescanAt(ctx, sys, device) }
+
+	resp, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:          "block-vol",
+		VolumePath:        t.TempDir(),
+		StagingTargetPath: t.TempDir(),
+		CapacityRange:     &csi.CapacityRange{RequiredBytes: 4 << 30},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(4<<30), resp.CapacityBytes)
+	commands := readNodeCommandLog(t, logPath)
+	assert.Contains(t, commands, "nvme ns-rescan /dev/nvme5")
+	assert.NotContains(t, commands, "nvme ns-rescan /dev/nvme3")
+}
+
 func TestNodeExpandVolumeReturnsErrorWhenActualSizeIsBelowTarget(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "nvme")
 	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")

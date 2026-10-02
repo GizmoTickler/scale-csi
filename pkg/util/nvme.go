@@ -789,12 +789,19 @@ func NVMeRescan(devicePath string) error {
 // NVMeRescanWithContext is NVMeRescan bounded by the inbound context's deadline
 // as well as the configured NVMe timeout.
 func NVMeRescanWithContext(ctx context.Context, devicePath string) error {
+	return NVMeRescanAt(ctx, "/sys", devicePath)
+}
+
+// NVMeRescanAt is NVMeRescanWithContext against the sysfs tree at sysRoot. It
+// rescans a live controller of the namespace's subsystem (see
+// nvmeNamespaceControllerAt), not necessarily the one the head is named after.
+func NVMeRescanAt(ctx context.Context, sysRoot, devicePath string) error {
 	deviceName := filepath.Base(devicePath)
-	matches := nvmeDeviceRegex.FindStringSubmatch(deviceName)
-	if len(matches) != 2 {
+	controller, err := nvmeNamespaceControllerAt(sysRoot, deviceName)
+	if err != nil {
 		return fmt.Errorf("invalid NVMe namespace device: %s", devicePath)
 	}
-	controllerPath := "/dev/" + matches[1]
+	controllerPath := "/dev/" + controller
 
 	ctx, cancel, err := commandContext(ctx, getNVMeTimeout())
 	if err != nil {
@@ -810,6 +817,58 @@ func NVMeRescanWithContext(ctx context.Context, devicePath string) error {
 		return fmt.Errorf("NVMe rescan failed: %w, output: %s", err, string(output))
 	}
 	return nil
+}
+
+// nvmeNamespaceControllerAt returns the controller to address a namespace
+// device through (nvme ns-rescan, the controller's transport).
+//
+// A native-multipath head disk nvmeXnY is named after the subsystem instance,
+// which the kernel takes from the controller that founded the subsystem; once
+// that controller is gone, /dev/nvmeX and /sys/class/nvme/nvmeX no longer
+// exist although other paths are live. /sys/block/<dev>/device is the
+// subsystem for a head (it links each of its controllers by name) and the
+// controller itself for a non-multipath namespace. A live controller is
+// preferred, the one the name points at first; with no sysfs evidence the
+// name's controller is returned, as before.
+func nvmeNamespaceControllerAt(sysRoot, deviceName string) (string, error) {
+	matches := nvmeDeviceRegex.FindStringSubmatch(deviceName)
+	if len(matches) != 2 {
+		return "", fmt.Errorf("invalid NVMe namespace device: %s", deviceName)
+	}
+	named := matches[1]
+
+	device := filepath.Join(sysRoot, "block", deviceName, "device")
+	var candidates []string
+	if entries, err := os.ReadDir(device); err == nil {
+		for _, entry := range entries {
+			if nvmeControllerRegex.MatchString(entry.Name()) {
+				candidates = append(candidates, entry.Name())
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		// Not a subsystem: a non-multipath namespace's device is its controller.
+		if _, err := os.Stat(filepath.Join(device, "transport")); err == nil {
+			if resolved, err := filepath.EvalSymlinks(device); err == nil && nvmeControllerRegex.MatchString(filepath.Base(resolved)) {
+				candidates = append(candidates, filepath.Base(resolved))
+			}
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if (candidates[i] == named) != (candidates[j] == named) {
+			return candidates[i] == named
+		}
+		return candidates[i] < candidates[j]
+	})
+	for _, controller := range candidates {
+		if readSysfsTrimmed(filepath.Join(sysRoot, "class", "nvme", controller, "state")) == "live" {
+			return controller, nil
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0], nil
+	}
+	return named, nil
 }
 
 // NVMeGetNamespaceInfo returns information about an NVMe namespace.
@@ -905,22 +964,25 @@ func NVMeFlush(devicePath string, nsid int) error {
 
 // IsNVMeFabric checks if a device is an NVMe-oF (fabric) device.
 func IsNVMeFabric(devicePath string) (bool, error) {
+	return isNVMeFabricAt("/sys", devicePath)
+}
+
+func isNVMeFabricAt(sysRoot, devicePath string) (bool, error) {
 	// Get the device name without /dev/
 	deviceName := filepath.Base(devicePath)
 
-	// Check if transport is fabrics
-	transportPath := fmt.Sprintf("/sys/block/%s/device/transport", deviceName)
-	transport, err := os.ReadFile(transportPath)
+	// A non-multipath namespace's device is its controller, which carries
+	// transport. A multipath head's device is the subsystem, which does not:
+	// ask one of its controllers, not the one the head's name points at (the
+	// founding controller, which may be gone while other paths are live).
+	transport, err := os.ReadFile(filepath.Join(sysRoot, "block", deviceName, "device", "transport"))
 	if err != nil {
-		// Try alternative path using controller name extracted from namespace device
-		if matches := nvmeDeviceRegex.FindStringSubmatch(deviceName); len(matches) == 2 {
-			ctrlName := matches[1]
-			transportPath = fmt.Sprintf("/sys/class/nvme/%s/transport", ctrlName)
-			transport, err = os.ReadFile(transportPath)
-			if err != nil {
-				return false, fmt.Errorf("failed to read transport: %w", err)
-			}
-		} else {
+		controller, ctrlErr := nvmeNamespaceControllerAt(sysRoot, deviceName)
+		if ctrlErr != nil {
+			return false, fmt.Errorf("failed to read transport: %w", err)
+		}
+		transport, err = os.ReadFile(filepath.Join(sysRoot, "class", "nvme", controller, "transport"))
+		if err != nil {
 			return false, fmt.Errorf("failed to read transport: %w", err)
 		}
 	}
@@ -970,10 +1032,12 @@ func NVMeDiscovery(transport, host, port string) ([]string, error) {
 
 // GetNVMeInfoFromDevice returns the NQN for a given device path.
 func GetNVMeInfoFromDevice(devicePath string) (string, error) {
-	return getNVMeInfoFromDeviceAt("/sys", devicePath)
+	return GetNVMeInfoFromDeviceAt("/sys", devicePath)
 }
 
-func getNVMeInfoFromDeviceAt(sysRoot, devicePath string) (string, error) {
+// GetNVMeInfoFromDeviceAt is GetNVMeInfoFromDevice against the sysfs tree at
+// sysRoot.
+func GetNVMeInfoFromDeviceAt(sysRoot, devicePath string) (string, error) {
 	deviceName := filepath.Base(devicePath)
 
 	// Check if it's an NVMe device
