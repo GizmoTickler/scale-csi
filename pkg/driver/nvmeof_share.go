@@ -46,8 +46,10 @@ func (b nvmeoFShareBackend) VolumeContext(ctx context.Context, ds *truenas.Datas
 func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string, res *fenceResolution) error {
 	var namespace *truenas.NVMeoFNamespace
 	var subsys *truenas.NVMeoFSubsystem
+	// An empty NQN in the memo (a create reply without subnqn) is never
+	// trusted: the volume context is immutable.
 	if res != nil && res.nvmeNSLoaded && res.nvmeNamespace != nil && res.nvmeSubsystem != nil &&
-		res.nvmeNamespace.SubsystemID == res.nvmeSubsystem.ID {
+		res.nvmeSubsystem.NQN != "" && res.nvmeNamespace.SubsystemID == res.nvmeSubsystem.ID {
 		namespace, subsys = res.nvmeNamespace, res.nvmeSubsystem
 	} else {
 		var err error

@@ -490,3 +490,31 @@ func TestNVMeoFVolumeContextResolvesWhenMemoIsIncomplete(t *testing.T) {
 	_, methods := client.callSnapshot()
 	assert.Equal(t, 1, methods["NVMeoFNamespaceGet"], "the incomplete memo is not trusted")
 }
+
+// A create reply without a subnqn must never become the volume context: the
+// context is immutable and an empty nqn leaves the PV unattachable. The memo
+// is then not trusted and the subsystem is read back.
+func TestNVMeoFVolumeContextResolvesWhenMemoHasNoNQN(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeOff)
+	d.config.NVMeoF.SubsystemAllowAnyHost = true
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("memo-no-nqn", "nvmeof"))
+	require.NoError(t, err)
+	ds, err := client.MockClient.DatasetGet(ctx, "pool/parent/memo-no-nqn")
+	require.NoError(t, err)
+	subsystem, err := client.MockClient.NVMeoFSubsystemFindByName(ctx, d.nvmeSubsystemName("pool/parent/memo-no-nqn"))
+	require.NoError(t, err)
+	namespace, err := client.MockClient.NVMeoFNamespaceFindByDevicePath(ctx, "zvol/pool/parent/memo-no-nqn")
+	require.NoError(t, err)
+	require.NotNil(t, namespace)
+	withoutNQN := *subsystem
+	withoutNQN.NQN = ""
+	res := &fenceResolution{}
+	res.storeNVMeObjects(namespace, &withoutNQN)
+
+	volumeContext := map[string]string{}
+	require.NoError(t, d.nvmeofVolumeContext(ctx, ds, "pool/parent/memo-no-nqn", volumeContext, res))
+	assert.Equal(t, subsystem.NQN, volumeContext["nqn"])
+	assert.NotEmpty(t, volumeContext["nqn"])
+}
