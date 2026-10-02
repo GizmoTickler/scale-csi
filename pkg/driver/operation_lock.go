@@ -23,8 +23,8 @@ import (
 // An attach and a data holder may hold one volume at once. Two attach holders
 // may not: strict fencing decides each grant from the records and allowlist
 // the previous one left, so publishes and unpublishes of a volume stay
-// serialised exactly as before. Two data holders may not either (they were
-// serialised before and nothing asks otherwise). Exclusive conflicts with
+// serialized exactly as before. Two data holders may not either (they were
+// serialized before and nothing asks otherwise). Exclusive conflicts with
 // everything: delete, expand, promote, modify, create, the startup and
 // background reconcilers.
 //
@@ -112,7 +112,7 @@ type operationLockTable struct {
 
 // tryAcquire takes key in mode if no holder conflicts. Otherwise it returns
 // the channel closed at the next release, for a waiter.
-func (t *operationLockTable) tryAcquire(key string, mode lockMode) (bool, <-chan struct{}) {
+func (t *operationLockTable) tryAcquire(key string, mode lockMode) (acquired bool, released <-chan struct{}) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.held == nil {

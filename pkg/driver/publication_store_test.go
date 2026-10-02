@@ -260,7 +260,7 @@ func TestKubernetesPublicationStoreWriteIsOneRequest(t *testing.T) {
 		require.NoError(t, err)
 		client.ClearActions()
 		require.NoError(t, store.store(ctx, "pool/v", nil, key, record))
-		verbs := make([]string, 0)
+		verbs := make([]string, 0, len(client.Actions()))
 		for _, action := range client.Actions() {
 			verbs = append(verbs, action.GetVerb())
 		}

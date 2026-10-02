@@ -213,7 +213,7 @@ func TestLockAttachWaitIsBounded(t *testing.T) {
 	assert.Equal(t, codes.Aborted, status.Code(err))
 }
 
-// Two attach-class operations on one volume are still serialised: strict
+// Two attach-class operations on one volume are still serialized: strict
 // fencing decides each grant from what the previous one left. The second
 // publish does not reach its read of the volume until the first is done.
 func TestLockTwoPublishesOfAVolumeStaySerialised(t *testing.T) {
@@ -257,7 +257,7 @@ func TestLockExclusiveOperationsStillConflictWithSharedHolders(t *testing.T) {
 	_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "exclusive"})
 	assert.Equal(t, codes.Aborted, status.Code(err), "delete alongside a snapshot")
 	_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-2", SourceVolumeId: "exclusive"})
-	assert.Equal(t, codes.Aborted, status.Code(err), "two snapshots of one volume stay serialised")
+	assert.Equal(t, codes.Aborted, status.Code(err), "two snapshots of one volume stay serialized")
 	d.releaseOperationLockMode(key, lockData)
 
 	require.True(t, d.acquireOperationLock(key))
@@ -305,11 +305,11 @@ func TestLockPublishResolvesTheNodeIdentityAfterTheWait(t *testing.T) {
 	d.releaseOperationLock(key)
 	require.NoError(t, <-errs)
 
-	subsystemIDText, err := gated.MockClient.DatasetGetUserProperty(ctx, "pool/parent/identity-after-wait", PropNVMeoFSubsystemID)
+	subsystemIDText, err := gated.DatasetGetUserProperty(ctx, "pool/parent/identity-after-wait", PropNVMeoFSubsystemID)
 	require.NoError(t, err)
 	subsystemID, err := strconv.Atoi(subsystemIDText)
 	require.NoError(t, err)
-	associations, err := gated.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
+	associations, err := gated.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
 	require.NoError(t, err)
 	require.Len(t, associations, 1)
 	assert.Equal(t, "nqn.2014-08.org.nvmexpress:uuid:new", associations[0].HostNQN)

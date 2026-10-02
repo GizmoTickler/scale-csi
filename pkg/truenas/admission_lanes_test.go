@@ -192,7 +192,7 @@ func TestAdmissionPublishQueryIsNotQueuedBehindAWriteBurst(t *testing.T) {
 }
 
 // This client never sends two nvmet writes at once: each reloads the nvmet
-// target on the appliance, which serialises them anyway.
+// target on the appliance, which serializes them anyway.
 func TestAdmissionNVMetWritesAreNeverSentInParallel(t *testing.T) {
 	server := startConcurrentRPCServer(t, nil)
 	server.nvmetDelay = 20 * time.Millisecond

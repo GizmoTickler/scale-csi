@@ -211,6 +211,7 @@ func (g *admissionGate) laneHasRoomLocked(lane admissionLane) bool {
 func (g *admissionGate) takeLocked(lane admissionLane) {
 	g.inUse++
 	switch lane {
+	case laneRead:
 	case laneWrite:
 		g.writes++
 	case laneNVMetWrite:
@@ -225,6 +226,7 @@ func (g *admissionGate) putLocked(lane admissionLane) {
 	}
 	g.inUse--
 	switch lane {
+	case laneRead:
 	case laneWrite:
 		g.writes--
 	case laneNVMetWrite:
