@@ -123,6 +123,14 @@ func FuzzPoolDatasetRowsMatchInterface(f *testing.F) {
 		if err := json.Unmarshal(payload, &generic); err != nil {
 			return
 		}
+		if generic == nil {
+			// JSON null unmarshals into a nil slice without error, but it is not
+			// a list: the interface path rejects it, and so must the typed one.
+			if _, err := decodePoolDatasetRows(payload); err == nil {
+				t.Fatalf("a null reply decoded as a dataset list")
+			}
+			return
+		}
 		if !decodedKeysLowercase(generic) {
 			t.Skip("off-wire-contract mixed-case key; typed/interface divergence is stdlib case-insensitivity, not a bug")
 		}
