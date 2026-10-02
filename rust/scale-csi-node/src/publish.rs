@@ -11,7 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Instant;
 
-use log::{debug, info, warn};
+use log::{debug, info};
 use tonic::Status;
 
 use crate::capability::{self, AccessType, ShareType, Signature, mount_sources_equal, normalize_mount_source};
