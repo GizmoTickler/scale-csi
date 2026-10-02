@@ -1,4 +1,4 @@
-# Release notes — v1.17.0 (next)
+# Release notes — next (v1.23.0 draft)
 
 ## v1.23.0 (draft) — snapshots and publishes no longer turn each other away
 
@@ -42,7 +42,9 @@ share the appliance with it instead of failing and running after it.
   once and leaving the attacher to back off for longer than the conflict
   lasted. Only one publish or unpublish waits per volume: any further one
   returns Aborted at once, so an RWX volume with many attachments in flight
-  cannot hold every attacher worker. The node's identity (its CSINode and
+  cannot hold every attacher worker. The cost: when ten or more attaches of
+  one RWX volume arrive together, all but the running one and the one
+  waiting get Aborted and come back after the attacher's backoff. The node's identity (its CSINode and
   Node) is read after the lock is taken.
 - **Reads ahead of write bursts.** Of the TrueNAS request slots
   (`truenas.maxConcurrentRequests`, 10 by default), writes now hold at most
