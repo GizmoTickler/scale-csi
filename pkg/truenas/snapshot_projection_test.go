@@ -65,9 +65,10 @@ func snapshotQueryAppliance(t *testing.T, seen chan<- []interface{}, withCreateT
 				options, _ := req.Params[0].(map[string]interface{})
 				projected, _ := options["properties"].([]interface{})
 				paths, _ := options["paths"].([]interface{})
-				// The client's capability PROBE calls this method with no paths and
-				// no properties; it is not a read and must not be mistaken for one.
-				if len(paths) > 0 {
+				// The client's capability PROBE calls this method scoped to the
+				// pool root, with no properties and no user properties; it is not
+				// a read and must not be mistaken for one.
+				if _, read := options["get_user_properties"]; read && len(paths) > 0 {
 					select {
 					case seen <- projected:
 					default:

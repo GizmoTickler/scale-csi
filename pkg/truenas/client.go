@@ -2,6 +2,7 @@
 package truenas
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -788,6 +789,16 @@ type Client struct {
 	serviceReloadResolved  atomic.Bool
 	serviceReloadUseLegacy atomic.Bool
 
+	// nvmet.host_subsys.query and nvmet.port_subsys.query are asked to filter
+	// by subsys.id server-side. If a backend ever rejects that filter while
+	// the unfiltered query works, remember it so later calls go straight to
+	// the whole-table read instead of paying a rejected call first. Results
+	// are always re-filtered client-side either way.
+	// When the server last rejected the subsys.id filter (unix nanoseconds,
+	// 0 for never); see queryBySubsystem.
+	hostSubsysServerFilterRejected atomic.Int64
+	portSubsysServerFilterRejected atomic.Int64
+
 	dispatcher *jobDispatcher
 
 	// A successful subscription closes the current pulse and installs a new
@@ -1379,6 +1390,12 @@ func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, gener
 	// and get a response before the read deadline expires.
 	const readDeadlineInterval = 45 * time.Second
 
+	// One frame buffer for the life of this read loop: each message is read
+	// whole into it and decoded with json.Unmarshal, instead of a
+	// json.Decoder that grows and copies its own buffer per message. The
+	// decoded rpcResponse copies what it keeps (RawMessage fields copy their
+	// bytes), so the buffer is free for the next frame.
+	var frame bytes.Buffer
 	for {
 		if !c.isGenerationActive(generation) {
 			return
@@ -1390,7 +1407,7 @@ func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, gener
 		}
 
 		var resp rpcResponse
-		if err := conn.ReadJSON(&resp); err != nil {
+		if err := readFrameJSON(conn, &frame, &resp); err != nil {
 			// Check if this is a timeout - if so, just loop again to check connection state
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
@@ -2236,4 +2253,35 @@ func (c *Client) CheckNVMeoFSupport(ctx context.Context) error {
 
 	klog.V(4).Infof("TrueNAS SCALE version %s supports NVMe-oF", info.Version)
 	return nil
+}
+
+// maxRetainedFrameBuffer bounds the frame buffer a read loop keeps between
+// messages: a large listing's buffer is released rather than pinned for the
+// life of the connection.
+const maxRetainedFrameBuffer = 1 << 20
+
+// readFrameJSON reads the next websocket message whole into buf and decodes
+// it into v. It returns the same errors conn.ReadJSON did: NextReader's
+// (timeouts included), io.ErrUnexpectedEOF for a truncated message, and the
+// JSON decode error.
+func readFrameJSON(conn *websocket.Conn, buf *bytes.Buffer, v interface{}) error {
+	_, reader, err := conn.NextReader()
+	if err != nil {
+		return err
+	}
+	buf.Reset()
+	if _, err = buf.ReadFrom(reader); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	if buf.Len() == 0 {
+		return io.ErrUnexpectedEOF
+	}
+	err = json.Unmarshal(buf.Bytes(), v)
+	if buf.Cap() > maxRetainedFrameBuffer {
+		*buf = bytes.Buffer{}
+	}
+	return err
 }

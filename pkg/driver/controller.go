@@ -1050,7 +1050,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
 	// result and the clone readiness path do not need another zvol poll.
-	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady, volumeProperties); shareErr != nil {
+	//
+	// A clone or copy reaching this point was made by this call:
+	// handleVolumeContentSource returns Aborted when the destination already
+	// existed. No share object can be named after it yet, so for NFS and
+	// NVMe-oF it is as fresh as a DatasetCreate result; there, freshlyCreated
+	// only skips the guaranteed-miss lookups, which on a clone first chase the
+	// share IDs it inherited from its SOURCE. iSCSI is excluded on purpose: it
+	// also reads freshlyCreated as "the zvol holds no data" when choosing the
+	// extent geometry, and a clone's data contradicts that.
+	shareFresh := freshlyCreated || (contentSource != nil && shareType != ShareTypeISCSI)
+	// One memo for this request: the share create records the objects it made
+	// and the volume context below reuses them instead of reading them back.
+	createRes := &fenceResolution{}
+	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, shareFresh, zvolReady, volumeProperties, createRes); shareErr != nil {
 		// (C12) Cleanup on failure. deleteShare MUST run before DatasetDelete,
 		// exactly like the property-write failure arm below: not every
 		// createShareWithOptions failure exit rolls back its own partial share
@@ -1108,7 +1121,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Get volume context for response
-	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
+	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType, createRes)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", err)
 	}
@@ -1578,7 +1591,10 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
 	// This handles the case where a previous CreateVolume created the dataset but failed
 	// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
-	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, nil); shareErr != nil {
+	// The ensure resolves (or rebuilds) the share objects once; the volume
+	// context below reuses them through this request's memo.
+	existingRes := &fenceResolution{}
+	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, existingRes); shareErr != nil {
 		return nil, shareErr
 	}
 
@@ -1588,7 +1604,7 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// than duplicating it.
 	d.ensureSnapshotTask(ctx, existingDS, datasetName, volumeID, vp.snapshotTask, req)
 
-	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
+	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType, existingRes)
 	if ctxErr != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 	}
@@ -2342,7 +2358,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		requestedLimit = 100
 	}
 
-	page, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
+	names, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
@@ -2353,10 +2369,6 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	// materialization that made the old filtered listing O(system size), and
 	// unlike the zfs.resource.query listing it carries the encryption fields
 	// (P-11) and user-property sources the entries below are built from.
-	names := make([]string, 0, len(page))
-	for _, ds := range page {
-		names = append(names, ds.Name)
-	}
 	hydrated := make(map[string]*truenas.Dataset, len(names))
 	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
 		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
@@ -2370,9 +2382,9 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		}
 	}
 
-	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(page))
-	for _, listed := range page {
-		ds, ok := hydrated[listed.Name]
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(names))
+	for _, name := range names {
+		ds, ok := hydrated[name]
 		if !ok {
 			// Deleted between the walk's frozen listing and this page's
 			// hydration: skip the entry rather than report a gone volume.
@@ -2408,7 +2420,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	// hydration misses above do not affect page math.
 	nextToken := ""
 	if hasMore {
-		nextToken = strconv.Itoa(offset + len(page))
+		nextToken = strconv.Itoa(offset + len(names))
 	}
 
 	return &csi.ListVolumesResponse{
@@ -2425,8 +2437,10 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 // always refetches regardless of TTL.
 const volumeListPageCacheTTL = 30 * time.Second
 
-// managedDatasetsForListPage returns one page of the parent's managed datasets
-// for ListVolumes, plus whether more pages remain in the frozen view. A fresh
+// managedDatasetsForListPage returns the names of one page of the parent's
+// managed datasets for ListVolumes, plus whether more pages remain in the
+// frozen view. The page is hydrated by name, so the frozen view keeps only the
+// sorted names, not the listing's decoded datasets, for its TTL. A fresh
 // walk (empty starting token) fetches the full managed set once via
 // listAllManagedDatasets (path-scoped zfs.resource.query, paged
 // pool.dataset.query fallback — both filtered to PropManagedResource=="true"),
@@ -2437,13 +2451,13 @@ const volumeListPageCacheTTL = 30 * time.Second
 // any walk populated the cache, e.g. across a controller restart) refetches —
 // offset tokens remain valid against the refreshed set exactly as they were
 // against the old per-page reads.
-func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) ([]*truenas.Dataset, bool, error) {
+func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []string, hasMore bool, err error) {
 	if !freshWalk {
 		d.volumePageCacheMu.Lock()
 		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
 			cached := d.volumePageCache
 			d.volumePageCacheMu.Unlock()
-			page, hasMore := sliceVolumeListPage(cached, limit, offset)
+			page, hasMore = sliceVolumeListPage(cached, limit, offset)
 			return page, hasMore, nil
 		}
 		d.volumePageCacheMu.Unlock()
@@ -2454,30 +2468,34 @@ func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool,
 	}
 	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
 	// pool.dataset.query fallback guarantees one.
-	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+	names := make([]string, len(all))
+	for i, dataset := range all {
+		names[i] = dataset.Name
+	}
+	sort.Strings(names)
 	d.volumePageCacheMu.Lock()
-	d.volumePageCache = all
+	d.volumePageCache = names
 	d.volumePageCacheTime = time.Now()
 	d.volumePageCacheMu.Unlock()
-	page, hasMore := sliceVolumeListPage(all, limit, offset)
+	page, hasMore = sliceVolumeListPage(names, limit, offset)
 	return page, hasMore, nil
 }
 
 // sliceVolumeListPage slices one offset/limit page out of the frozen listing.
 // Because the full set length is known, hasMore is exact — no lookahead row and
 // no trailing empty page, matching the old fetchLimit=limit+1 token semantics.
-func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page []*truenas.Dataset, hasMore bool) {
+func sliceVolumeListPage(names []string, limit, offset int) (page []string, hasMore bool) {
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= len(datasets) {
+	if offset >= len(names) {
 		return nil, false
 	}
-	end := len(datasets)
+	end := len(names)
 	if limit > 0 && offset+limit < end {
 		end = offset + limit
 	}
-	return datasets[offset:end], end < len(datasets)
+	return names[offset:end], end < len(names)
 }
 
 // publishedNodeIDs derives a ListVolumes entry's PublishedNodeIds
@@ -4699,7 +4717,9 @@ func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds
 	return nil
 }
 
-func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) (map[string]string, error) {
+// res, when non-nil, carries the share objects this request already resolved
+// or created, so the context is built without reading them again.
+func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, res *fenceResolution) (map[string]string, error) {
 	volumeContext := map[string]string{
 		"node_attach_driver": shareType.String(),
 	}
@@ -4713,7 +4733,7 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 	}
 
 	if backend := backendForShareType(d, shareType); backend != nil {
-		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext); err != nil {
+		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext, res); err != nil {
 			return nil, err
 		}
 	}

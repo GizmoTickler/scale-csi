@@ -1064,7 +1064,11 @@ func TestMockClient_NVMeoFPortSubsysFindBySubsystem(t *testing.T) {
 
 	exists, err := client.NVMeoFPortSubsysFindBySubsystem(ctx, 1)
 	require.NoError(t, err)
-	// Mock returns true by default
+	assert.False(t, exists, "no association created yet")
+	_, err = client.NVMeoFPortSubsysCreate(ctx, 1, 1)
+	require.NoError(t, err)
+	exists, err = client.NVMeoFPortSubsysFindBySubsystem(ctx, 1)
+	require.NoError(t, err)
 	assert.True(t, exists)
 }
 

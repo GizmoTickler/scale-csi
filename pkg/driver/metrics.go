@@ -1288,6 +1288,12 @@ func ResetStartupFencingUnconvergedVolumes() {
 	startupFencingUnconvergedVolumes.Reset()
 }
 
+// ClearStartupFencingUnconverged drops volumeID's series: a targeted re-run of
+// that volume replaces its earlier quarantine verdict, and only its own.
+func ClearStartupFencingUnconverged(volumeID string) {
+	startupFencingUnconvergedVolumes.DeleteLabelValues(volumeID)
+}
+
 // RecordStartupFencingUnconverged marks volumeID as quarantined by the
 // current startup fencing pass (C11). Safe to call concurrently across
 // per-volume workers: each call only ever touches its own volume's label.

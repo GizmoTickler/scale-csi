@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -246,17 +247,12 @@ type allowlistCountingClient struct {
 
 type nvmeAssociationInterleavingClient struct {
 	*truenas.MockClient
-	listCalls  int
-	afterFirst func()
+	listCalls int
 }
 
 func (c *nvmeAssociationInterleavingClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
-	associations, err := c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
 	c.listCalls++
-	if c.listCalls == 1 && c.afterFirst != nil {
-		c.afterFirst()
-	}
-	return associations, err
+	return c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
 }
 
 func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T) {
@@ -298,7 +294,52 @@ func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T
 		assert.Equal(t, nqn, associations[0].HostNQN)
 	})
 
-	t.Run("foreign association created after boundary read is removed", func(t *testing.T) {
+	// The classification read is not enforcement evidence: an association that
+	// appears after it must still be revoked, from the list read after the
+	// writes.
+	t.Run("foreign association created after the classification read is removed", func(t *testing.T) {
+		ctx := context.Background()
+		base := truenas.NewMockClient()
+		d := &Driver{
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeStrict},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			},
+			truenasClient: base, nvmeResolvedHosts: make(map[string]int),
+		}
+		dataset, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/classified-remove", Type: "VOLUME", Volsize: testGiB,
+		})
+		require.NoError(t, err)
+		subsystem, err := base.NVMeoFSubsystemCreate(ctx, "classified-remove", false, nil)
+		require.NoError(t, err)
+		namespace, err := base.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+		require.NoError(t, err)
+		desiredNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+		desired, err := base.NVMeoFHostCreate(ctx, desiredNQN)
+		require.NoError(t, err)
+		association, err := base.NVMeoFHostSubsysCreate(ctx, desired.ID, subsystem.ID)
+		require.NoError(t, err)
+		res := &fenceResolution{
+			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
+			nvmeAssociations: []*truenas.NVMeoFHostSubsys{association}, nvmeAssocLoaded: true,
+		}
+		foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
+		require.NoError(t, err)
+		_, err = base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+		require.NoError(t, err, "foreign association lands after classification cached its list")
+
+		require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+			[]NodeIdentity{{Name: "worker-a", NVMeNQN: desiredNQN}}, nil, nil, nil, res))
+		associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		require.NoError(t, err)
+		require.Len(t, associations, 1)
+		assert.Equal(t, desiredNQN, associations[0].HostNQN)
+	})
+
+	// Without a classification read (unpublish, stale revoke) the one fresh
+	// read IS the post-write list: nothing is created before it.
+	t.Run("foreign association present at the enforcement read is removed", func(t *testing.T) {
 		ctx := context.Background()
 		base := truenas.NewMockClient()
 		client := &nvmeAssociationInterleavingClient{MockClient: base}
@@ -324,10 +365,8 @@ func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T
 		require.NoError(t, err)
 		foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
 		require.NoError(t, err)
-		client.afterFirst = func() {
-			_, createErr := base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
-			require.NoError(t, createErr)
-		}
+		_, err = base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+		require.NoError(t, err)
 		res := &fenceResolution{
 			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
 		}
@@ -338,6 +377,7 @@ func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T
 		require.NoError(t, err)
 		require.Len(t, associations, 1)
 		assert.Equal(t, desiredNQN, associations[0].HostNQN)
+		assert.Equal(t, 1, client.listCalls, "no write happened, so the enforcement read is the only list")
 	})
 }
 
@@ -1597,7 +1637,17 @@ func TestStartupReconcileBackfillsAttachedNFSNodeAndEnforcesFence(t *testing.T) 
 	assert.True(t, share.Enabled)
 }
 
+// The initial snapshot only schedules work: the per-volume pass re-reads each
+// VolumeAttachment by name under the lock, and one that is gone or being
+// deleted by then is never granted.
 func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing.T) {
+	for _, change := range []string{"deleted", "being deleted", "no longer attached"} {
+		t.Run(change, func(t *testing.T) { testStartupReconcileIgnoresAttachmentChangedAfterSnapshot(t, change) })
+	}
+}
+
+func testStartupReconcileIgnoresAttachmentChangedAfterSnapshot(t *testing.T, change string) {
+	t.Helper()
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/stale-startup", Type: "FILESYSTEM"})
@@ -1626,12 +1676,18 @@ func TestStartupReconcileIgnoresAttachmentDeletedAfterInitialSnapshot(t *testing
 		Drivers: []storagev1.CSINodeDriver{{Name: "csi.scale.io", NodeID: nodeID}},
 	}}
 	kube := kubernetesfake.NewSimpleClientset(pv, attachment, csiNode)
-	var attachmentLists atomic.Int32
-	kube.PrependReactor("list", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
-		if attachmentLists.Add(1) == 1 {
-			return false, nil, nil
+	kube.PrependReactor("get", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
+		changed := attachment.DeepCopy()
+		switch change {
+		case "deleted":
+			return true, nil, apierrors.NewNotFound(storagev1.Resource("volumeattachments"), attachment.Name)
+		case "being deleted":
+			now := metav1.Now()
+			changed.DeletionTimestamp = &now
+		case "no longer attached":
+			changed.Status.Attached = false
 		}
-		return true, &storagev1.VolumeAttachmentList{}, nil
+		return true, changed, nil
 	})
 	d := &Driver{
 		name: "csi.scale.io",
@@ -3244,7 +3300,7 @@ func TestBackgroundStartupAdditiveWaitsForDeferredTrigger(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, records, "new attachments are reconciled only after a real deferral signals work")
 
-	d.recordFencingDeferred(NodeIdentity{Name: "worker-later"}, ShareTypeNFS, "missing_identity", "test trigger")
+	d.recordFencingDeferred(dataset.Name, NodeIdentity{Name: "worker-later"}, ShareTypeNFS, "missing_identity", "test trigger")
 
 	require.Eventually(t, func() bool {
 		fresh, getErr := client.DatasetGet(ctx, dataset.Name)
@@ -3594,4 +3650,48 @@ func TestControllerPublishFailsSafeWhenAttachmentListUnavailable(t *testing.T) {
 	share, err := client.NFSShareGet(ctx, shareID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts, "fail-safe must leave the blocking grant intact")
+}
+
+// On a backend that does not expand an association's host NQN, strict
+// enforcement falls back to host IDs: the desired association is recognized by
+// ID (no duplicate create) and a foreign one is still revoked.
+func TestStrictNVMeFenceWithoutExpandedHostNQNFallsBackToHostIDs(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	client := &allowlistCountingClient{MockClient: base}
+	d := &Driver{
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+	}
+	dataset, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/nqnless-strict", Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+	subsystem, err := base.NVMeoFSubsystemCreate(ctx, "nqnless-strict", false, nil)
+	require.NoError(t, err)
+	namespace, err := base.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+	require.NoError(t, err)
+	desiredNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+	desired, err := base.NVMeoFHostCreate(ctx, desiredNQN)
+	require.NoError(t, err)
+	_, err = base.NVMeoFHostSubsysCreate(ctx, desired.ID, subsystem.ID)
+	require.NoError(t, err)
+	foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
+	require.NoError(t, err)
+	_, err = base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+	require.NoError(t, err)
+	base.EmptyNVMeHostNQN = true
+	res := &fenceResolution{nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true}
+
+	require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+		[]NodeIdentity{{Name: "worker-a", NVMeNQN: desiredNQN}}, nil, nil, nil, res))
+	associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+	require.NoError(t, err)
+	require.Len(t, associations, 1)
+	assert.Equal(t, desired.ID, associations[0].HostID)
+	assert.Equal(t, int64(0), client.nvmeHostSubsysCreate.Load(), "the desired association exists by host ID")
+	assert.Equal(t, int64(1), client.nvmeHostSubsysDelete.Load())
 }

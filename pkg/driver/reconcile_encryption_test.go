@@ -570,7 +570,7 @@ func TestStartupReconcileUnlocksBeforeShareRebuild(t *testing.T) {
 	name := addManagedEncryptedVolume(t, client, volumeID, passphrase)
 	require.NoError(t, client.DatasetLock(context.Background(), name))
 
-	require.NoError(t, d.runStartupAttachmentReconcile(context.Background()))
+	require.NoError(t, d.runStartupAttachmentReconcile(context.Background(), nil))
 
 	unlocked, err := client.DatasetGet(context.Background(), name)
 	require.NoError(t, err)

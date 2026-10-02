@@ -153,7 +153,7 @@ type Driver struct {
 	// starting token always refetches, and no delete/authorization decision
 	// ever reads it.
 	volumePageCacheMu   sync.Mutex
-	volumePageCache     []*truenas.Dataset
+	volumePageCache     []string // sorted dataset names of the walk's frozen listing
 	volumePageCacheTime time.Time
 
 	// Ready flag (atomic for safe concurrent access)
@@ -235,19 +235,26 @@ type Driver struct {
 	startupReconcileWg      sync.WaitGroup
 	startupReconcileOnce    sync.Once
 	startupReconcileSignal  chan struct{}
-	// startupReconcileQuarantineCount is the number of volumes
-	// quarantineStaleStartupFencingVolume (C11) carved out of the MOST RECENT
-	// reconcilePublishedAttachments pass. Reset to 0 at the same point that
-	// pass calls ResetStartupFencingUnconvergedVolumes (before any worker can
-	// observe it) and read by startStartupAttachmentReconcile immediately
-	// after that pass returns, so it never needs its own lock: exactly one
-	// pass is ever in flight for a given Driver. A quarantine is a DEFERRAL,
-	// not an abandonment — strict mode still latches readiness true on a
-	// quarantine-only pass, but must keep this field's reader from exiting
-	// the reconcile goroutine, since only that goroutine's later passes (woken
-	// by requestStartupAttachmentReconcile, e.g. from
-	// revokeStalePublicationRecord) can ever converge the quarantined volume.
-	startupReconcileQuarantineCount atomic.Int64
+	// startupReconcileTargetsMu guards startupReconcilePending and
+	// startupQuarantined.
+	startupReconcileTargetsMu sync.Mutex
+	// startupReconcilePending is the set of datasets a re-run signal named
+	// (a deferred fence, a revoked stale record) that no pass has taken yet.
+	// A signal wakes the loop, which re-runs exactly these volumes.
+	startupReconcilePending map[string]struct{}
+	// startupQuarantined maps each volume quarantineStaleStartupFencingVolume
+	// (C11) carved out to its dataset, across passes: a full pass replaces the
+	// set, a targeted pass replaces only its own volumes' entries. A
+	// quarantine is a DEFERRAL, not an abandonment — strict mode still latches
+	// readiness true on a quarantine-only pass, but the reconcile goroutine
+	// must not exit while this set is non-empty, since only its later passes
+	// (woken by requestStartupAttachmentReconcile, e.g. from
+	// revokeStalePublicationRecord) can ever converge a quarantined volume.
+	startupQuarantined map[string]startupQuarantine
+	// startupReconcileExited is set (under startupReconcileTargetsMu) when the
+	// reconcile loop has returned: later re-run requests are dropped instead of
+	// collecting in startupReconcilePending with nothing left to take them.
+	startupReconcileExited bool
 
 	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
 	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
@@ -850,7 +857,10 @@ func (d *Driver) logInterceptor(
 
 	// Log a cloned request with any CSI secrets structurally removed. The
 	// original request is left untouched for the RPC handler.
-	klog.V(5).Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
+	// Guarded: the clone is built only when V(5) is on, not on every RPC.
+	if requestLog := klog.V(5); requestLog.Enabled() {
+		requestLog.Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
+	}
 
 	// Kubernetes Pod readiness does not stop CSI sidecars in the same Pod from
 	// using the Unix socket. During strict startup convergence, enforce the gate

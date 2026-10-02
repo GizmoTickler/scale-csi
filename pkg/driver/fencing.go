@@ -402,9 +402,11 @@ func validateIdentityForProtocol(identity NodeIdentity, shareType ShareType) err
 	return nil
 }
 
-func (d *Driver) recordFencingDeferred(identity NodeIdentity, shareType ShareType, reason, detail string) {
+// recordFencingDeferred counts a deferral and asks the startup reconcile loop
+// to re-run datasetName, the volume whose fence was deferred, once more.
+func (d *Driver) recordFencingDeferred(datasetName string, identity NodeIdentity, shareType ShareType, reason, detail string) {
 	RecordFencingDeferred(reason, string(shareType))
-	d.requestStartupAttachmentReconcile()
+	d.requestStartupAttachmentReconcile(datasetName)
 	key := reason + "\x00" + string(shareType) + "\x00" + identity.Name
 	if _, loaded := d.fencingDeferredLogs.LoadOrStore(key, struct{}{}); loaded {
 		return
@@ -433,7 +435,7 @@ func rejectReservedSentinelIdentity(identity NodeIdentity, shareType ShareType) 
 // static allowlist. The publish still writes a durable ownership record so a
 // second legacy node cannot bypass SINGLE_NODE semantics, but skips only that
 // node's backend grant. Strict mode preserves the fail-closed contract.
-func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType ShareType) (bool, error) {
+func (d *Driver) validateOrDeferFencingIdentity(datasetName string, identity NodeIdentity, shareType ShareType) (bool, error) {
 	if err := rejectReservedSentinelIdentity(identity, shareType); err != nil {
 		// F2: a node that physically reported the reserved deny-all sentinel as its
 		// own initiator IQN is NOT a temporarily-missing-IQN rolling-upgrade node.
@@ -449,7 +451,7 @@ func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType
 	}
 	if err := validateIdentityForProtocol(identity, shareType); err != nil {
 		if d.config.Fencing.Mode == FencingModeAdditive {
-			d.recordFencingDeferred(identity, shareType, "missing_identity", err.Error())
+			d.recordFencingDeferred(datasetName, identity, shareType, "missing_identity", err.Error())
 			return true, nil
 		}
 		return false, err
@@ -469,7 +471,7 @@ func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType
 	err := status.Errorf(codes.FailedPrecondition,
 		"node %s has no IP inside nfs.shareAllowedNetworks", identity.Name)
 	if d.config.Fencing.Mode == FencingModeAdditive {
-		d.recordFencingDeferred(identity, shareType, "outside_allowed_network", err.Error())
+		d.recordFencingDeferred(datasetName, identity, shareType, "outside_allowed_network", err.Error())
 		return true, nil
 	}
 	return false, err
@@ -697,26 +699,35 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 			}
 		}
 		exemptNQNs := stringSet(sameNodeNQNs, d.config.NVMeoF.SubsystemHosts)
-		exemptHostIDs := make(map[int]struct{}, len(exemptNQNs))
-		for nqn := range exemptNQNs {
-			host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
-			if findErr != nil {
-				return status.Errorf(codes.Internal, "verify NVMe-oF host %q: %v", nqn, findErr)
-			}
-			if host != nil {
-				exemptHostIDs[host.ID] = struct{}{}
-			}
-		}
 		associations, listErr := d.resolvedNVMeAssociations(ctx, res, subsystem.ID)
 		if listErr != nil {
 			return status.Errorf(codes.Internal, "verify NVMe-oF subsystem allowlist: %v", listErr)
 		}
+		// TrueNAS 26.0 expands each association's host NQN, which is matched
+		// directly. Exempt NQNs are resolved to host IDs only for an association
+		// that arrived without one.
+		var exemptHostIDs map[int]struct{}
 		for _, association := range associations {
-			if _, allowed := exemptHostIDs[association.HostID]; allowed {
-				continue
-			}
-			if _, allowed := exemptNQNs[association.HostNQN]; association.HostNQN != "" && allowed {
-				continue
+			if association.HostNQN != "" {
+				if _, allowed := exemptNQNs[association.HostNQN]; allowed {
+					continue
+				}
+			} else {
+				if exemptHostIDs == nil {
+					exemptHostIDs = make(map[int]struct{}, len(exemptNQNs))
+					for _, nqn := range sortedSetKeys(exemptNQNs) {
+						host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
+						if findErr != nil {
+							return status.Errorf(codes.Internal, "verify NVMe-oF host %q: %v", nqn, findErr)
+						}
+						if host != nil {
+							exemptHostIDs[host.ID] = struct{}{}
+						}
+					}
+				}
+				if _, allowed := exemptHostIDs[association.HostID]; allowed {
+					continue
+				}
 			}
 			identity := association.HostNQN
 			if identity == "" {
@@ -1044,7 +1055,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	deferred := false
 	if backendEnforcement {
 		var err error
-		deferred, err = d.validateOrDeferFencingIdentity(identity, shareType)
+		deferred, err = d.validateOrDeferFencingIdentity(datasetName, identity, shareType)
 		if err != nil {
 			return err
 		}
@@ -1219,7 +1230,7 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 	protectedNVMeNQNs := make([]string, 0)
 	hasDeferredActiveISCSI := false
 	for _, identity := range active {
-		deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
+		deferred, err := d.validateOrDeferFencingIdentity(datasetName, identity, shareType)
 		if err != nil {
 			return fmt.Errorf("publication record for node %s is not enforceable yet: %w", identity.Name, err)
 		}
@@ -1248,6 +1259,15 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 		return fmt.Errorf("unsupported share type %q", shareType)
 	}
 	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs, hasDeferredActiveISCSI, res)
+}
+
+func sortedSetKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func uniqueSortedStrings(values []string) []string {
@@ -1321,7 +1341,7 @@ func (d *Driver) applyNFSFence(
 		}
 		if !accepted {
 			if d.config.Fencing.Mode == FencingModeAdditive {
-				d.recordFencingDeferred(identity, ShareTypeNFS, "outside_allowed_network",
+				d.recordFencingDeferred(datasetName, identity, ShareTypeNFS, "outside_allowed_network",
 					"no node IP is inside nfs.shareAllowedNetworks")
 				return fmt.Errorf("%w: node %s has no IP inside nfs.shareAllowedNetworks", errFenceDeferred, identity.Name)
 			}
@@ -1712,11 +1732,22 @@ func (d *Driver) applyNVMeFence(
 			return updateErr
 		}
 	}
-	// Compatibility/classification reads are not enforcement evidence: an
-	// operator, peer controller, or backend action can change the allowlist
-	// outside this process-local volume lock. Fresh-list at the mutation boundary.
-	if _, refreshErr := d.refreshNVMeAssociations(ctx, res, subsystem.ID); refreshErr != nil {
-		return refreshErr
+	// The pre-write view is the classification list this request already read
+	// under the volume lock (validateBackendSingleNodeCompatibility memoizes
+	// it), or one fresh read when there is none (unpublish, revoke). It only
+	// decides which associations to CREATE. Removals below always work from a
+	// list read after the writes: a classification read is not enforcement
+	// evidence, because an operator, a peer controller or the backend can
+	// change the allowlist outside this process-local lock.
+	preWriteFromClassification := res != nil && res.nvmeAssocLoaded
+	var preWrite []*truenas.NVMeoFHostSubsys
+	if preWriteFromClassification {
+		preWrite = res.nvmeAssociations
+	} else {
+		preWrite, err = d.refreshNVMeAssociations(ctx, res, subsystem.ID)
+		if err != nil {
+			return err
+		}
 	}
 	desiredNQNs := make([]string, 0, len(active)+len(d.config.NVMeoF.SubsystemHosts))
 	for _, identity := range active {
@@ -1728,28 +1759,88 @@ func (d *Driver) applyNVMeFence(
 		desiredNQNs = append(desiredNQNs, d.config.NVMeoF.SubsystemHosts...)
 	}
 	desiredNQNs = uniqueSortedStrings(desiredNQNs)
-	desiredIDs, err := d.resolveNVMeoFHostIDs(ctx, desiredNQNs)
-	if err != nil {
-		return err
-	}
-	desiredByID := make(map[int]struct{}, len(desiredIDs))
-	for _, hostID := range desiredIDs {
-		desiredByID[hostID] = struct{}{}
-		// Issue the desired association unconditionally. The client keeps its
-		// AlreadyExists tolerance, and this closes the race where an association
-		// observed during compatibility disappears before enforcement.
-		_, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsystem.ID)
-		res.invalidateNVMeAssociations()
-		if createErr != nil {
-			return createErr
+	desiredNQNSet := stringSet(desiredNQNs)
+	// Host IDs are resolved only for a desired host that has to be associated,
+	// or when the backend did not expand an association's host NQN. TrueNAS
+	// 26.0 expands it, so a steady-state publish or unpublish resolves nothing.
+	desiredByID := make(map[int]struct{}, len(desiredNQNs))
+	desiredIDsResolved := false
+	resolveDesiredIDs := func() error {
+		if desiredIDsResolved {
+			return nil
 		}
+		ids, resolveErr := d.resolveNVMeoFHostIDs(ctx, desiredNQNs)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		for _, hostID := range ids {
+			desiredByID[hostID] = struct{}{}
+		}
+		desiredIDsResolved = true
+		return nil
 	}
-	// Removals must use a fresh POST-create list. A foreign association can
-	// appear after the boundary read, and strict fencing must revoke it before
-	// reporting success.
-	associations, err := d.refreshNVMeAssociations(ctx, res, subsystem.ID)
+	// ensureDesired creates every desired association the given view lacks and
+	// reports whether it wrote anything.
+	ensureDesired := func(view []*truenas.NVMeoFHostSubsys) (bool, error) {
+		presentNQNs := make(map[string]struct{}, len(view))
+		presentIDs := make(map[int]struct{}, len(view))
+		for _, association := range view {
+			if association.HostNQN != "" {
+				presentNQNs[association.HostNQN] = struct{}{}
+			}
+			presentIDs[association.HostID] = struct{}{}
+		}
+		wrote := false
+		for _, nqn := range desiredNQNs {
+			if _, present := presentNQNs[nqn]; present {
+				continue
+			}
+			hostIDs, resolveErr := d.resolveNVMeoFHostIDs(ctx, []string{nqn})
+			if resolveErr != nil {
+				return wrote, resolveErr
+			}
+			for _, hostID := range hostIDs {
+				desiredByID[hostID] = struct{}{}
+				if _, present := presentIDs[hostID]; present {
+					continue
+				}
+				_, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsystem.ID)
+				res.invalidateNVMeAssociations()
+				wrote = true
+				if createErr != nil {
+					return wrote, createErr
+				}
+			}
+		}
+		return wrote, nil
+	}
+	wrote, err := ensureDesired(preWrite)
 	if err != nil {
 		return err
+	}
+	// Removals must use a fresh POST-write list. A foreign association can
+	// appear after the classification read, and strict fencing must revoke it
+	// before reporting success. When nothing was written and the pre-write view
+	// was itself a fresh read at this boundary, that read is the post-write list.
+	associations := preWrite
+	if wrote || preWriteFromClassification {
+		associations, err = d.refreshNVMeAssociations(ctx, res, subsystem.ID)
+		if err != nil {
+			return err
+		}
+		// A desired association seen in the classification read can vanish
+		// before this one. Re-assert it from the fresh view instead of
+		// reporting success without it.
+		rewrote, ensureErr := ensureDesired(associations)
+		if ensureErr != nil {
+			return ensureErr
+		}
+		if rewrote {
+			associations, err = d.refreshNVMeAssociations(ctx, res, subsystem.ID)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	removeNQNs := append([]string(nil), additiveRemovingNQNs...)
 	if d.config.Fencing.Mode == FencingModeStrict {
@@ -1760,47 +1851,64 @@ func (d *Driver) applyNVMeFence(
 			}
 		}
 	}
-	removeIDs := make([]int, 0, len(removeNQNs))
-	for _, nqn := range uniqueSortedStrings(removeNQNs) {
-		host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
-		if findErr != nil {
-			return fmt.Errorf("resolve NVMe-oF host %q for unpublish: %w", nqn, findErr)
-		}
-		if host != nil {
-			removeIDs = append(removeIDs, host.ID)
-		}
-	}
-	removeByID := make(map[int]struct{}, len(removeIDs))
-	for _, hostID := range removeIDs {
-		removeByID[hostID] = struct{}{}
-	}
+	removeNQNSet := stringSet(removeNQNs)
 	protectedNQNs := stringSet(additiveProtectedNQNs)
-	protectedByID := make(map[int]struct{}, len(protectedNQNs))
-	for nqn := range protectedNQNs {
-		host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
-		if findErr != nil {
-			return fmt.Errorf("resolve deferred NVMe-oF host %q: %w", nqn, findErr)
+	// NQN -> host ID lookups for associations the backend returned without an
+	// expanded host NQN; resolved once, only if such an association exists.
+	var removeByID, protectedByID map[int]struct{}
+	resolveByID := func(nqns map[string]struct{}, what string) (map[int]struct{}, error) {
+		byID := make(map[int]struct{}, len(nqns))
+		for _, nqn := range sortedSetKeys(nqns) {
+			host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
+			if findErr != nil {
+				return nil, fmt.Errorf("resolve %s NVMe-oF host %q: %w", what, nqn, findErr)
+			}
+			if host != nil {
+				byID[host.ID] = struct{}{}
+			}
 		}
-		if host != nil {
-			protectedByID[host.ID] = struct{}{}
-		}
+		return byID, nil
 	}
 	for _, association := range associations {
-		if _, keep := desiredByID[association.HostID]; keep {
-			continue
-		}
-		if _, keep := protectedByID[association.HostID]; keep {
-			continue
-		}
-		if _, keep := protectedNQNs[association.HostNQN]; association.HostNQN != "" && keep {
-			continue
+		if association.HostNQN != "" {
+			if _, keep := desiredNQNSet[association.HostNQN]; keep {
+				continue
+			}
+			if _, keep := protectedNQNs[association.HostNQN]; keep {
+				continue
+			}
+		} else {
+			// No expanded NQN: fall back to host IDs, as before TrueNAS 26.0.
+			if resolveErr := resolveDesiredIDs(); resolveErr != nil {
+				return resolveErr
+			}
+			if _, keep := desiredByID[association.HostID]; keep {
+				continue
+			}
+			if protectedByID == nil {
+				if protectedByID, err = resolveByID(protectedNQNs, "deferred"); err != nil {
+					return err
+				}
+			}
+			if _, keep := protectedByID[association.HostID]; keep {
+				continue
+			}
 		}
 		remove := d.config.Fencing.Mode == FencingModeStrict
 		if d.config.Fencing.Mode == FencingModeAdditive {
-			// TrueNAS 26.0 expands hostnqn in the nested host object. Resolve the
-			// durable CSI-added NQN to HostID as a defensive fallback and remove
-			// only associations carrying explicit scale-csi provenance.
-			_, remove = removeByID[association.HostID]
+			// Remove only associations carrying explicit scale-csi provenance:
+			// the durable CSI-added NQN, matched on the expanded host NQN, or on
+			// the host ID when the backend did not expand it.
+			if association.HostNQN != "" {
+				_, remove = removeNQNSet[association.HostNQN]
+			} else {
+				if removeByID == nil {
+					if removeByID, err = resolveByID(removeNQNSet, "unpublish"); err != nil {
+						return err
+					}
+				}
+				_, remove = removeByID[association.HostID]
+			}
 		}
 		if remove {
 			deleteErr := d.truenasClient.NVMeoFHostSubsysDelete(ctx, association.ID)
