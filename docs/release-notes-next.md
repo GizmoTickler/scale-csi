@@ -1,6 +1,6 @@
 # Release notes — v1.17.0 (next)
 
-## v1.20.0 (draft)
+## v1.20.0 — kernel NVMe-oF waits for the current /dev node
 
 - **Kernel NVMe-oF: a stage right after a handover waits for the current /dev
   node.** When one plugin unstaged a kernel NVMe-oF volume and the other
