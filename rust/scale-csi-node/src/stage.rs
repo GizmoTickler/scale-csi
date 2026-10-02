@@ -139,12 +139,10 @@ pub async fn handle_existing_stage(state: &State, want: &Wanted<'_>) -> Result<b
     // A mount point is never a symlink; a dead network mount's lstat would
     // block, so it is not looked at.
     let symlink = !mounted && {
-        let path = staging.to_string();
-        bounded_path_call(state, move || {
-            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-        })
-        .await
-        .unwrap_or(false)
+        let (path, lstat) = (staging.to_string(), state.host.lstat.clone());
+        bounded_path_call(state, move || lstat(&path).is_ok_and(|m| m.file_type().is_symlink()))
+            .await
+            .unwrap_or(false)
     };
     if !mounted && !symlink {
         state.records.delete_stage(staging);
@@ -615,12 +613,10 @@ pub async fn node_unstage(
     let symlink = match in_mountinfo {
         Some(_) => false,
         None => {
-            let path = staging.to_string();
-            bounded_path_call(state, move || {
-                std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-            })
-            .await
-            .unwrap_or(false)
+            let (path, lstat) = (staging.to_string(), state.host.lstat.clone());
+            bounded_path_call(state, move || lstat(&path).is_ok_and(|m| m.file_type().is_symlink()))
+                .await
+                .unwrap_or(false)
         }
     };
     let mounted_source = match state.mounter.mount_source(staging, deadline).await {
@@ -634,8 +630,8 @@ pub async fn node_unstage(
     };
     let link = match (&mounted_source, symlink) {
         (None, true) => {
-            let path = staging.to_string();
-            bounded_path_call(state, move || std::fs::read_link(path))
+            let (path, read_link) = (staging.to_string(), state.host.read_link.clone());
+            bounded_path_call(state, move || read_link(&path))
                 .await
                 .and_then(Result::ok)
                 .map(|target| target.to_string_lossy().into_owned())

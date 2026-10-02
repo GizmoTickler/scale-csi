@@ -44,6 +44,9 @@ pub struct HostState {
     pub deadline_spent_after: Option<String>,
     deadline_spent: bool,
     pub calls: Vec<String>,
+    /// Paths looked at directly through `Host::lstat` and `Host::read_link`:
+    /// "lstat <path>", "readlink <path>".
+    pub path_probes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -115,6 +118,18 @@ impl FakeHost {
 
     pub fn calls(&self) -> Vec<String> {
         self.0.lock().unwrap().calls.clone()
+    }
+
+    /// The path probes (`Host::lstat`, `Host::read_link`) that named `path`.
+    pub fn probes_of(&self, path: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .path_probes
+            .iter()
+            .filter(|p| p.split_once(' ').is_some_and(|(_, probed)| probed == path))
+            .cloned()
+            .collect()
     }
 
     pub fn is_mounted(&self, target: &str) -> bool {
@@ -466,6 +481,21 @@ pub fn node(config_yaml: &str, host_nqn: &str, tweak: impl FnOnce(&mut State)) -
         device_number: {
             let numbers = host.clone();
             Arc::new(move |path: &str| Ok(numbers.device_number(path)))
+        },
+        // The real calls, logged in HostState::path_probes.
+        lstat: {
+            let probes = host.clone();
+            Arc::new(move |path: &str| {
+                probes.0.lock().unwrap().path_probes.push(format!("lstat {path}"));
+                std::fs::symlink_metadata(path)
+            })
+        },
+        read_link: {
+            let probes = host.clone();
+            Arc::new(move |path: &str| {
+                probes.0.lock().unwrap().path_probes.push(format!("readlink {path}"));
+                std::fs::read_link(path)
+            })
         },
     };
     let nvme_runner: Arc<dyn Runner> = host.clone();

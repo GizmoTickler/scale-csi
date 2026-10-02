@@ -355,7 +355,7 @@ pub async fn cleanup_trunk_probes(state: &State, staging: &str, deadline: Option
                 continue;
             }
         }
-        let removed = match std::fs::symlink_metadata(&probe) {
+        let removed = match (state.host.lstat)(&probe) {
             Ok(meta) if meta.is_dir() => std::fs::remove_dir(&probe),
             Ok(_) => std::fs::remove_file(&probe),
             Err(e) => Err(e),

@@ -34,6 +34,13 @@ fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
     Ok(meta.file_type().is_block_device().then(|| meta.rdev()))
 }
 
+/// lstat(2) of a path the node looks at directly (never one that may be a
+/// network mount: on a dead server it blocks).
+pub type PathProbe = Arc<dyn Fn(&str) -> std::io::Result<std::fs::Metadata> + Send + Sync>;
+
+/// readlink(2) of a staging path.
+pub type LinkReader = Arc<dyn Fn(&str) -> std::io::Result<PathBuf> + Send + Sync>;
+
 /// Where the node looks at the host; the tests point it elsewhere.
 pub struct Host {
     /// Where block devices appear.
@@ -44,6 +51,9 @@ pub struct Host {
     pub host_id_files: Vec<PathBuf>,
     /// stat(2) of a block device's number (the tests supply their own).
     pub device_number: BlockDeviceNumber,
+    /// lstat(2) and readlink(2) of a path (the tests watch which paths).
+    pub lstat: PathProbe,
+    pub read_link: LinkReader,
 }
 
 impl Default for Host {
@@ -54,6 +64,8 @@ impl Default for Host {
             sysfs: PathBuf::from("/sys"),
             host_id_files: crate::ublk_state::default_host_id_files(),
             device_number: Arc::new(block_device_number),
+            lstat: Arc::new(|path: &str| std::fs::symlink_metadata(path)),
+            read_link: Arc::new(|path: &str| std::fs::read_link(path)),
         }
     }
 }

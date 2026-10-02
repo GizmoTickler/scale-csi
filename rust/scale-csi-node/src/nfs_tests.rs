@@ -862,3 +862,61 @@ async fn the_check_after_a_slow_unmount_has_its_own_budget() {
         .expect("unpublished although the deadline is spent");
     assert!(!n.host.is_mounted(&target) && !exists(&target));
 }
+
+/// A trunk probe whose mount state cannot be read may still be a (possibly
+/// dead) network mount: it is neither stat'ed nor removed.
+#[tokio::test]
+async fn a_trunk_probe_of_unknown_mount_state_is_left_alone() {
+    let n = nfs_node(NFS_ON);
+    let staging = n.path("staging/globalmount");
+    node_stage(&n.state, &stage_request(&staging, &[], context(&[])), None)
+        .await
+        .unwrap();
+    let probe = format!("{staging}.scale-csi-nfs-trunk-1");
+    std::fs::create_dir_all(&probe).unwrap();
+    n.host
+        .0
+        .lock()
+        .unwrap()
+        .failing
+        .push(format!("findmnt --mountpoint {probe} "));
+
+    node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
+    assert!(exists(&probe), "a probe of unknown state was removed");
+    assert!(n.host.probes_of(&probe).is_empty(), "{:?}", n.host.probes_of(&probe));
+    assert!(!exists(&staging));
+}
+
+/// A staging path mountinfo shows a mount on is an NFS share: unstage never
+/// lstats or reads it as a link (on a dead server that blocks).
+#[tokio::test]
+async fn unstage_never_probes_a_mounted_staging_path() {
+    let n = nfs_node(NFS_ON);
+    let staging = n.path("staging/globalmount");
+    std::fs::create_dir_all(&staging).unwrap();
+    n.host.mount(&staging, SOURCE, "nfs4");
+    node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
+    assert!(!n.host.is_mounted(&staging) && !exists(&staging));
+    assert!(
+        n.host.probes_of(&staging).is_empty(),
+        "{:?}",
+        n.host.probes_of(&staging)
+    );
+}
+
+/// The existing-stage check lstats the staging path only while nothing is
+/// mounted there: once the share is mounted, a replay never probes it.
+#[tokio::test]
+async fn the_existing_stage_check_never_probes_a_mounted_path() {
+    let n = nfs_node(NFS_ON);
+    let staging = n.path("staging/globalmount");
+    let req = stage_request(&staging, &[], context(&[]));
+    node_stage(&n.state, &req, None).await.unwrap();
+    assert_eq!(
+        n.host.probes_of(&staging),
+        [format!("lstat {staging}")],
+        "only the check before the mount looks at the path"
+    );
+    node_stage(&n.state, &req, None).await.unwrap();
+    assert_eq!(n.host.probes_of(&staging), [format!("lstat {staging}")]);
+}
