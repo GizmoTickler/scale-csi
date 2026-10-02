@@ -1257,3 +1257,76 @@ async fn a_failed_multipath_resize_fails_the_expansion() {
         );
     }
 }
+
+/// The handover race: the other plugin logged out, this one logged in, and
+/// sysfs already names the new disk while its /dev node still carries the
+/// previous disk's number for a few stats. The device wait must not return
+/// that node (blkid gets ENXIO), but poll until the node is current: through
+/// the portal's session (scoped or not) and through the IQN fallback.
+#[tokio::test]
+async fn the_device_wait_skips_a_stale_dev_node() {
+    for (portal, scoped) in [(PORTAL, true), (PORTAL, false), ("truenas.example:3260", false)] {
+        let n = iscsi_node(CONFIG);
+        let device = fake(&n, |f| {
+            f.stale_polls = 3;
+            f.add_session(PORTAL, IQN)
+        });
+        let found = n
+            .state
+            .iscsi
+            .wait_for_device(portal, IQN, 0, Duration::from_secs(5), scoped, None)
+            .await
+            .unwrap();
+        assert_eq!(found, device, "{portal} scoped={scoped}");
+        assert_eq!(
+            fake(&n, |f| f.stale.values().sum::<u32>()),
+            0,
+            "{portal} scoped={scoped}: the wait must poll past the stale node"
+        );
+    }
+}
+
+/// A node that never becomes current ends in the wait's own timeout.
+#[tokio::test]
+async fn the_device_wait_times_out_on_a_stale_dev_node() {
+    let n = iscsi_node(CONFIG);
+    fake(&n, |f| {
+        f.stale_polls = u32::MAX;
+        f.add_session(PORTAL, IQN)
+    });
+    let err = n
+        .state
+        .iscsi
+        .wait_for_device(PORTAL, IQN, 0, Duration::from_millis(150), true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("timeout waiting for device (iqn={IQN}, lun=0)")
+    );
+    assert!(
+        fake(&n, |f| f.stale.values().all(|left| *left < u32::MAX - 1)),
+        "re-checked until the timeout"
+    );
+}
+
+/// A whole stage across the handover race, single portal and multipath (the
+/// map's node is stale too): it stages the current nodes.
+#[tokio::test]
+async fn a_stage_right_after_a_handover_waits_for_current_nodes() {
+    for (config, multipath) in [(CONFIG, false), (MULTIPATH_CONFIG, true)] {
+        let n = iscsi_node_with(config, |f| {
+            f.multipathd = multipath;
+            f.stale_polls = 2;
+        });
+        let mut req = stage_request(&n, block());
+        if multipath {
+            req = with_hint(req, HINT);
+        }
+        node_stage(&n.state, &req, None).await.unwrap();
+        assert_eq!(fake(&n, |f| f.stale.values().sum::<u32>()), 0, "multipath={multipath}");
+        if multipath {
+            assert!(fake(&n, |f| f.map_of(WWID)).is_some());
+        }
+    }
+}

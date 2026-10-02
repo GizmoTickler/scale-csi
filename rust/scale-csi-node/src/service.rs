@@ -28,7 +28,7 @@ use crate::ublk_client::{self, Daemon};
 /// A path's device number, when it is a block device.
 pub type BlockDeviceNumber = Arc<dyn Fn(&str) -> std::io::Result<Option<u64>> + Send + Sync>;
 
-fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
+pub(crate) fn block_device_number(path: &str) -> std::io::Result<Option<u64>> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let meta = std::fs::metadata(path)?;
     Ok(meta.file_type().is_block_device().then(|| meta.rdev()))

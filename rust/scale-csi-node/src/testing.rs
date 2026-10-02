@@ -81,11 +81,19 @@ impl HostState {
     }
 }
 
+/// The fake device number of a device name.
+pub fn fake_device_number(name: &str) -> u64 {
+    name.bytes()
+        .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
+}
+
 impl FakeHost {
     /// A fake device number: a bind target reports its device's; a device
-    /// path reports one derived from its name.
+    /// path (symlinks resolved, as stat(2) does) reports one derived from its
+    /// name, or a stale one while the fake iSCSI initiator still models the
+    /// previous disk's node under that name.
     pub fn device_number(&self, path: &str) -> Option<u64> {
-        let host = self.0.lock().unwrap();
+        let mut host = self.0.lock().unwrap();
         let device = match host.mounts.get(path) {
             // As a hung server would: the agent must never stat one.
             Some((_, fs, _)) if fs.starts_with("nfs") => panic!("stat of the network mount {path}"),
@@ -94,15 +102,21 @@ impl FakeHost {
                 .and_then(|s| s.strip_suffix(']'))
                 .unwrap_or(source)
                 .to_string(),
-            _ => path.to_string(),
+            _ => std::fs::canonicalize(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned()),
         };
         let name = std::path::Path::new(&device).file_name()?.to_str()?;
         let is_device =
             name.starts_with("ublkb") || name.starts_with("nvme") || name.starts_with("sd") || name.starts_with("dm-");
-        is_device.then(|| {
-            name.bytes()
-                .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
-        })
+        if !is_device {
+            return None;
+        }
+        if let Some(stale) = host.iscsi.as_mut().and_then(|f| f.stale.get_mut(name))
+            && *stale > 0
+        {
+            *stale -= 1;
+            return Some(fake_device_number(name) ^ 0xff);
+        }
+        Some(fake_device_number(name))
     }
 
     pub fn mount(&self, target: &str, source: &str, fs: &str) {

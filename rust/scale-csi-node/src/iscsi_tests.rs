@@ -13,7 +13,9 @@ use crate::iscsi::{
     Credentials, InfoError, Iscsi, Session, canonical_portal, go_duration, node_record_files, normalize_scsi_wwid,
     parse_sessions, same_portal, set_record_param, split_portal, write_node_record_secret,
 };
+use crate::iscsi_testing::sysfs_dev;
 use crate::mount::Runner;
+use crate::testing::fake_device_number;
 
 /// (exit code, output, wedged)
 type Reply = (Option<i32>, &'static str, bool);
@@ -57,7 +59,15 @@ fn initiator(script: &Arc<Script>, root: &Path) -> Iscsi {
     iscsi.dev = root.join("dev");
     iscsi.node_db_roots = vec![root.join("etc-iscsi"), root.join("var-lib-iscsi")];
     iscsi.multipathd_sockets = vec![root.join("run/multipathd.sock")];
+    iscsi.device_number = Arc::new(|path: &str| Ok(Some(node_number(path)?)));
     iscsi
+}
+
+/// stat(2) of a fixture node: it exists, and (symlinks resolved) carries the
+/// fake number of its name. Fixtures cannot mknod.
+fn node_number(path: &str) -> std::io::Result<u64> {
+    let resolved = std::fs::canonicalize(path)?;
+    Ok(fake_device_number(&resolved.file_name().unwrap().to_string_lossy()))
 }
 
 /// Generated from Go parseISCSISessionLines.
@@ -641,6 +651,7 @@ fn device_identity_through_sysfs() {
         }
         touch(&sys.join("block").join(dm).join("dm/uuid"));
         std::fs::write(sys.join("block").join(dm).join("dm/uuid"), uuid).unwrap();
+        std::fs::write(sys.join("block").join(dm).join("dev"), sysfs_dev(dm)).unwrap();
         touch(&dev.join(dm));
     }
     assert_eq!(iscsi.info_from_device(&dev_path("dm-0"), &listed).unwrap().1, "iqn.x:t");
@@ -735,6 +746,8 @@ fn devices_are_found_by_session() {
     for (host, session, disk, iqn) in [(3, 4, "sdb", "iqn.x:a"), (5, 6, "sdc", "iqn.x:b")] {
         std::fs::create_dir_all(sys.join(format!("class/iscsi_host/host{host}/device/session{session}"))).unwrap();
         std::fs::create_dir_all(sys.join(format!("class/scsi_device/{host}:0:0:0/device/block/{disk}"))).unwrap();
+        touch(&sys.join("class/block").join(disk).join("dev"));
+        std::fs::write(sys.join("class/block").join(disk).join("dev"), sysfs_dev(disk)).unwrap();
         touch(&dev.join(disk));
         touch(&sys.join(format!("class/iscsi_session/session{session}/targetname")));
         std::fs::write(
@@ -750,4 +763,77 @@ fn devices_are_found_by_session() {
     assert!(iscsi.find_device_for_session("9", 0).is_err());
     assert_eq!(iscsi.find_device_by_iqn("iqn.x:b", 0).unwrap(), dev_path("sdc"));
     assert!(iscsi.find_device_by_iqn("iqn.x:none", 0).is_err());
+}
+
+/// Right after a logout and a new login, sysfs names the new disk while /dev
+/// can still hold the previous disk's node of that name: a node whose number
+/// is not the kernel's, or that is not a block device, is not the device.
+#[test]
+fn a_stale_dev_node_is_not_the_device() {
+    let root = tempfile::tempdir().unwrap();
+    let mut iscsi = initiator(&Script::new(vec![]), root.path());
+    let sys = root.path().join("sys");
+    let dev = root.path().join("dev");
+    std::fs::create_dir_all(sys.join("class/iscsi_host/host3/device/session4")).unwrap();
+    std::fs::create_dir_all(sys.join("class/scsi_device/3:0:0:0/device/block/sdb")).unwrap();
+    touch(&sys.join("class/iscsi_session/session4/targetname"));
+    std::fs::write(sys.join("class/iscsi_session/session4/targetname"), "iqn.x:a\n").unwrap();
+    touch(&sys.join("class/block/sdb/dev"));
+    std::fs::write(sys.join("class/block/sdb/dev"), sysfs_dev("sdb")).unwrap();
+    touch(&dev.join("sdb"));
+    let sdb = dev.join("sdb").to_string_lossy().into_owned();
+    assert_eq!(iscsi.find_device_for_session("4", 0).unwrap(), sdb);
+
+    iscsi.device_number = Arc::new(|path: &str| Ok(Some(node_number(path)? ^ 0xff)));
+    assert!(
+        iscsi.find_device_for_session("4", 0).is_err(),
+        "the previous disk's node"
+    );
+    assert!(
+        iscsi.find_device_by_iqn("iqn.x:a", 0).is_err(),
+        "the previous disk's node"
+    );
+    iscsi.device_number = Arc::new(|_: &str| Ok(None));
+    assert!(iscsi.find_device_for_session("4", 0).is_err(), "not a block device");
+    iscsi.device_number = Arc::new(|path: &str| Ok(Some(node_number(path)?)));
+    std::fs::write(sys.join("class/block/sdb/dev"), "garbage\n").unwrap();
+    assert!(
+        iscsi.find_device_for_session("4", 0).is_err(),
+        "no readable sysfs number"
+    );
+    std::fs::write(sys.join("class/block/sdb/dev"), sysfs_dev("sdb")).unwrap();
+    assert_eq!(iscsi.find_device_by_iqn("iqn.x:a", 0).unwrap(), sdb);
+}
+
+/// A map rebuilt right after the previous one was flushed: sysfs names the new
+/// dm-3 while /dev/mapper/<name> still links to the old dm-2 node.
+#[test]
+fn a_stale_map_node_is_not_the_map() {
+    let root = tempfile::tempdir().unwrap();
+    let iscsi = initiator(&Script::new(vec![]), root.path());
+    let sys = root.path().join("sys");
+    let dev = root.path().join("dev");
+    touch(&sys.join("block/dm-3/dm/uuid"));
+    std::fs::write(sys.join("block/dm-3/dm/uuid"), "mpath-36589\n").unwrap();
+    std::fs::write(sys.join("block/dm-3/dm/name"), "mpatha\n").unwrap();
+    std::fs::write(sys.join("block/dm-3/dev"), sysfs_dev("dm-3")).unwrap();
+    touch(&dev.join("dm-2"));
+    std::fs::create_dir_all(dev.join("mapper")).unwrap();
+    std::os::unix::fs::symlink("../dm-2", dev.join("mapper/mpatha")).unwrap();
+    let dev_path = |n: &str| dev.join(n).to_string_lossy().into_owned();
+
+    assert!(
+        iscsi.find_multipath_device("naa.6589").is_err(),
+        "neither the stale link nor a missing dm-3 node is the map"
+    );
+    // The dm node appears before udev rewrites the link: the node is the map.
+    touch(&dev.join("dm-3"));
+    assert_eq!(iscsi.find_multipath_device("naa.6589").unwrap(), dev_path("dm-3"));
+    // Once udev points the link at the map, the friendly path wins again.
+    std::fs::remove_file(dev.join("mapper/mpatha")).unwrap();
+    std::os::unix::fs::symlink("../dm-3", dev.join("mapper/mpatha")).unwrap();
+    assert_eq!(
+        iscsi.find_multipath_device("naa.6589").unwrap(),
+        dev_path("mapper/mpatha")
+    );
 }

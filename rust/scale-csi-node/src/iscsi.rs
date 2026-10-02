@@ -35,6 +35,7 @@ use log::{debug, info, warn};
 use crate::exec::{Limits, Output};
 use crate::mount::Runner;
 use crate::nvme_addresses::join_host_port;
+use crate::service::{BlockDeviceNumber, block_device_number};
 
 /// `ISCSI_ERR_SESS_EXISTS`: a `--login` whose session already exists.
 pub const EXIT_SESSION_EXISTS: i32 = 15;
@@ -161,6 +162,8 @@ pub struct Iscsi {
     pub discovery_retry_delay: Duration,
     /// How often a device wait re-lists the sessions.
     pub session_refresh: Duration,
+    /// stat(2) of a block device's number (the tests supply their own).
+    pub device_number: BlockDeviceNumber,
     portals: Mutex<PortalState>,
 }
 
@@ -180,6 +183,7 @@ impl Iscsi {
             discovery_cache: Duration::from_secs(30),
             discovery_retry_delay: Duration::from_secs(2),
             session_refresh: Duration::from_secs(1),
+            device_number: Arc::new(block_device_number),
             portals: Mutex::default(),
         }
     }
@@ -1207,12 +1211,35 @@ impl Iscsi {
                 .join("device/block");
             for name in sorted_names(&block, |_| true) {
                 let device = self.dev.join(&name);
-                if device.exists() {
+                if self.is_current_node(&device, &self.sysfs.join("class/block").join(&name).join("dev")) {
                     return Ok(device.to_string_lossy().into_owned());
                 }
             }
         }
         bail!("device for session {number} not found")
+    }
+
+    /// Whether `device` is a block device node with the number the kernel
+    /// gives the disk (`sysfs_dev` holds `MAJ:MIN`). Right after a logout and
+    /// a new login to the same target, sysfs already names the new disk while
+    /// /dev can still hold the previous disk's node of that name (devtmpfs and
+    /// udev removal lag), or a stale node with no fresh one yet; opening it
+    /// fails with ENXIO/ENODEV, so a device wait keeps polling until the node
+    /// matches. One stat and one small sysfs read.
+    fn is_current_node(&self, device: &Path, sysfs_dev: &Path) -> bool {
+        let Ok(Some(number)) = (self.device_number)(&device.to_string_lossy()) else {
+            return false;
+        };
+        let Ok(want) = std::fs::read_to_string(sysfs_dev) else {
+            return false;
+        };
+        let Some((major, minor)) = want.trim().split_once(':') else {
+            return false;
+        };
+        match (major.parse::<u32>(), minor.parse::<u32>()) {
+            (Ok(major), Ok(minor)) => libc::major(number) == major && libc::minor(number) == minor,
+            _ => false,
+        }
     }
 
     /// The SCSI identifier dm-multipath keys its map by.
@@ -1252,18 +1279,21 @@ impl Iscsi {
                 Ok(uuid) if uuid.trim() == want => {}
                 _ => continue,
             }
+            // A just-built map can sit beside the previous map's /dev/mapper
+            // link or dm node (removal lags): either must carry its number.
+            let number = dir.join("dev");
             if let Ok(name) = std::fs::read_to_string(dir.join("dm/name")) {
                 let name = name.trim();
                 // A single path component only: never escape /dev/mapper.
                 if !name.is_empty() && !name.contains('/') && name != "." && name != ".." {
                     let mapper = self.dev.join("mapper").join(name);
-                    if mapper.exists() {
+                    if self.is_current_node(&mapper, &number) {
                         return Ok(mapper.to_string_lossy().into_owned());
                     }
                 }
             }
             let device = self.dev.join(&dm);
-            if device.exists() {
+            if self.is_current_node(&device, &number) {
                 return Ok(device.to_string_lossy().into_owned());
             }
         }

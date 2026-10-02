@@ -12,7 +12,8 @@ use std::time::Duration;
 use crate::exec::Output;
 use crate::iscsi::{Iscsi, same_portal, set_record_param, split_portal};
 use crate::mount::Runner;
-use crate::testing::{HOST_NQN, Node, node};
+use crate::service::BlockDeviceNumber;
+use crate::testing::{HOST_NQN, Node, fake_device_number, node};
 
 pub const PORTAL: &str = "192.0.2.30:3260";
 pub const PORTAL_B: &str = "192.0.2.31:3260";
@@ -71,6 +72,12 @@ pub struct FakeIscsi {
     pub multipathd_calls: Vec<String>,
     /// Another LUN identity answers on this portal (a misconfigured portal).
     pub foreign_wwid_on: Option<String>,
+    /// For this many stats after a login, each new disk's (and dm map's)
+    /// /dev node reports a stale device number: the node the previous disk of
+    /// that name left behind, before devtmpfs/udev catch up.
+    pub stale_polls: u32,
+    /// Device name -> stats left that report the stale number.
+    pub stale: BTreeMap<String, u32>,
     pub discoveries: usize,
     next_session: u32,
     next_host: u32,
@@ -99,6 +106,12 @@ fn disk_name(n: u32) -> String {
         }
     }
     format!("sd{name}")
+}
+
+/// The sysfs `dev` file ("MAJ:MIN") of a fake device (FakeHost::device_number).
+pub fn sysfs_dev(name: &str) -> String {
+    let number = fake_device_number(name);
+    format!("{}:{}\n", libc::major(number), libc::minor(number))
 }
 
 fn write(path: &Path, content: &str) {
@@ -132,6 +145,8 @@ impl FakeIscsi {
             multipath_resize_reply: None,
             multipathd_calls: Vec::new(),
             foreign_wwid_on: None,
+            stale_polls: 0,
+            stale: BTreeMap::new(),
             discoveries: 0,
             next_session: 1,
             next_host: 2,
@@ -215,7 +230,11 @@ impl FakeIscsi {
             std::fs::create_dir_all(self.sys.join("block").join(&disk)).unwrap();
             std::os::unix::fs::symlink(&scsi, self.sys.join("block").join(&disk).join("device")).unwrap();
             write(&self.sys.join("class/block").join(&disk).join("size"), "2097152\n");
+            write(&self.sys.join("class/block").join(&disk).join("dev"), &sysfs_dev(&disk));
             write(&self.dev.join(&disk), "");
+            if self.stale_polls > 0 {
+                self.stale.insert(disk.clone(), self.stale_polls);
+            }
             disks.insert(lun, disk);
         }
         self.sessions.push(FakeSession {
@@ -250,7 +269,11 @@ impl FakeIscsi {
                     let dir = self.sys.join("block").join(&dm);
                     write(&dir.join("dm/uuid"), &format!("mpath-3{wwid}\n"));
                     write(&dir.join("dm/name"), &format!("{name}\n"));
+                    write(&dir.join("dev"), &sysfs_dev(&dm));
                     write(&self.dev.join(&dm), "");
+                    if self.stale_polls > 0 {
+                        self.stale.insert(dm.clone(), self.stale_polls);
+                    }
                     std::fs::create_dir_all(self.dev.join("mapper")).unwrap();
                     std::os::unix::fs::symlink(format!("../{dm}"), self.dev.join("mapper").join(&name)).unwrap();
                     dm
@@ -459,7 +482,12 @@ pub fn iscsi_node(config: &str) -> Node {
 pub fn iscsi_node_with(config: &str, tweak: impl FnOnce(&mut FakeIscsi)) -> Node {
     let n = node(config, HOST_NQN, |state| {
         let dir = state.host.sysfs.parent().unwrap().to_path_buf();
-        state.iscsi = fake_initiator(&dir, &state.host.dev_dir, state.mounter.runner.clone());
+        state.iscsi = fake_initiator(
+            &dir,
+            &state.host.dev_dir,
+            state.mounter.runner.clone(),
+            state.host.device_number.clone(),
+        );
     });
     n.daemon.state.lock().unwrap().forbidden = true;
     let dev = n.daemon.dev_dir.path().to_path_buf();
@@ -474,8 +502,13 @@ pub fn iscsi_node_with(config: &str, tweak: impl FnOnce(&mut FakeIscsi)) -> Node
 }
 
 /// The agent's initiator pointed at the fake's sysfs, /dev and node database.
-pub fn fake_initiator(n_dir: &Path, dev: &Path, runner: Arc<dyn Runner>) -> Iscsi {
+pub fn fake_initiator(n_dir: &Path, dev: &Path, runner: Arc<dyn Runner>, device_number: BlockDeviceNumber) -> Iscsi {
     let mut iscsi = Iscsi::new(runner, Duration::from_secs(10));
+    // stat(2) fails on a missing node; the host's fake numbers the rest.
+    iscsi.device_number = Arc::new(move |path: &str| {
+        std::fs::metadata(path)?;
+        device_number(path)
+    });
     iscsi.sysfs = n_dir.join("sys");
     iscsi.dev = dev.to_path_buf();
     iscsi.node_db_roots = vec![n_dir.join("etc-iscsi"), n_dir.join("var-lib-iscsi")];
