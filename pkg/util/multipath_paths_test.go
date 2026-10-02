@@ -17,11 +17,12 @@ func TestMultipathPathsReadsTheMapNameAndItsPaths(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(block, "dm-3/dm/name"), []byte("mpatha\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(block, "dm-3/dm/uuid"), []byte("mpath-36589cfc000000a1b\n"), 0o600))
-	name, paths, isMap, err := multipathPathsIn("/dev/dm-3", block, "/dev")
+	devRoot := filepath.Join(sys, "dev")
+	name, paths, isMap, err := multipathPathsIn("/dev/dm-3", block, devRoot)
 	require.NoError(t, err)
 	assert.True(t, isMap)
 	assert.Equal(t, "mpatha", name)
-	assert.Equal(t, []string{"/dev/sdb", "/dev/sdc"}, paths)
+	assert.Equal(t, []string{filepath.Join(devRoot, "sdb"), filepath.Join(devRoot, "sdc")}, paths)
 
 	_, _, isMap, err = multipathPathsIn("/dev/sdb", block, "/dev")
 	require.NoError(t, err)

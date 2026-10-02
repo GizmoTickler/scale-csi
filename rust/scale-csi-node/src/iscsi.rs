@@ -855,7 +855,12 @@ impl Iscsi {
             return Ok(None);
         }
         let dir = self.sysfs.join("block").join(name);
-        if !std::fs::read_to_string(dir.join("dm/uuid")).is_ok_and(|u| u.trim().starts_with("mpath-")) {
+        let uuid = match std::fs::read_to_string(dir.join("dm/uuid")) {
+            Ok(uuid) => uuid,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => bail!("failed to read the dm UUID of {device}: {e}"),
+        };
+        if !uuid.trim().starts_with("mpath-") {
             return Ok(None);
         }
         let map = std::fs::read_to_string(dir.join("dm/name"))

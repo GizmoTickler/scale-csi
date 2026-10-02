@@ -1191,7 +1191,10 @@ func multipathPathsIn(devicePath, sysBlockRoot, devRoot string) (mapName string,
 	// Only a dm-multipath map (dm UUID mpath-<wwid>) is a map; any other dm
 	// device (a kpartx partition, an LVM volume) is a single device.
 	uuid, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "uuid"))
-	if readErr != nil || !strings.HasPrefix(strings.TrimSpace(string(uuid)), "mpath-") {
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return "", nil, false, fmt.Errorf("failed to read the dm UUID of %s: %w", devicePath, readErr)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(string(uuid)), "mpath-") {
 		return "", nil, false, nil
 	}
 	name, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "name"))
