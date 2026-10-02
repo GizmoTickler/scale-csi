@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestParseSubsysJSON(t *testing.T) {
@@ -283,6 +284,8 @@ func TestFindNVMeNamespaceForControllerDoesNotAssumeNamespaceOne(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(classRoot, "nvme7", "nvme7n9"), 0o750))
 	require.NoError(t, os.MkdirAll(devRoot, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "nvme7n9"), nil, 0o600))
+	writeSysfsDev(t, filepath.Join(classRoot, "nvme7", "nvme7n9"), unix.Mkdev(259, 9))
+	fixedBlockDeviceNumbers(t, map[string]uint64{"nvme7n9": unix.Mkdev(259, 9)})
 
 	devicePath, err := findNVMeNamespaceForController("nvme7", classRoot, devRoot)
 	require.NoError(t, err)
