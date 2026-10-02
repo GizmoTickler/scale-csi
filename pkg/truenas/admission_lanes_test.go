@@ -25,9 +25,11 @@ func TestAdmissionLaneForMethod(t *testing.T) {
 		"sharing.nfs.update":                   laneWrite,
 		"service.reload":                       laneWrite,
 		"iscsi.target.create":                  laneWrite,
-		"nvmet.host_subsys.create":             laneWrite,
-		"nvmet.port_subsys.delete":             laneWrite,
-		"nvmet.subsys.update":                  laneWrite,
+		// Waits on a job, which may be a write: not a read.
+		"core.job_wait":            laneWrite,
+		"nvmet.host_subsys.create": laneWrite,
+		"nvmet.port_subsys.delete": laneWrite,
+		"nvmet.subsys.update":      laneWrite,
 	} {
 		assert.Equal(t, want, laneForMethod(method), method)
 	}

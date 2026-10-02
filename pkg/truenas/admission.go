@@ -102,7 +102,7 @@ func isReadAPIMethod(method string) bool {
 	}
 	switch method {
 	case "pool.dataset.attachments", "pool.dataset.processes", "pool.dataset.encryption_summary",
-		"pool.dataset.recommended_zvol_blocksize", "zfs.resource.snapshot.holds", "filesystem.getacl", "core.job_wait":
+		"pool.dataset.recommended_zvol_blocksize", "zfs.resource.snapshot.holds", "filesystem.getacl":
 		return true
 	}
 	return false
