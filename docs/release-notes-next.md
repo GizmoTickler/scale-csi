@@ -13,7 +13,7 @@ controller's own request-duration metrics on a TrueNAS 26.0 system
 `pool.dataset.query` 0.29 s), a parent-wide dataset query at 5.3 ms per row,
 and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
 
-| | v1.23.0 | v1.24.0 |
+| | v1.23.1 | v1.24.0 |
 |---|---|---|
 | DeleteVolume, NFS, no snapshots, 30 volumes: calls; TrueNAS time | 8; 3.2 s | 5; 1.5 s |
 | ... at 300 volumes | 8; 4.6 s | 5; 1.5 s |
@@ -94,17 +94,23 @@ and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
   without its dataset field; the dataset is now taken from the snapshot's
   name. An empty listing reads as "no snapshots" to DeleteVolume.
 
-### Rolling back to v1.23.0
+### Rolling back to v1.23.1
 
 Nothing to undo on TrueNAS. If your values set `zfs.observeBusyBeforeDelete`
 to `always`, `on-failure` or `never`, set it to `true` or `false` (or remove
-it) before rolling back: the v1.23.0 chart's schema accepts only a boolean,
-and a v1.23.0 controller reading a mode name refuses to start. The default
+it) before rolling back: the v1.23.1 chart's schema accepts only a boolean,
+and a v1.23.1 controller reading a mode name refuses to start. The default
 render does not contain the key. Rolled back, the busy scans run before every
 delete again.
 
+## v1.23.1 — v1.23.0, released
 
-## v1.23.0 (draft) — snapshots and publishes no longer turn each other away
+v1.23.0's tag build failed on a race in one admission test (the mock server
+counted a finished query as in flight), so v1.23.0 published no images or
+chart. v1.23.1 is the same controller with that test fixed; everything in
+the v1.23.0 section below ships in v1.23.1.
+
+## v1.23.0 — snapshots and publishes no longer turn each other away
 
 Nothing to configure. Three changes to how the controller schedules its own
 work, and one fix to ListVolumes.

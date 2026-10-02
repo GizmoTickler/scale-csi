@@ -314,7 +314,7 @@ func TestDocsCarryNoRealApplianceIdentity(t *testing.T) {
 
 // TestReleaseNotesNextTitlesThisRelease catches the stalest kind of release
 // note: the "(next)" file still titled with the version that already shipped.
-// v1.10.6 through v1.23.0 are tagged and have their own
+// v1.10.6 through v1.23.1 are tagged and have their own
 // sections further down the same file.
 func TestReleaseNotesNextTitlesThisRelease(t *testing.T) {
 	path := filepath.Join(repoRoot(t), "docs", "release-notes-next.md")
@@ -332,7 +332,7 @@ func TestReleaseNotesNextTitlesThisRelease(t *testing.T) {
 	}
 	// A version that already has a released section below cannot also be the
 	// "next" one.
-	for _, shipped := range []string{"v1.10.6", "v1.11.0", "v1.11.1", "v1.11.2", "v1.12.0", "v1.13.0", "v1.13.1", "v1.14.0", "v1.15.0", "v1.16.0", "v1.17.0", "v1.18.0", "v1.19.0", "v1.20.0", "v1.21.0", "v1.22.0", "v1.23.0"} {
+	for _, shipped := range []string{"v1.10.6", "v1.11.0", "v1.11.1", "v1.11.2", "v1.12.0", "v1.13.0", "v1.13.1", "v1.14.0", "v1.15.0", "v1.16.0", "v1.17.0", "v1.18.0", "v1.19.0", "v1.20.0", "v1.21.0", "v1.22.0", "v1.23.0", "v1.23.1"} {
 		if strings.Contains(title, shipped) {
 			t.Errorf("release notes title %q names %s, which is tagged and has its own section in this file", title, shipped)
 		}
