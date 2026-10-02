@@ -2,6 +2,7 @@ package truenas
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 )
@@ -64,17 +65,70 @@ func operationStartOf(ctx context.Context, fallback time.Time) time.Time {
 // rest.
 const agingStep = 2 * time.Second
 
+// admissionLane is the kind of request a slot is for. TrueNAS's middleware
+// serves writes largely one at a time, so a burst of writes holding every
+// slot used to keep the reads that publish and unpublish start with queued
+// behind them. Writes now hold at most writeCapacity of the slots, which
+// leaves the rest to reads; among the writes, nvmet writes (each one reloads
+// the kernel nvmet target on the appliance) hold at most one, so this client
+// never sends two of them at once.
+type admissionLane int
+
+const (
+	laneRead admissionLane = iota
+	laneWrite
+	laneNVMetWrite
+)
+
+// defaultWriteCapacity is how many slots writes may hold at once.
+const defaultWriteCapacity = 4
+
+// nvmetWriteCapacity is how many slots nvmet writes may hold at once.
+const nvmetWriteCapacity = 1
+
+// laneForMethod classifies a middleware method. A method not known to be a
+// read is a write.
+func laneForMethod(method string) admissionLane {
+	if isReadAPIMethod(method) {
+		return laneRead
+	}
+	if strings.HasPrefix(method, "nvmet.") {
+		return laneNVMetWrite
+	}
+	return laneWrite
+}
+
+// isReadAPIMethod is isIdempotentAPIMethod widened by the read-only methods
+// whose names do not say so. It only places a request in a lane; it never
+// decides a retry.
+func isReadAPIMethod(method string) bool {
+	if isIdempotentAPIMethod(method) {
+		return true
+	}
+	switch method {
+	case "pool.dataset.attachments", "pool.dataset.processes", "pool.dataset.encryption_summary",
+		"pool.dataset.recommended_zvol_blocksize", "zfs.resource.snapshot.holds", "filesystem.getacl", "core.job_wait":
+		return true
+	}
+	return false
+}
+
 // admissionGate is a counting semaphore whose waiters are admitted by
 // (aged priority, operation start, arrival) instead of first come, first
-// served.
+// served, among the waiters whose lane has room.
 type admissionGate struct {
 	mu       sync.Mutex
 	capacity int
 	inUse    int
-	seq      uint64
-	waiting  []*admissionWaiter
-	now      func() time.Time
-	metrics  AdmissionMetrics
+	// writeCapacity bounds the slots held by writes (nvmet ones included);
+	// writes and nvmetWrites count them.
+	writeCapacity int
+	writes        int
+	nvmetWrites   int
+	seq           uint64
+	waiting       []*admissionWaiter
+	now           func() time.Time
+	metrics       AdmissionMetrics
 }
 
 // AdmissionMetrics receives the gate's observations; either function may be nil.
@@ -101,6 +155,7 @@ func (g *admissionGate) reportQueuedLocked(p Priority) {
 }
 
 type admissionWaiter struct {
+	lane     admissionLane
 	priority Priority
 	start    time.Time
 	enqueued time.Time
@@ -116,10 +171,69 @@ func newAdmissionGate(capacity int) *admissionGate {
 }
 
 func newAdmissionGateWithMetrics(capacity int, metrics AdmissionMetrics) *admissionGate {
+	return newAdmissionGateWithLanes(capacity, defaultWriteCapacity, metrics)
+}
+
+// newAdmissionGateWithLanes is a gate whose writes hold at most
+// writeCapacity slots. Reads keep at least one slot of their own when there
+// are two or more.
+func newAdmissionGateWithLanes(capacity, writeCapacity int, metrics AdmissionMetrics) *admissionGate {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &admissionGate{capacity: capacity, now: time.Now, metrics: metrics}
+	if writeCapacity < 1 {
+		writeCapacity = defaultWriteCapacity
+	}
+	if capacity > 1 && writeCapacity > capacity-1 {
+		writeCapacity = capacity - 1
+	}
+	if writeCapacity > capacity {
+		writeCapacity = capacity
+	}
+	return &admissionGate{capacity: capacity, writeCapacity: writeCapacity, now: time.Now, metrics: metrics}
+}
+
+// laneHasRoomLocked is whether a request of lane may take a slot now.
+func (g *admissionGate) laneHasRoomLocked(lane admissionLane) bool {
+	if g.inUse >= g.capacity {
+		return false
+	}
+	switch lane {
+	case laneWrite:
+		return g.writes < g.writeCapacity
+	case laneNVMetWrite:
+		return g.writes < g.writeCapacity && g.nvmetWrites < nvmetWriteCapacity
+	default:
+		return true
+	}
+}
+
+func (g *admissionGate) takeLocked(lane admissionLane) {
+	g.inUse++
+	switch lane {
+	case laneWrite:
+		g.writes++
+	case laneNVMetWrite:
+		g.writes++
+		g.nvmetWrites++
+	}
+}
+
+func (g *admissionGate) putLocked(lane admissionLane) {
+	if g.inUse <= 0 {
+		panic("truenas: request slot released without being acquired")
+	}
+	g.inUse--
+	switch lane {
+	case laneWrite:
+		g.writes--
+	case laneNVMetWrite:
+		g.writes--
+		g.nvmetWrites--
+	}
+	if g.writes < 0 || g.nvmetWrites < 0 {
+		panic("truenas: write slot released without being acquired")
+	}
 }
 
 // rank is the waiter's class after aging: one class higher per agingStep
@@ -145,9 +259,20 @@ func (w *admissionWaiter) before(other *admissionWaiter, now time.Time) bool {
 	return w.seq < other.seq
 }
 
-// acquire waits for a slot. It returns ctx's error if ctx ends first, holding
-// no slot; a slot granted to a caller that has meanwhile given up is handed on.
+// acquire waits for a read slot (acquireLane).
 func (g *admissionGate) acquire(ctx context.Context) error {
+	return g.acquireLane(ctx, laneRead)
+}
+
+// release releases a read slot.
+func (g *admissionGate) release() {
+	g.releaseLane(laneRead)
+}
+
+// acquireLane waits for a slot in lane. It returns ctx's error if ctx ends
+// first, holding no slot; a slot granted to a caller that has meanwhile
+// given up is handed on.
+func (g *admissionGate) acquireLane(ctx context.Context, lane admissionLane) error {
 	// An operation that has already given up never takes a slot.
 	if err := ctx.Err(); err != nil {
 		return err
@@ -156,6 +281,7 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 	now := g.now()
 	g.seq++
 	w := &admissionWaiter{
+		lane:     lane,
 		priority: priorityOf(ctx),
 		start:    operationStartOf(ctx, now),
 		enqueued: now,
@@ -170,7 +296,7 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 	select {
 	case <-w.ready:
 		if err := ctx.Err(); err != nil {
-			g.release()
+			g.releaseLane(lane)
 			return err
 		}
 		// Only a slot the caller keeps counts as a wait.
@@ -182,7 +308,7 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 		g.mu.Lock()
 		if w.granted {
 			// Granted while giving up: hand the slot on.
-			g.inUse--
+			g.putLocked(lane)
 			g.dispatchLocked()
 		} else {
 			g.removeLocked(w)
@@ -193,33 +319,37 @@ func (g *admissionGate) acquire(ctx context.Context) error {
 	}
 }
 
-func (g *admissionGate) release() {
+func (g *admissionGate) releaseLane(lane admissionLane) {
 	g.mu.Lock()
-	if g.inUse <= 0 {
-		g.mu.Unlock()
-		panic("truenas: request slot released without being acquired")
-	}
-	g.inUse--
+	defer g.mu.Unlock()
+	g.putLocked(lane)
 	g.dispatchLocked()
-	g.mu.Unlock()
 }
 
-// dispatchLocked grants free slots to the best waiters.
+// dispatchLocked grants free slots to the best waiters whose lane has room.
+// A waiter whose lane is full does not hold back one behind it in another
+// lane: a queued write never delays a read while a read slot is free.
 func (g *admissionGate) dispatchLocked() {
 	if g.inUse >= g.capacity || len(g.waiting) == 0 {
 		return
 	}
 	now := g.now()
 	for g.inUse < g.capacity && len(g.waiting) > 0 {
-		best := 0
-		for i := 1; i < len(g.waiting); i++ {
-			if g.waiting[i].before(g.waiting[best], now) {
+		best := -1
+		for i, candidate := range g.waiting {
+			if !g.laneHasRoomLocked(candidate.lane) {
+				continue
+			}
+			if best < 0 || candidate.before(g.waiting[best], now) {
 				best = i
 			}
 		}
+		if best < 0 {
+			return
+		}
 		w := g.waiting[best]
 		g.waiting = append(g.waiting[:best], g.waiting[best+1:]...)
-		g.inUse++
+		g.takeLocked(w.lane)
 		w.granted = true
 		w.grantedAt = now
 		close(w.ready)
