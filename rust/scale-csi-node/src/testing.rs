@@ -680,6 +680,7 @@ impl FakeKernel {
         std::fs::write(dir.join("transport"), "tcp\n").unwrap();
         std::fs::write(dir.join("address"), format!("traddr={address},trsvcid=4420\n")).unwrap();
         std::fs::write(dir.join("fast_io_fail_tmo"), format!("{fast_io_fail_tmo}\n")).unwrap();
+        std::fs::write(dir.join("state"), format!("{state}\n")).unwrap();
         if !self.subsystems.contains_key(nqn) {
             let index = self.next_subsystem;
             self.next_subsystem += 1;
@@ -696,6 +697,10 @@ impl FakeKernel {
             }
             self.subsystems.insert(nqn.to_string(), (index, Vec::new()));
         }
+        // The subsystem links each of its controllers by name, as in the kernel.
+        let index = self.subsystems[nqn].0;
+        let subsystem = self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}"));
+        std::os::unix::fs::symlink(&dir, subsystem.join(&controller)).unwrap();
         let entry = self.subsystems.get_mut(nqn).unwrap();
         entry
             .1
@@ -711,8 +716,9 @@ impl FakeKernel {
         let (index, paths) = self.subsystems.get_mut(nqn).unwrap();
         assert!(paths.len() > 1, "a surviving path is needed");
         let (founder, _, _) = paths.remove(0);
-        std::fs::remove_dir_all(self.sys.join("class/nvme").join(founder)).unwrap();
+        std::fs::remove_dir_all(self.sys.join("class/nvme").join(&founder)).unwrap();
         let subsystem = self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}"));
+        std::fs::remove_file(subsystem.join(&founder)).unwrap();
         let namespace = format!("nvme{index}n1");
         let head = subsystem.join(&namespace);
         std::os::unix::fs::symlink(&subsystem, head.join("device")).unwrap();
