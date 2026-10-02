@@ -156,6 +156,8 @@ type ClientInterface interface {
 	NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
 	NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
 	NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error)
+	NVMeoFHostSubsysList(ctx context.Context) ([]*NVMeoFHostSubsys, error)
+	NVMeoFHostList(ctx context.Context) ([]*NVMeoFHost, error)
 	NVMeoFHostSubsysDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...NVMeoFSubsystemCreateOptions) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error)
