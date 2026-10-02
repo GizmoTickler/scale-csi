@@ -1,5 +1,52 @@
 # Release notes — v1.17.0 (next)
 
+## v1.22.0 (draft) — a restart of seconds, a drain that does not wait for it
+
+Nothing to configure. Startup with strict fencing, a drain that overlaps a
+controller restart, and ListVolumes all cost less. Times below are from an
+in-process model (the TrueNAS mock with per-call latencies calibrated on
+nas01), not from a run on hardware: strict fencing, NVMe-oF with four
+portals, records in Kubernetes.
+
+| | 30 volumes | 300 | 1,000 |
+|---|---|---|---|
+| Restart, everything in place | 1.4 s → 0.3 s | 13.7 s → 1.1 s | 50 s → 3.1 s |
+| 30-volume drain overlapping a restart (10 moves at 30 volumes) | 15.9 s → 6.1 s | 66 s → 18.2 s | 131 s → 18.4 s |
+
+- **Per-volume readiness for publishes.** With strict fencing a
+  ControllerPublishVolume no longer waits until every attached volume in the
+  cluster has converged. Once startup has taken its VolumeAttachment
+  snapshot, a publish waits only for its own volume: a volume that has
+  converged, or had no VolumeAttachment in the snapshot, is published at
+  once; one still pending is converged by the publish itself, under the
+  volume lock, before the node is granted, and the publish returns
+  Unavailable if that fails. CreateVolume, ControllerExpandVolume and the
+  other provisioning calls still wait for global readiness, as before.
+- **A busy volume no longer fails the startup pass.** A startup worker waits
+  up to 15 seconds for a volume lock a live operation holds, and when some
+  volumes do fail, the retry re-runs only those.
+- **Diff-first startup.** A full startup pass reads the fleet once (the
+  attached volumes' datasets, by name, in up to four requests, and the nvmet
+  subsystem, namespace, port and host tables) and converges on its own, under
+  the volume lock, only the volumes whose records or backend differ from what
+  their attachments need. A restart with everything in place makes no
+  per-volume TrueNAS call and takes no volume lock. This covers strict
+  NVMe-oF volumes; NFS, iSCSI and additive mode take the per-volume path as
+  before. A volume a live operation touches while the diff reads is never
+  judged from those reads.
+- **ListVolumes from the listing.** A ListVolumes walk takes each entry's
+  capacity from the one managed-dataset listing it already makes and its
+  published nodes from the publication store (the VolumePublication cache),
+  instead of re-reading every page from TrueNAS. Only a dataset that still
+  carries ZFS publication records (not yet imported into Kubernetes) is
+  re-read. At 1,000 volumes a walk is 1 TrueNAS call instead of 11, and in
+  the benchmark 144 ms and 17.8 MB instead of 343 ms and 30.1 MB. The output
+  is unchanged.
+- **Concurrent listings share one read.** The startup readers that list every
+  managed dataset at about the same time (the stale-record sweep, the orphan
+  reconcile, the publication import, the unlock reconciler, ListVolumes) now
+  share one listing in flight; each gets its own copy.
+
 ## v1.20.0 — kernel NVMe-oF waits for the current /dev node
 
 - **Kernel NVMe-oF: a stage right after a handover waits for the current /dev
