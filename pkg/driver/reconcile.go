@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"sort"
@@ -1004,7 +1005,105 @@ func reconcileAge(now time.Time, creationUnix int64, minAge time.Duration) (time
 // the migration. See the LIVE-PROBE GATE on DatasetQueryByParent: the resource
 // shape is modeled, not yet live-verified, and this fallback is what makes the
 // migration safe to ship behind detection.
+//
+// Concurrent callers share one listing (managedListingCall): at startup the
+// stale-record sweep, the orphan reconcile, the publication import, the
+// unlock reconciler and the startup diff all list the parent within seconds of
+// each other, and each listing is the whole fleet, decoded. Every caller gets
+// its own copy of the datasets, so a caller may sort the slice or mirror a
+// write into a dataset without touching another caller's.
 func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset, error) {
+	return d.listAllManagedDatasetsSince(ctx, time.Time{})
+}
+
+// managedListingCall is one listing in flight, shared by every caller that
+// arrives while it runs.
+type managedListingCall struct {
+	started time.Time
+	done    chan struct{}
+	result  []*truenas.Dataset
+	err     error
+}
+
+// listAllManagedDatasetsSince is listAllManagedDatasets that joins only a
+// listing started at or after notBefore: a caller that needs a listing no
+// older than some point of its own (the startup diff) starts a new one rather
+// than take an older read.
+func (d *Driver) listAllManagedDatasetsSince(ctx context.Context, notBefore time.Time) ([]*truenas.Dataset, error) {
+	for {
+		d.managedListingMu.Lock()
+		call := d.managedListing
+		if call == nil || call.started.Before(notBefore) {
+			call = &managedListingCall{started: time.Now(), done: make(chan struct{})}
+			d.managedListing = call
+			d.managedListingMu.Unlock()
+			d.runManagedListing(ctx, call)
+			if call.err != nil {
+				return nil, call.err
+			}
+			return cloneDatasets(call.result), nil
+		}
+		d.managedListingMu.Unlock()
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if call.err != nil && ctx.Err() == nil &&
+			(errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded)) {
+			// The caller that ran the listing gave up; this one has not.
+			continue
+		}
+		if call.err != nil {
+			return nil, call.err
+		}
+		return cloneDatasets(call.result), nil
+	}
+}
+
+// runManagedListing runs call's listing and releases its waiters, however the
+// listing ends.
+func (d *Driver) runManagedListing(ctx context.Context, call *managedListingCall) {
+	defer func() {
+		d.managedListingMu.Lock()
+		if d.managedListing == call {
+			d.managedListing = nil
+		}
+		d.managedListingMu.Unlock()
+		close(call.done)
+	}()
+	call.err = errors.New("managed-dataset listing did not complete")
+	call.result, call.err = d.listAllManagedDatasetsOnce(ctx)
+}
+
+// cloneDatasets copies a listing for one caller: the slice, each dataset, and
+// its user-property maps. Property values are shared; no caller writes them.
+func cloneDatasets(datasets []*truenas.Dataset) []*truenas.Dataset {
+	out := make([]*truenas.Dataset, len(datasets))
+	for i, dataset := range datasets {
+		if dataset == nil {
+			continue
+		}
+		clone := *dataset
+		if dataset.UserProperties != nil {
+			clone.UserProperties = make(map[string]truenas.UserProperty, len(dataset.UserProperties))
+			for key, value := range dataset.UserProperties {
+				clone.UserProperties[key] = value
+			}
+		}
+		if dataset.LegacyCSIProperties != nil {
+			clone.LegacyCSIProperties = make(map[string]truenas.UserProperty, len(dataset.LegacyCSIProperties))
+			for key, value := range dataset.LegacyCSIProperties {
+				clone.LegacyCSIProperties[key] = value
+			}
+		}
+		out[i] = &clone
+	}
+	return out
+}
+
+// listAllManagedDatasetsOnce is one listing, not shared.
+func (d *Driver) listAllManagedDatasetsOnce(ctx context.Context) ([]*truenas.Dataset, error) {
 	resourceDatasets, err := d.truenasClient.DatasetQueryByParent(ctx, d.config.ZFS.DatasetParentName)
 	if err == nil {
 		managed := make([]*truenas.Dataset, 0, len(resourceDatasets))

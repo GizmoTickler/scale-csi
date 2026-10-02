@@ -141,6 +141,11 @@ type Driver struct {
 	snapshotPageCache     []*truenas.Snapshot
 	snapshotPageCacheTime time.Time
 
+	// managedListingMu guards managedListing, the managed-dataset listing in
+	// flight that concurrent callers share (listAllManagedDatasetsSince).
+	managedListingMu sync.Mutex
+	managedListing   *managedListingCall
+
 	// ListVolumes paging cache (P-3): the name-sorted managed-dataset listing
 	// fetched at the START of a paging walk (empty starting token), served to
 	// that walk's continuation pages within a short TTL. pool.dataset.query
