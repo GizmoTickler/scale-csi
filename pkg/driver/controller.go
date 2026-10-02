@@ -2345,8 +2345,10 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 // periodically. Exactly like ListSnapshots, a fresh walk (empty starting
 // token) freezes the name-sorted managed listing into a short-TTL cache and
 // continuation tokens slice that frozen view. Starting-token semantics
-// (integer offset) are unchanged. A volume this controller deleted since the
-// walk's listing is left out of its later pages, as a re-read would have.
+// (integer offset) are unchanged. A volume this controller deleted at or
+// after the moment the walk's listing began reading (a shared listing it
+// joined may have begun before the walk) is left out of the walk, as a
+// re-read would have left it out.
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	klog.V(4).Info("ListVolumes called")
 
@@ -2366,7 +2368,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		requestedLimit = 100
 	}
 
-	page, hasMore, err := d.managedVolumesForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
+	page, viewStart, hasMore, err := d.managedVolumesForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
@@ -2396,7 +2398,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 
 	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(page))
 	for _, listed := range page {
-		if d.listedVolumeDeleted(listed.name) {
+		if d.listedVolumeDeletedSince(listed.name, viewStart) {
 			continue
 		}
 		capacity := listed.capacity
@@ -2462,55 +2464,140 @@ type listedVolume struct {
 }
 
 // managedVolumesForListPage returns one page of the parent's managed volumes
-// for ListVolumes, plus whether more pages remain in the frozen view. A fresh
-// walk (empty starting token) fetches the full managed set once via
-// listAllManagedDatasets (path-scoped zfs.resource.query, paged
-// pool.dataset.query fallback — both filtered to PropManagedResource=="true"),
-// sorts it by name so offsets are stable across pages, and repopulates the
-// cache; a continuation token within the TTL is served from that frozen view,
-// so a walk can neither skip nor duplicate volumes however much create/delete
-// churn happens meanwhile. A continuation arriving after the TTL (or before
-// any walk populated the cache, e.g. across a controller restart) refetches —
-// offset tokens remain valid against the refreshed set exactly as they were
-// against the old per-page reads. The view keeps three small fields per
-// volume, not the listing's decoded datasets.
-func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []listedVolume, hasMore bool, err error) {
+// for ListVolumes, when the listing behind it began, and whether more pages
+// remain in the frozen view. A fresh walk (empty starting token) fetches the
+// full managed set once via listAllManagedDatasets (path-scoped
+// zfs.resource.query, paged pool.dataset.query fallback — both filtered to
+// PropManagedResource=="true"), sorts it by name so offsets are stable across
+// pages, and repopulates the cache; a continuation token within the TTL is
+// served from that frozen view, so a walk can neither skip nor duplicate
+// volumes however much create/delete churn happens meanwhile. A continuation
+// arriving after the TTL (or before any walk populated the cache, e.g. across
+// a controller restart) refetches — offset tokens remain valid against the
+// refreshed set exactly as they were against the old per-page reads. The view
+// keeps three small fields per volume, not the listing's decoded datasets.
+func (d *Driver) managedVolumesForListPage(ctx context.Context, freshWalk bool, limit, offset int) (page []listedVolume, viewStart time.Time, hasMore bool, err error) {
 	if !freshWalk {
 		d.volumePageCacheMu.Lock()
 		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
-			cached := d.volumePageCache
+			cached, cachedStart := d.volumePageCache, d.volumePageCacheStart
 			d.volumePageCacheMu.Unlock()
 			page, hasMore = sliceVolumeListPage(cached, limit, offset)
-			return page, hasMore, nil
+			return page, cachedStart, hasMore, nil
 		}
 		d.volumePageCacheMu.Unlock()
 	}
-	all, err := d.listAllManagedDatasets(ctx)
+	listing := d.beginVolumeListing()
+	defer d.endVolumeListing(listing)
+	all, start, err := d.listAllManagedDatasetsWithStart(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, time.Time{}, false, err
 	}
 	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
 	// pool.dataset.query fallback guarantees one.
-	volumes := make([]listedVolume, len(all))
-	for i, dataset := range all {
-		volumes[i] = listedVolume{
+	volumes := make([]listedVolume, 0, len(all))
+	for _, dataset := range all {
+		volumes = append(volumes, listedVolume{
 			name:       dataset.Name,
 			capacity:   d.listedCapacity(dataset),
 			recordKeys: datasetHasPublicationRecordKeys(dataset),
-		}
+		})
 	}
 	sort.Slice(volumes, func(i, j int) bool { return volumes[i].name < volumes[j].name })
 	d.volumePageCacheMu.Lock()
-	d.volumePageCache = volumes
-	d.volumePageCacheTime = time.Now()
-	d.volumePageDeleted = nil
+	// A volume DeleteVolume removed at or after the listing began may still
+	// be in its rows: leave it out of the view.
+	kept := volumes[:0]
+	for _, volume := range volumes {
+		if deletedAt, deleted := d.volumePageDeleted[volume.name]; deleted && !deletedAt.Before(start) {
+			continue
+		}
+		kept = append(kept, volume)
+	}
+	volumes = kept
+	// A slower walk's older listing does not replace a newer one's view.
+	if d.volumePageCache == nil || !start.Before(d.volumePageCacheStart) {
+		d.volumePageCache = volumes
+		d.volumePageCacheTime = time.Now()
+		d.volumePageCacheStart = start
+	}
 	d.volumePageCacheMu.Unlock()
 	page, hasMore = sliceVolumeListPage(volumes, limit, offset)
-	return page, hasMore, nil
+	return page, start, hasMore, nil
 }
 
-// forgetListedVolume leaves a volume this controller deleted out of the
-// current walk's later pages.
+// volumeListing is one ListVolumes listing in flight. floor is the earliest
+// time its rows can date from: its own arrival, or the start of the shared
+// listing already in flight that it may join.
+type volumeListing struct {
+	floor time.Time
+}
+
+// beginVolumeListing registers a listing so that deletes it may need to leave
+// out are kept until it is done.
+func (d *Driver) beginVolumeListing() *volumeListing {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	listing := &volumeListing{floor: d.sharedListingFloor(time.Now())}
+	if d.volumePageListings == nil {
+		d.volumePageListings = make(map[*volumeListing]struct{})
+	}
+	d.volumePageListings[listing] = struct{}{}
+	return listing
+}
+
+func (d *Driver) endVolumeListing(listing *volumeListing) {
+	d.volumePageCacheMu.Lock()
+	defer d.volumePageCacheMu.Unlock()
+	delete(d.volumePageListings, listing)
+	d.pruneListedVolumeDeletes(time.Now())
+}
+
+// sharedListingFloor is the earlier of now and the start of the shared
+// managed listing in flight: a listing that begins now may join it.
+func (d *Driver) sharedListingFloor(now time.Time) time.Time {
+	d.managedListingMu.Lock()
+	defer d.managedListingMu.Unlock()
+	if d.managedListing != nil && d.managedListing.start.Before(now) {
+		return d.managedListing.start
+	}
+	return now
+}
+
+// pruneListedVolumeDeletes drops the deletes no listing can need: those
+// before the start of the cached view (while it is served), of every listing
+// in flight, and of the shared listing in flight that a new one may join.
+// With none of these, every entry goes, so the map stays bounded when nothing
+// lists. The caller holds volumePageCacheMu.
+func (d *Driver) pruneListedVolumeDeletes(now time.Time) {
+	floor := d.sharedListingFloor(now)
+	held := floor.Before(now)
+	if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
+		held = true
+		if d.volumePageCacheStart.Before(floor) {
+			floor = d.volumePageCacheStart
+		}
+	}
+	for listing := range d.volumePageListings {
+		held = true
+		if listing.floor.Before(floor) {
+			floor = listing.floor
+		}
+	}
+	if !held {
+		clear(d.volumePageDeleted)
+		return
+	}
+	for name, deletedAt := range d.volumePageDeleted {
+		if deletedAt.Before(floor) {
+			delete(d.volumePageDeleted, name)
+		}
+	}
+}
+
+// forgetListedVolume records that DeleteVolume removed a volume, so a listing
+// that began at or before now leaves it out. It is recorded even while no walk
+// is cached: a fresh listing may be in flight.
 func (d *Driver) forgetListedVolume(volumeID string) {
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
@@ -2518,20 +2605,21 @@ func (d *Driver) forgetListedVolume(volumeID string) {
 	}
 	d.volumePageCacheMu.Lock()
 	defer d.volumePageCacheMu.Unlock()
-	if d.volumePageCache == nil {
-		return
-	}
 	if d.volumePageDeleted == nil {
-		d.volumePageDeleted = make(map[string]struct{})
+		d.volumePageDeleted = make(map[string]time.Time)
 	}
-	d.volumePageDeleted[datasetName] = struct{}{}
+	now := time.Now()
+	d.volumePageDeleted[datasetName] = now
+	d.pruneListedVolumeDeletes(now)
 }
 
-func (d *Driver) listedVolumeDeleted(datasetName string) bool {
+// listedVolumeDeletedSince reports a volume DeleteVolume removed at or after
+// viewStart, the start of the listing a page is served from.
+func (d *Driver) listedVolumeDeletedSince(datasetName string, viewStart time.Time) bool {
 	d.volumePageCacheMu.Lock()
 	defer d.volumePageCacheMu.Unlock()
-	_, deleted := d.volumePageDeleted[datasetName]
-	return deleted
+	deletedAt, deleted := d.volumePageDeleted[datasetName]
+	return deleted && !deletedAt.Before(viewStart)
 }
 
 // listedCapacity is a ListVolumes entry's capacity (listedDatasetCapacity).

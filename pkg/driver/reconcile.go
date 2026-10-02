@@ -1014,24 +1014,34 @@ func reconcileAge(now time.Time, creationUnix int64, minAge time.Duration) (time
 // its own copy of the datasets, so a caller may sort the slice or mirror a
 // write into a dataset without touching another caller's.
 func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset, error) {
+	datasets, _, err := d.listAllManagedDatasetsWithStart(ctx)
+	return datasets, err
+}
+
+// listAllManagedDatasetsWithStart is listAllManagedDatasets that also returns
+// when the listing it was served from began. A caller that joins a shared
+// listing gets that listing's start, not its own arrival: the rows may predate
+// anything that happened after the start.
+func (d *Driver) listAllManagedDatasetsWithStart(ctx context.Context) ([]*truenas.Dataset, time.Time, error) {
 	for {
 		d.managedListingMu.Lock()
 		call := d.managedListing
 		if call == nil {
-			call = &managedListingCall{done: make(chan struct{})}
+			call = &managedListingCall{done: make(chan struct{}), start: time.Now()}
 			d.managedListing = call
 			d.managedListingMu.Unlock()
 			d.runManagedListing(ctx, call)
 			if call.err != nil {
-				return nil, call.err
+				return nil, time.Time{}, call.err
 			}
-			return cloneDatasets(call.result), nil
+			return cloneDatasets(call.result), call.start, nil
 		}
+		call.joined++
 		d.managedListingMu.Unlock()
 		select {
 		case <-call.done:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, time.Time{}, ctx.Err()
 		}
 		if call.err != nil && ctx.Err() == nil &&
 			(errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded)) {
@@ -1039,16 +1049,18 @@ func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset
 			continue
 		}
 		if call.err != nil {
-			return nil, call.err
+			return nil, time.Time{}, call.err
 		}
-		return cloneDatasets(call.result), nil
+		return cloneDatasets(call.result), call.start, nil
 	}
 }
 
 // managedListingCall is one listing in flight, shared by every caller that
-// arrives while it runs.
+// arrives while it runs. start is taken before the listing is read.
 type managedListingCall struct {
 	done   chan struct{}
+	start  time.Time
+	joined int // callers that waited on it; guarded by managedListingMu
 	result []*truenas.Dataset
 	err    error
 }

@@ -159,10 +159,17 @@ type Driver struct {
 	// ever reads it.
 	volumePageCacheMu sync.Mutex
 	volumePageCache   []listedVolume // the walk's frozen listing, sorted by name
-	// volumePageDeleted is the volumes this controller deleted since the
-	// frozen listing was taken; its later pages leave them out.
-	volumePageDeleted   map[string]struct{}
+	// volumePageDeleted is when DeleteVolume removed each volume this
+	// controller deleted. A listing that began at or before that time may
+	// still hold the volume, so its pages leave it out. Entries no listing
+	// can need any more are pruned (pruneListedVolumeDeletes).
+	volumePageDeleted   map[string]time.Time
 	volumePageCacheTime time.Time
+	// volumePageCacheStart is when the cached view's listing began reading.
+	volumePageCacheStart time.Time
+	// volumePageListings are the ListVolumes listings in flight, each with
+	// the earliest time its rows can date from.
+	volumePageListings map[*volumeListing]struct{}
 	// unknownVolsizeLogged is the zvols ListVolumes has warned about once
 	// for an unreadable volsize.
 	unknownVolsizeLogged sync.Map
