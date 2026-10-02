@@ -128,3 +128,62 @@ func TestManagedListingJoinerOutlivesACancelledLeader(t *testing.T) {
 	close(client.release)
 	assert.Len(t, <-joined, 2)
 }
+
+// Every caller of a shared listing, the one that ran it and each one that
+// joined it, gets its own slice and its own datasets: none is the shared
+// result, and none shares a slice, a dataset or a property map with another.
+func TestManagedListingGivesEveryCallerADistinctResult(t *testing.T) {
+	d, client := newGatedListingDriver(t)
+	ctx := context.Background()
+	const callers = 4
+	results := make([][]*truenas.Dataset, callers)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		results[0], err = d.listAllManagedDatasets(ctx)
+		assert.NoError(t, err)
+	}()
+	<-client.entered
+	d.managedListingMu.Lock()
+	shared := d.managedListing
+	d.managedListingMu.Unlock()
+	require.NotNil(t, shared)
+	for i := 1; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var err error
+			results[i], err = d.listAllManagedDatasets(ctx)
+			assert.NoError(t, err)
+		}(i)
+	}
+	require.Eventually(t, func() bool {
+		d.managedListingMu.Lock()
+		defer d.managedListingMu.Unlock()
+		return shared.joined == callers-1
+	}, 5*time.Second, time.Millisecond, "every other caller joins the listing")
+	close(client.release)
+	wg.Wait()
+	require.Equal(t, int32(1), client.calls.Load())
+
+	require.Len(t, shared.result, 2)
+	all := append([][]*truenas.Dataset{shared.result}, results...)
+	for i := range all {
+		require.Len(t, all[i], 2)
+		for j := i + 1; j < len(all); j++ {
+			assert.NotSame(t, &all[i][0], &all[j][0], "results %d and %d share a slice", i, j)
+			for k := range all[i] {
+				assert.NotSame(t, all[i][k], all[j][k], "results %d and %d share a dataset", i, j)
+			}
+		}
+	}
+	for i := range results {
+		results[i][0].UserProperties["scale-csi:probe"] = truenas.UserProperty{Value: string(rune('a' + i))}
+	}
+	assert.NotContains(t, shared.result[0].UserProperties, "scale-csi:probe")
+	for i := range results {
+		assert.Equal(t, string(rune('a'+i)), results[i][0].UserProperties["scale-csi:probe"].Value, "caller %d's property map is its own", i)
+	}
+}
