@@ -23,9 +23,12 @@ import (
 // difference, a doubt, a read that failed, a volume a live CSI operation
 // touched while the diff read) takes the per-volume path as before.
 //
-// The diff only ever skips work; it never writes, grants or revokes. A
-// skipped volume is one whose observed state is a fixed point of the
-// per-volume path, and any change after that is made by a CSI operation under
+// The diff only ever skips work; it never grants or revokes, and never
+// writes a volume's records or share. Its one possible write is resolving the
+// configured ports: up to one NVMeoFGetOrCreatePort per portal address (four
+// with multipath) on a fresh process, which creates a port that is missing,
+// exactly as the per-volume path's first share check would. A skipped volume
+// is one whose observed state is a fixed point of the per-volume path, and any change after that is made by a CSI operation under
 // the volume lock, which converges its own volume. It covers strict NVMe-oF
 // volumes, the shape of a large fleet; additive mode, NFS and iSCSI take the
 // per-volume path.
@@ -258,8 +261,10 @@ func (d *Driver) readStartupDiffFleet(ctx context.Context, candidates []string) 
 		}
 	}
 	for _, address := range d.config.NVMeoF.multipathAddresses() {
-		// The per-volume path resolves the same ports; the client caches them
-		// for the process, so this is a read at most once per address.
+		// The per-volume path resolves the same ports. The client caches them
+		// for the process: on a fresh process this is one lookup per address,
+		// and it creates the port if the address has none (a write the
+		// per-volume path would make too); after that it costs nothing.
 		port, err := d.truenasClient.NVMeoFGetOrCreatePort(ctx, d.config.NVMeoF.Transport, address,
 			d.config.NVMeoF.TransportServiceID, d.nvmeofPortCreateOpts())
 		if err != nil {
