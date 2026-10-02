@@ -58,6 +58,18 @@ func (s importingPublicationStore) records(ctx context.Context, datasetName stri
 	return resolvePublicationRecords(legacy, current), nil
 }
 
+func (s importingPublicationStore) lockedRecords(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error) {
+	legacy, err := s.legacy.records(ctx, datasetName, ds)
+	if err != nil {
+		return nil, err
+	}
+	current, err := s.kube.lockedRecords(ctx, datasetName, ds)
+	if err != nil {
+		return nil, err
+	}
+	return resolvePublicationRecords(legacy, current), nil
+}
+
 // resolvePublicationRecords decides a volume's records from its ZFS records
 // (legacy) and its VolumePublications (current).
 //
@@ -156,7 +168,7 @@ func (s importingPublicationStore) importLegacy(ctx context.Context, datasetName
 	if err != nil || len(legacy) == 0 {
 		return err
 	}
-	current, err := s.kube.records(ctx, datasetName, ds)
+	current, err := s.kube.lockedRecords(ctx, datasetName, ds)
 	if err != nil {
 		return err
 	}

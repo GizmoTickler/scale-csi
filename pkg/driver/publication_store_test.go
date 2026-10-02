@@ -74,6 +74,28 @@ func newFakeVolumePublicationClient() *dynamicfake.FakeDynamicClient {
 		object.SetResourceVersion(next())
 		return false, nil, nil
 	})
+	client.PrependReactor("delete", "volumepublications", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		del := action.(clienttesting.DeleteAction)
+		precondition := del.GetDeleteOptions().Preconditions
+		if precondition == nil || precondition.ResourceVersion == nil {
+			return false, nil, nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		current, err := client.Tracker().Get(volumePublicationGVR, del.GetNamespace(), del.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		currentMeta, err := meta.Accessor(current)
+		if err != nil {
+			return true, nil, err
+		}
+		if currentMeta.GetResourceVersion() != *precondition.ResourceVersion {
+			return true, nil, apierrors.NewConflict(volumePublicationGVR.GroupResource(), del.GetName(),
+				errors.New("the ResourceVersion in the precondition does not match the ResourceVersion in record"))
+		}
+		return false, nil, nil
+	})
 	return client
 }
 
@@ -226,7 +248,7 @@ func TestKubernetesPublicationStoreReportsAConflict(t *testing.T) {
 			if tc.before {
 				require.NoError(t, twin.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStatePublished)))
 			}
-			_, err := store.records(ctx, "pool/v", nil) // the locked read
+			_, err := store.lockedRecords(ctx, "pool/v", nil) // the locked read
 			require.NoError(t, err)
 			tc.change(twin)
 			before, _ := twin.resource().Get(ctx, store.objectName("pool/v", key), metav1.GetOptions{})
@@ -237,7 +259,7 @@ func TestKubernetesPublicationStoreReportsAConflict(t *testing.T) {
 			assert.Equal(t, before, after, "the other process's write was overwritten")
 
 			// The next decision reads again, and its write goes through.
-			_, err = store.records(ctx, "pool/v", nil)
+			_, err = store.lockedRecords(ctx, "pool/v", nil)
 			require.NoError(t, err)
 			require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStateRemoving)))
 			got, err := store.records(ctx, "pool/v", nil)
@@ -256,7 +278,7 @@ func TestKubernetesPublicationStoreWriteIsOneRequest(t *testing.T) {
 	key := publicationPropertyKey("node-1")
 	writes := func(record publicationRecord) []string {
 		t.Helper()
-		_, err := store.records(ctx, "pool/v", nil)
+		_, err := store.lockedRecords(ctx, "pool/v", nil)
 		require.NoError(t, err)
 		client.ClearActions()
 		require.NoError(t, store.store(ctx, "pool/v", nil, key, record))
@@ -279,4 +301,97 @@ func TestKubernetesPublicationStoreWriteIsOneRequest(t *testing.T) {
 	require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStatePublished)))
 	require.Len(t, client.Actions(), 1)
 	assert.Equal(t, "create", client.Actions()[0].GetVerb())
+}
+
+// foreignUpdate rewrites the record as another process would, bumping its
+// resourceVersion.
+func foreignUpdate(t *testing.T, store kubernetesPublicationStore, datasetName, key, updatedAt string) {
+	t.Helper()
+	ctx := context.Background()
+	current, err := store.resource().Get(ctx, store.objectName(datasetName, key), metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NoError(t, unstructured.SetNestedField(current.Object, updatedAt, "spec", "updatedAt"))
+	_, err = store.resource().Update(ctx, current, metav1.UpdateOptions{})
+	require.NoError(t, err)
+}
+
+// A read made without the volume lock (a ListVolumes page, the startup diff)
+// between the locked read and the write does not make a foreign write the
+// write's starting point: the write still conflicts instead of overwriting it.
+func TestKubernetesPublicationStoreUnlockedReadDoesNotDefeatTheCompareAndSet(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeVolumePublicationClient()
+	store := newKubernetesPublicationStore(client, "scale-csi", "one")
+	key := publicationPropertyKey("node-1")
+	require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStatePublished)))
+
+	_, err := store.lockedRecords(ctx, "pool/v", nil) // the volume lock is held from here
+	require.NoError(t, err)
+	foreignUpdate(t, newKubernetesPublicationStore(client, "scale-csi", "one"), "pool/v", key, "2026-10-02T09:00:00Z")
+	_, err = store.records(ctx, "pool/v", nil) // a reporting read, without the lock
+	require.NoError(t, err)
+
+	err = store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStateRemoving))
+	require.ErrorIs(t, err, errPublicationRecordConflict, "the foreign write was overwritten")
+	got, err := store.records(ctx, "pool/v", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "2026-10-02T09:00:00Z", got[key].UpdatedAt)
+}
+
+// A reporting read whose answer predates this process's own last write does
+// not wind the write's starting point back: the next locked write succeeds.
+func TestKubernetesPublicationStoreStaleUnlockedReadCausesNoConflict(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeVolumePublicationClient()
+	store := newKubernetesPublicationStore(client, "scale-csi", "one")
+	key := publicationPropertyKey("node-1")
+	require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStatePublished)))
+	stale, err := store.resource().List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+
+	_, err = store.lockedRecords(ctx, "pool/v", nil)
+	require.NoError(t, err)
+	require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStateRemoving)))
+
+	// A reporting read that was answered before that write lands after it.
+	var once sync.Once
+	client.PrependReactor("list", "volumepublications", func(clienttesting.Action) (bool, runtime.Object, error) {
+		served := false
+		once.Do(func() { served = true })
+		if !served {
+			return false, nil, nil
+		}
+		return true, stale.DeepCopy(), nil
+	})
+	_, err = store.records(ctx, "pool/v", nil)
+	require.NoError(t, err)
+
+	require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStatePublished)),
+		"a stale reporting read caused a conflict")
+}
+
+// A removal is a compare-and-set too: a record changed since the locked read
+// is kept and the removal reported.
+func TestKubernetesPublicationStoreRemoveIsACompareAndSet(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeVolumePublicationClient()
+	store := newKubernetesPublicationStore(client, "scale-csi", "one")
+	key := publicationPropertyKey("node-1")
+	require.NoError(t, store.store(ctx, "pool/v", nil, key, testRecord("node-1", publicationStatePublished)))
+	_, err := store.lockedRecords(ctx, "pool/v", nil)
+	require.NoError(t, err)
+	foreignUpdate(t, newKubernetesPublicationStore(client, "scale-csi", "one"), "pool/v", key, "2026-10-02T09:00:00Z")
+
+	err = store.remove(ctx, "pool/v", nil, []string{key})
+	require.ErrorIs(t, err, errPublicationRecordConflict)
+	got, err := store.records(ctx, "pool/v", nil)
+	require.NoError(t, err)
+	assert.Contains(t, got, key, "a record changed since the read was removed")
+
+	_, err = store.lockedRecords(ctx, "pool/v", nil)
+	require.NoError(t, err)
+	require.NoError(t, store.remove(ctx, "pool/v", nil, []string{key}))
+	got, err = store.records(ctx, "pool/v", nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }

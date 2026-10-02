@@ -14,7 +14,13 @@ import (
 // from it and mirrors its writes into it, so a caller's later fence
 // computation sees them without another read.
 type publicationStore interface {
+	// records reads the records for a caller that only reports or judges
+	// them. It never sets what a later write is compared against.
 	records(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error)
+	// lockedRecords is the read a write is decided on. The caller holds the
+	// volume lock, and the store's next store or remove of these records is
+	// a compare-and-set against what this read saw.
+	lockedRecords(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error)
 	store(ctx context.Context, datasetName string, ds *truenas.Dataset, key string, record publicationRecord) error
 	remove(ctx context.Context, datasetName string, ds *truenas.Dataset, keys []string) error
 	// forget drops every record of a deleted volume's dataset.
@@ -29,6 +35,10 @@ type zfsPublicationStore struct {
 
 func (s zfsPublicationStore) records(_ context.Context, _ string, ds *truenas.Dataset) (map[string]publicationRecord, error) {
 	return publicationRecordsFromDataset(ds)
+}
+
+func (s zfsPublicationStore) lockedRecords(ctx context.Context, datasetName string, ds *truenas.Dataset) (map[string]publicationRecord, error) {
+	return s.records(ctx, datasetName, ds)
 }
 
 func (s zfsPublicationStore) store(ctx context.Context, datasetName string, ds *truenas.Dataset, key string, record publicationRecord) error {
