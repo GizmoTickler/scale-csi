@@ -1208,3 +1208,52 @@ async fn a_multipath_filesystem_is_rescanned() {
     assert_eq!(fake(&n, |f| f.multipathd_calls.clone()), [format!("resize map {name}")]);
     assert!(n.host.calls().contains(&format!("resize2fs {map}")));
 }
+
+/// multipathd failing the resize fails the expansion with Internal, whether
+/// it exits non-zero or exits 0 and answers "fail" (as it does for an unknown
+/// map). The map's size already shows the new size, so only the answer can
+/// fail the call.
+#[tokio::test]
+async fn a_failed_multipath_resize_fails_the_expansion() {
+    for (code, text) in [(1, "timeout\n"), (0, "fail\n")] {
+        let n = iscsi_node_with(MULTIPATH_CONFIG, |f| f.multipathd = true);
+        let req = with_hint(stage_request(&n, filesystem()), HINT);
+        node_stage(&n.state, &req, None).await.unwrap();
+        let map = fake(&n, |f| f.map_of(WWID).unwrap());
+        n.host.0.lock().unwrap().filesystems.insert(map.clone(), "ext4".into());
+        let dm = std::fs::canonicalize(&map).unwrap();
+        let size = n.dir.path().join(format!(
+            "sys/class/block/{}/size",
+            dm.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(size.parent().unwrap()).unwrap();
+        std::fs::write(&size, "4194304\n").unwrap();
+        fake(&n, |f| f.multipath_resize_reply = Some((code, text.into())));
+        let err = node_expand_volume(
+            &n.state,
+            &csi::NodeExpandVolumeRequest {
+                volume_id: VOLUME.into(),
+                volume_path: req.staging_target_path.clone(),
+                staging_target_path: req.staging_target_path.clone(),
+                capacity_range: Some(csi::CapacityRange {
+                    required_bytes: 2 << 30,
+                    limit_bytes: 0,
+                }),
+                volume_capability: Some(filesystem()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Internal, "exit {code} {text:?}: {err:?}");
+        assert!(
+            err.message().contains("failed to resize multipath map"),
+            "exit {code} {text:?}: {err:?}"
+        );
+        assert!(
+            !n.host.calls().contains(&format!("resize2fs {map}")),
+            "exit {code} {text:?}"
+        );
+    }
+}

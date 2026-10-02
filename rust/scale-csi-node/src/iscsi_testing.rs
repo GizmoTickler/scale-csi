@@ -65,6 +65,8 @@ pub struct FakeIscsi {
     /// Written on `multipathd resize map <name>`, as multipathd grows a map
     /// only when told to: (file, content).
     pub on_multipath_resize: Option<(PathBuf, String)>,
+    /// `multipathd resize map` answers this (exit code, output) instead.
+    pub multipath_resize_reply: Option<(i32, String)>,
     /// `multipathd` argv, in order.
     pub multipathd_calls: Vec<String>,
     /// Another LUN identity answers on this portal (a misconfigured portal).
@@ -127,6 +129,7 @@ impl FakeIscsi {
             login_failure: None,
             on_rescan: None,
             on_multipath_resize: None,
+            multipath_resize_reply: None,
             multipathd_calls: Vec::new(),
             foreign_wwid_on: None,
             discoveries: 0,
@@ -319,6 +322,10 @@ impl FakeIscsi {
     pub fn run_multipathd(&mut self, args: &[&str]) -> Output {
         self.multipathd_calls.push(args.join(" "));
         match args {
+            ["resize", "map", _] if self.multipath_resize_reply.is_some() => {
+                let (code, text) = self.multipath_resize_reply.clone().unwrap();
+                out(code, &text)
+            }
             ["resize", "map", _] if self.multipathd => {
                 if let Some((file, content)) = &self.on_multipath_resize {
                     std::fs::write(file, content).unwrap();
