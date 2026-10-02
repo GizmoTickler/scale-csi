@@ -24,6 +24,11 @@ const startupReconcileWorkers = 4
 var (
 	startupReconcileInitialBackoff = 5 * time.Second
 	startupReconcileMaxBackoff     = time.Minute
+	// startupVolumeLockWait bounds how long a startup worker waits for a
+	// volume lock a live CSI operation holds. A publish or unpublish holds it
+	// for about a second; past the bound the volume is left for the retry,
+	// which re-runs only the volumes that failed.
+	startupVolumeLockWait = 15 * time.Second
 )
 
 // startupReconcileRequestedHook, when set (tests only), sees every re-run
@@ -31,7 +36,7 @@ var (
 var startupReconcileRequestedHook func(datasetName string)
 
 // errStartupVolumeBusy is a volume a pass skipped because a live CSI operation
-// held its lock. The pass's targets are kept, and the retry runs it.
+// held its lock for longer than startupVolumeLockWait. The retry runs it.
 var errStartupVolumeBusy = errors.New("live CSI operation is in progress")
 
 // startupErrOnlyBusy is whether every error in a pass's (joined, wrapped)
@@ -187,37 +192,44 @@ type startupAttachment struct {
 // four-worker bound. The TrueNAS client has ten request slots, so this leaves
 // capacity for live CSI calls while startup convergence runs in the background.
 func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
-	return d.reconcilePublishedAttachmentsFor(ctx, nil)
+	_, err := d.reconcilePublishedAttachmentsFor(ctx, nil)
+	return err
 }
 
 // reconcilePublishedAttachmentsFor is one pass over every attached volume
 // (targets nil), or over only the volumes whose dataset is in targets: a
 // re-run signal (a deferred fence, a revoked stale record) names the volumes
 // it concerns, and the rest of the cluster is left alone.
-func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets map[string]struct{}) error {
+//
+// When the pass fails only because some volumes did not converge, failed
+// names their datasets, and the retry re-runs exactly those. A failure that
+// belongs to no one volume (a listing error, a VolumeAttachment whose
+// PersistentVolume is missing) returns failed nil, and the retry is a full
+// pass.
+func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets map[string]struct{}) (failed map[string]struct{}, err error) {
 	if d.config == nil || !d.config.Fencing.Enabled() {
-		return nil
+		return nil, nil
 	}
 	if d.eventRecorder == nil || d.eventRecorder.clientset == nil {
-		return fmt.Errorf("fencing startup reconciliation requires Kubernetes client access")
+		return nil, fmt.Errorf("fencing startup reconciliation requires Kubernetes client access")
 	}
 	clientset := d.eventRecorder.clientset
 
 	pvList, err := clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list PersistentVolumes for startup fencing reconciliation: %w", err)
+		return nil, fmt.Errorf("list PersistentVolumes for startup fencing reconciliation: %w", err)
 	}
 	attachmentList, err := clientset.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list VolumeAttachments for startup fencing reconciliation: %w", err)
+		return nil, fmt.Errorf("list VolumeAttachments for startup fencing reconciliation: %w", err)
 	}
 	csiNodeList, err := clientset.StorageV1().CSINodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list CSINodes for startup fencing reconciliation: %w", err)
+		return nil, fmt.Errorf("list CSINodes for startup fencing reconciliation: %w", err)
 	}
 	nodeList, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list Nodes for startup fencing reconciliation: %w", err)
+		return nil, fmt.Errorf("list Nodes for startup fencing reconciliation: %w", err)
 	}
 
 	pvs := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
@@ -338,8 +350,12 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 		ResetStartupFencingUnconvergedVolumes()
 		d.resetStartupQuarantine()
 	}
+	type volumeResult struct {
+		volumeID string
+		err      error
+	}
 	jobs := make(chan *startupFencingVolume)
-	results := make(chan error, len(volumeIDs))
+	results := make(chan volumeResult, len(volumeIDs))
 	workerCount := startupReconcileWorkers
 	if len(volumeIDs) < workerCount {
 		workerCount = len(volumeIDs)
@@ -350,7 +366,7 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 		go func() {
 			defer workers.Done()
 			for volume := range jobs {
-				results <- d.reconcileStartupFencingVolume(ctx, volume)
+				results <- volumeResult{volumeID: volume.volumeID, err: d.reconcileStartupFencingVolume(ctx, volume)}
 			}
 		}()
 	}
@@ -360,17 +376,32 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 	close(jobs)
 	workers.Wait()
 	close(results)
+	var volumeErrors []error
 	for result := range results {
-		if result != nil {
-			collectionErrors = append(collectionErrors, result)
+		if result.err == nil {
+			continue
 		}
+		volumeErrors = append(volumeErrors, result.err)
+		datasetName, nameErr := d.datasetForID(result.volumeID)
+		if nameErr != nil {
+			// A volume with no dataset name cannot be re-run on its own.
+			collectionErrors = append(collectionErrors, nameErr)
+			continue
+		}
+		if failed == nil {
+			failed = make(map[string]struct{})
+		}
+		failed[datasetName] = struct{}{}
 	}
 	if len(collectionErrors) > 0 {
-		return errors.Join(collectionErrors...)
+		return nil, errors.Join(append(collectionErrors, volumeErrors...)...)
+	}
+	if len(volumeErrors) > 0 {
+		return failed, errors.Join(volumeErrors...)
 	}
 	klog.Infof("Startup fencing reconciliation converged: %d attached publication(s) across %d volume(s)",
 		attachmentCount, len(volumeIDs))
-	return nil
+	return nil, nil
 }
 
 // csiNodeID is the id the CSINode advertises for driverName, "" if none.
@@ -485,7 +516,10 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		return err
 	}
 	lockKey := volumeLockKey(volume.volumeID)
-	if !d.acquireOperationLock(lockKey) {
+	if !d.acquireOperationLockWait(ctx, lockKey, startupVolumeLockWait) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return fmt.Errorf("startup reconcile volume %s: %w", volume.volumeID, errStartupVolumeBusy)
 	}
 	defer d.releaseOperationLock(lockKey)
@@ -918,13 +952,13 @@ func accessModeForPersistentVolume(pv *corev1.PersistentVolume) (csi.VolumeCapab
 	return csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false
 }
 
-func (d *Driver) runStartupAttachmentReconcile(parent context.Context, targets map[string]struct{}) error {
+func (d *Driver) runStartupAttachmentReconcile(parent context.Context, targets map[string]struct{}) (map[string]struct{}, error) {
 	timeout, err := d.config.Fencing.StartupReconcileTimeoutDuration()
 	if err != nil {
-		return fmt.Errorf("invalid fencing.startupReconcileTimeout: %w", err)
+		return nil, fmt.Errorf("invalid fencing.startupReconcileTimeout: %w", err)
 	}
 	if timeout <= 0 {
-		return fmt.Errorf("fencing.startupReconcileTimeout must be positive")
+		return nil, fmt.Errorf("fencing.startupReconcileTimeout must be positive")
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
@@ -979,10 +1013,12 @@ func (d *Driver) startStartupAttachmentReconcile() {
 		}()
 		backoff := startupReconcileInitialBackoff
 		waitForSignal := false
-		// full is true until a full pass has converged; after that, each
-		// signal re-runs only the volumes it named (targets), and a failed
-		// targeted pass retries those same volumes.
-		full := true
+		// converged is false until every attached volume has converged. The
+		// first pass is a full one; when it fails on some volumes only, the
+		// retries re-run exactly those (targets) instead of the whole cluster.
+		// After convergence each signal re-runs only the volumes it named, and
+		// a failed targeted pass retries the ones that failed.
+		converged := false
 		var targets map[string]struct{}
 		for {
 			if waitForSignal {
@@ -1002,7 +1038,9 @@ func (d *Driver) startStartupAttachmentReconcile() {
 				}
 			}
 			pending := d.takeStartupReconcileTargets()
-			if !full {
+			// Before convergence with no targets, the next pass is a full one
+			// and covers every signal.
+			if converged || targets != nil {
 				if targets == nil {
 					targets = make(map[string]struct{}, len(pending))
 				}
@@ -1017,13 +1055,9 @@ func (d *Driver) startStartupAttachmentReconcile() {
 					continue
 				}
 			}
-			var passTargets map[string]struct{}
-			if !full {
-				passTargets = targets
-			}
-			err := d.runStartupAttachmentReconcile(ctx, passTargets)
+			failed, err := d.runStartupAttachmentReconcile(ctx, targets)
 			if err == nil {
-				full = false
+				converged = true
 				targets = nil
 				if d.config.Fencing.Mode == FencingModeStrict {
 					d.ready.Store(true)
@@ -1053,13 +1087,19 @@ func (d *Driver) startStartupAttachmentReconcile() {
 			if ctx.Err() != nil {
 				return
 			}
-			// A targeted pass runs only after a full pass converged, on volumes
-			// that pass left converged or quarantined. One that only met busy
-			// volumes keeps readiness (their quarantine and gauge stand, and
-			// the targets are kept for the retry below): dropping it would gate
-			// every CSI call in the cluster on a lock some other operation holds.
-			if d.config.Fencing.Mode == FencingModeStrict && (full || !startupErrOnlyBusy(err)) {
+			// After convergence a targeted pass runs on volumes that pass left
+			// converged or quarantined. One that only met busy volumes keeps
+			// readiness (their quarantine and gauge stand, and they are retried
+			// below): dropping it would gate every CSI call in the cluster on a
+			// lock some other operation holds.
+			if d.config.Fencing.Mode == FencingModeStrict && (!converged || !startupErrOnlyBusy(err)) {
 				d.ready.Store(false)
+			}
+			// Only the volumes that failed are re-run. A failure that belongs to
+			// no one volume retries the pass as it was (a full pass, or the same
+			// targets).
+			if failed != nil {
+				targets = failed
 			}
 			klog.Warningf("Background startup fencing reconciliation incomplete; retrying in %v: %v", backoff, err)
 			timer := time.NewTimer(backoff)

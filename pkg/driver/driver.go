@@ -958,15 +958,53 @@ func requestWithoutSecrets(req interface{}) interface{} {
 }
 
 // acquireOperationLock acquires a lock for the given operation key.
-// Returns false if the lock is already held.
+// Returns false if the lock is already held. The held value is a channel the
+// release closes, so a caller that may wait (acquireOperationLockWait) learns
+// of the release without polling.
 func (d *Driver) acquireOperationLock(key string) bool {
-	_, loaded := d.operationLock.LoadOrStore(key, struct{}{})
+	if _, held := d.operationLock.Load(key); held {
+		return false
+	}
+	_, loaded := d.operationLock.LoadOrStore(key, make(chan struct{}))
 	return !loaded
+}
+
+// acquireOperationLockWait is acquireOperationLock that waits up to wait for
+// a held lock to be released. It returns false if the lock is still held
+// when wait runs out or ctx ends.
+func (d *Driver) acquireOperationLockWait(ctx context.Context, key string, wait time.Duration) bool {
+	if d.acquireOperationLock(key) {
+		return true
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		released := make(chan struct{})
+		actual, loaded := d.operationLock.LoadOrStore(key, released)
+		if !loaded {
+			return true
+		}
+		held, ok := actual.(chan struct{})
+		if !ok {
+			return false
+		}
+		select {
+		case <-held:
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
 
 // releaseOperationLock releases the lock for the given operation key.
 func (d *Driver) releaseOperationLock(key string) {
-	d.operationLock.Delete(key)
+	if held, ok := d.operationLock.LoadAndDelete(key); ok {
+		if released, isChannel := held.(chan struct{}); isChannel {
+			close(released)
+		}
+	}
 }
 
 // GetTrueNASClient returns the TrueNAS API client.
