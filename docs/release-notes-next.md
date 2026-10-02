@@ -1,4 +1,72 @@
-# Release notes — next (v1.23.0 draft)
+# Release notes — next (v1.24.0 draft)
+
+## v1.24.0 (draft) — fewer TrueNAS calls to delete a volume and to move an iSCSI volume
+
+One default changes (`zfs.observeBusyBeforeDelete`, below); nothing else to
+configure.
+
+The numbers below are not measured on hardware. They come from an in-process
+model: the TrueNAS mock with per-call costs taken from 30 days of the
+controller's own request-duration metrics on a TrueNAS 26.0 system
+(`pool.dataset.attachments` 0.72 s, `pool.dataset.processes` 0.54 s,
+`pool.dataset.delete` 0.87 s, `pool.dataset.update` 1.51 s,
+`pool.dataset.query` 0.29 s), a parent-wide dataset query at 5.3 ms per row,
+and an `iscsitarget` reload of 0.5 s (assumed; that system serves no iSCSI).
+
+| | v1.23.0 | v1.24.0 |
+|---|---|---|
+| DeleteVolume, NFS, no snapshots, 30 volumes: calls; TrueNAS time | 8; 3.2 s | 5; 1.5 s |
+| ... at 300 volumes | 8; 4.6 s | 5; 1.5 s |
+| ... at 1,000 volumes | 8; 8.3 s | 5; 1.5 s |
+| Strict iSCSI move (unpublish A, publish B): calls; writes; TrueNAS time | 25; 13; 12.4 s | 19; 7; 6.8 s |
+| Strict iSCSI republish to the same node: calls; writes | 15; 6 | 9; 0 |
+
+- **Delete: no origin scan for a volume without snapshots.** Before deleting
+  a volume's share, DeleteVolume checks that no clone depends on it. A clone
+  can depend on a volume only through one of the volume's own snapshots, and
+  ZFS keeps a cloned snapshot until its last clone is gone. So when the
+  volume has no snapshots (the snapshot listing the delete already makes says
+  so), the check is answered without the parent-wide `pool.dataset.query` of
+  every dataset's origin. A volume with snapshots still runs it: TrueNAS 26.0
+  does not return the snapshot `clones` property through `pool.snapshot.query`
+  or `zfs.resource.snapshot.query` (checked read-only on a live system: it is
+  silently dropped, also for snapshots that do have clones), so the origin
+  scan stays the only authority. The scope is unchanged: a clone of another
+  volume's snapshot never blocks this volume's delete.
+- **Delete: the busy scans run when a delete fails, by default.**
+  `zfs.observeBusyBeforeDelete` now takes a mode:
+  - `on-failure` (the new default): the two observation-only scans
+    (`pool.dataset.attachments`, `pool.dataset.processes`) run only after a
+    dataset delete fails with anything other than a snapshot or children
+    dependency, and what they find is logged at the default verbosity.
+  - `always` (or `true`): before every delete, as before. This is the only
+    setting that records a forced delete of a dataset that was still in use.
+  - `never` (or `false`): not at all.
+
+  The default follows the record: over 30 days, 6,071 dataset deletes each
+  ran both scans, and not one found an attachment or a process, or failed to
+  answer. The `scale_csi_dataset_busy_observations_total` and
+  `..._errors_total` series now exist at zero from start-up.
+- **iSCSI: write and reload only when something changed.** A publish no
+  longer re-stamps the target, extent and association IDs that are already
+  set; the strict fence no longer rewrites an initiator group that already
+  holds the allowlist, an initiator-group ID that is already stamped, or a
+  target whose groups are already right. A reload follows a change, not a
+  call: the controller tracks the iSCSI changes it has written and which of
+  them a successful reload covers. A pass that changed nothing reloads only
+  if an earlier change is still owed a reload (its reload failed or never ran,
+  or it predates this controller's start: the first iSCSI pass after a start
+  reloads once). A create always reloads, and its ID stamp is always written.
+
+### Rolling back to v1.23.0
+
+Nothing to undo on TrueNAS. If your values set `zfs.observeBusyBeforeDelete`
+to `always`, `on-failure` or `never`, set it to `true` or `false` (or remove
+it) before rolling back: the v1.23.0 chart's schema accepts only a boolean,
+and a v1.23.0 controller reading a mode name refuses to start. The default
+render does not contain the key. Rolled back, the busy scans run before every
+delete again.
+
 
 ## v1.23.0 (draft) — snapshots and publishes no longer turn each other away
 
