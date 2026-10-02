@@ -196,6 +196,17 @@ used to hold one worker until the agent stopped answering for every protocol.
   as a kpartx partition or an LVM volume, takes the single-device rescan. A
   dm device whose UUID cannot be read fails the expansion with Internal rather
   than being guessed at; one with no UUID file is not a map.
+- **An iSCSI stage right after a handover no longer fails in blkid.** When one
+  plugin unstaged a volume and the other staged it at once (logout, then login
+  to the same target), the device wait found the new disk in sysfs and took
+  `/dev/<name>` as soon as it existed. That node could still be the previous
+  disk's, because devtmpfs and udev remove it a little later, so the stage
+  failed with `blkid: error: /dev/sdb: No such device or address`. Both plugins
+  now accept a device only when its `/dev` node is a block device whose number
+  matches the kernel's (`/sys/class/block/<name>/dev`) and keep polling until
+  then, within the existing device timeout. The same check applies to the
+  portal-scoped lookup, the IQN fallback and the dm-multipath map
+  (`/dev/mapper/<name>` or `/dev/dm-N` against the map's own number).
 
 ## v1.16.0 — publication records in Kubernetes
 
