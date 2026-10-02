@@ -688,6 +688,42 @@ fn device_identity_through_sysfs() {
     assert!(iscsi.check_multipath_prerequisites().is_ok());
 }
 
+/// Only a dm-multipath map (dm UUID `mpath-<wwid>`) is a map to rescan path
+/// by path; a kpartx partition of a map or an LVM volume is a dm device with
+/// slaves too, and takes the single-device rescan.
+#[test]
+fn only_a_dm_multipath_map_has_multipath_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let iscsi = initiator(&Script::new(vec![]), root.path());
+    let sys = root.path().join("sys");
+    let dev = root.path().join("dev");
+    for (dm, uuid) in [
+        ("dm-3", Some("mpath-36589cfc000000a1b\n")),
+        ("dm-4", Some("part1-mpath-36589cfc000000a1b\n")),
+        ("dm-5", Some("LVM-aBcDeF0123456789\n")),
+        ("dm-6", None),
+    ] {
+        for slave in ["sdb", "sdc"] {
+            std::fs::create_dir_all(sys.join("block").join(dm).join("slaves").join(slave)).unwrap();
+        }
+        std::fs::create_dir_all(sys.join("block").join(dm).join("dm")).unwrap();
+        std::fs::write(sys.join("block").join(dm).join("dm/name"), "mpatha\n").unwrap();
+        if let Some(uuid) = uuid {
+            std::fs::write(sys.join("block").join(dm).join("dm/uuid"), uuid).unwrap();
+        }
+        touch(&dev.join(dm));
+    }
+    let dev_path = |n: &str| dev.join(n).to_string_lossy().into_owned();
+    assert_eq!(
+        iscsi.multipath_paths(&dev_path("dm-3")).unwrap(),
+        Some(("mpatha".to_string(), vec![dev_path("sdb"), dev_path("sdc")]))
+    );
+    for dm in ["dm-4", "dm-5", "dm-6"] {
+        assert_eq!(iscsi.multipath_paths(&dev_path(dm)).unwrap(), None, "{dm}");
+    }
+    assert_eq!(iscsi.multipath_paths(&dev_path("sdb")).unwrap(), None);
+}
+
 /// A LUN's device is found on the SCSI host of the exact session, never by
 /// LUN number alone.
 #[test]

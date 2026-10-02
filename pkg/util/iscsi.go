@@ -1173,7 +1173,8 @@ func ISCSIRescanSessionWithContext(ctx context.Context, portal, iqn string) erro
 }
 
 // MultipathPaths returns the dm-multipath map devicePath is (or resolves to)
-// and the path devices under it. isMap is false for a plain disk.
+// and the path devices under it. isMap is false for a plain disk and for any
+// dm device whose dm UUID is not mpath-<wwid>.
 func MultipathPaths(devicePath string) (mapName string, paths []string, isMap bool, err error) {
 	return multipathPathsIn(devicePath, "/sys/block", "/dev")
 }
@@ -1185,6 +1186,12 @@ func multipathPathsIn(devicePath, sysBlockRoot, devRoot string) (mapName string,
 	devicePath = blockDeviceParentAt(filepath.Join(filepath.Dir(sysBlockRoot), "class", "block"), devicePath)
 	deviceName := filepath.Base(devicePath)
 	if !strings.HasPrefix(deviceName, "dm-") {
+		return "", nil, false, nil
+	}
+	// Only a dm-multipath map (dm UUID mpath-<wwid>) is a map; any other dm
+	// device (a kpartx partition, an LVM volume) is a single device.
+	uuid, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "uuid"))
+	if readErr != nil || !strings.HasPrefix(strings.TrimSpace(string(uuid)), "mpath-") {
 		return "", nil, false, nil
 	}
 	name, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "name"))

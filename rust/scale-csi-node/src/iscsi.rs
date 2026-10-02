@@ -843,7 +843,9 @@ impl Iscsi {
     }
 
     /// The dm-multipath map `device` is (or resolves to) and the paths under
-    /// it, or `None` for a plain disk: (map name, slave device paths).
+    /// it, or `None` for a plain disk and for any dm device whose dm UUID is
+    /// not `mpath-<wwid>` (a kpartx partition, an LVM volume): (map name,
+    /// slave device paths).
     pub fn multipath_paths(&self, device: &str) -> Result<Option<(String, Vec<String>)>> {
         let resolved =
             std::fs::canonicalize(device).map_or_else(|_| device.to_string(), |p| p.to_string_lossy().into_owned());
@@ -853,6 +855,9 @@ impl Iscsi {
             return Ok(None);
         }
         let dir = self.sysfs.join("block").join(name);
+        if !std::fs::read_to_string(dir.join("dm/uuid")).is_ok_and(|u| u.trim().starts_with("mpath-")) {
+            return Ok(None);
+        }
         let map = std::fs::read_to_string(dir.join("dm/name"))
             .map_err(|e| anyhow!("failed to read the map name of {device}: {e}"))?
             .trim()
