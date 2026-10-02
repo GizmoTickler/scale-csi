@@ -32,13 +32,18 @@ share the appliance with it instead of failing and running after it.
   (strict fencing decides each grant from what the previous one left), two
   snapshot operations on one volume still are, and DeleteVolume,
   ControllerExpandVolume, ModifyVolume, CreateVolume, promote and the
-  background reconcilers still hold a volume's lock exclusively.
+  background reconcilers still hold a volume's lock exclusively. While the
+  startup worker waits for a volume's lock, no new attach or data holder is
+  let in ahead of it. The debug endpoint names a shared hold's modes, as
+  `volume:x(attach+data)`.
 - **A publish waits briefly for its volume.** A publish or unpublish that
   finds its volume's lock held by a conflicting operation now waits up to
   8 seconds for it before returning Aborted, instead of returning Aborted at
   once and leaving the attacher to back off for longer than the conflict
-  lasted. The node's identity (its CSINode and Node) is read after the lock
-  is taken.
+  lasted. Only one publish or unpublish waits per volume: any further one
+  returns Aborted at once, so an RWX volume with many attachments in flight
+  cannot hold every attacher worker. The node's identity (its CSINode and
+  Node) is read after the lock is taken.
 - **Reads ahead of write bursts.** Of the TrueNAS request slots
   (`truenas.maxConcurrentRequests`, 10 by default), writes now hold at most
   4, so the reads a publish or unpublish starts with are sent at once
@@ -46,13 +51,15 @@ share the appliance with it instead of failing and running after it.
   among the requests whose kind has a free slot: a publish's write takes the
   next write slot ahead of background writes. A call that backs off between
   retries of a connection failure no longer holds a slot while it waits.
-- **VolumePublication writes are a compare-and-set.** A record write carries
-  the resourceVersion the controller read under the volume lock: one request
+- **VolumePublication writes are a compare-and-set.** A record write or
+  removal carries the resourceVersion of the read the controller made under
+  the volume lock to decide it (the reads that only report records, such as
+  ListVolumes and the startup diff, never set it): one request per write
   instead of two (a first publish 3 → 2 requests, an unpublish 4 → 3). A
-  write that finds the object changed, created or removed since that read is
-  no longer retried over the other writer's record: the operation fails with
-  "publication record changed since it was read" and its retry decides again
-  from a fresh read.
+  write or removal that finds the object changed, created or removed since
+  that read is no longer retried over the other writer's record: the publish
+  or unpublish returns Aborted ("publication record changed since it was
+  read"), and its retry decides again from a fresh read.
 - **ListVolumes.** A continuation page could report a volume this controller
   had deleted after the walk began, if the walk's cached view expired while
   the page re-read its datasets (records in Kubernetes only). Every page now
