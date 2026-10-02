@@ -82,7 +82,7 @@ func TestDatasetHasDependentClonesSeesACloneOutsideTheParent(t *testing.T) {
 	assert.Equal(t, []interface{}{"tank"}, options["paths"], "the scan is the origin's whole pool")
 	assert.Equal(t, true, options["get_children"])
 	assert.Equal(t, []interface{}{"origin"}, options["properties"])
-	assert.Nil(t, options["get_user_properties"], "no user properties are materialised")
+	assert.Nil(t, options["get_user_properties"], "no user properties are materialized")
 
 	clones, err := client.SnapshotDependentClones(context.Background(), "tank/k8s/volumes/source@snap-1")
 	require.NoError(t, err)

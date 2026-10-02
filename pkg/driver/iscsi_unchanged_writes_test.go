@@ -287,8 +287,8 @@ func TestISCSIDeleteAndInitiatorCreateLeaveAReloadOwed(t *testing.T) {
 
 	require.NoError(t, d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"))
 	require.False(t, d.serviceReloadDebouncer.ReloadOwed("iscsitarget"))
-	for id := range client.MockClient.ISCSIInitiators {
-		delete(client.MockClient.ISCSIInitiators, id)
+	for id := range client.ISCSIInitiators {
+		delete(client.ISCSIInitiators, id)
 	}
 	d.invalidateISCSITargetGroup()
 	_, err = d.resolveISCSITargetGroup(ctx)
@@ -304,7 +304,7 @@ func TestISCSIRetriedRevokeReloadsEvenWhenNothingIsOwed(t *testing.T) {
 	d, client, nodeA, _ := newPublishedStrictISCSIVolume(t)
 	target, err := client.MockClient.ISCSITargetFindByName(ctx, d.iscsiShareName(iscsiMoveVolume))
 	require.NoError(t, err)
-	group := client.MockClient.ISCSIInitiators[target.Groups[0].Initiator]
+	group := client.ISCSIInitiators[target.Groups[0].Initiator]
 	group.Initiators = iscsiDenyAllInitiators() // the earlier attempt's write
 
 	// A new controller whose ledger has just been satisfied.

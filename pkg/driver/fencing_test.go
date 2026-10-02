@@ -2244,7 +2244,7 @@ func TestISCSILastUnpublishReattachesDenyGroupToExistingTargetPortals(t *testing
 		truenasClient: client,
 	}
 
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, false, nil))
 	target, err = client.ISCSITargetGet(ctx, target.ID)
 	require.NoError(t, err)
 	require.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, target.Groups,
@@ -2283,7 +2283,7 @@ func TestISCSIFenceZeroActiveIdentitiesWritesDenyAllSentinelGroup(t *testing.T) 
 	}
 
 	// Last unpublish: zero active identities.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, false, nil))
 
 	initiator, err := client.ISCSIInitiatorGet(ctx, dynamic.ID)
 	require.NoError(t, err)
@@ -2336,15 +2336,15 @@ func TestISCSIFenceRepublishReplacesSentinelWithRealIQN(t *testing.T) {
 	}
 
 	// Publish to A.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, false, false, nil))
 	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-a"}, allowlist())
 
 	// Last unpublish: deny-all sentinel replaces A.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, false, nil))
 	assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, allowlist())
 
 	// Republish to B: the update must REPLACE the sentinel, not append to it.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, false, false, nil))
 	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-b"}, allowlist(),
 		"republish must replace the sentinel, never accumulate it alongside a real IQN")
 }
@@ -2502,7 +2502,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 	// initiator would match, which is why publish must fail closed.
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, false, nil))
 
 	// Real node-side discovery: initiatorname.iscsi carries the reserved sentinel.
 	origRead := nodeReadIdentityFile
@@ -2584,7 +2584,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 	// matches, which is why publishing it must fail closed.
 	ds, err = client.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
-	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, false, nil))
 
 	// Real node-side discovery reads the reserved sentinel; this is the identity
 	// encoded into the CURRENT CSINode registration.

@@ -1613,17 +1613,14 @@ func isISCSIDenyAllSentinel(iqn string) bool {
 	return iqn == iscsiDenyAllSentinelIQN
 }
 
-func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, hasDeferredActiveISCSI bool, res *fenceResolution) error {
-	return d.applyISCSIFenceRevoking(ctx, ds, datasetName, active, hasDeferredActiveISCSI, false, res)
-}
-
-// applyISCSIFenceRevoking is applyISCSIFence for a fence that may be revoking
-// a node (an unpublish, a stale-grant revoke: records being removed). Such a
-// fence always reloads, even when it wrote nothing: the reload ledger is per
-// process, so a retried revoke whose allowlist an earlier attempt (or another
-// controller) already wrote, with the reload never confirmed, must not trust
-// it. A publish that changed nothing still reloads only when one is owed.
-func (d *Driver) applyISCSIFenceRevoking(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, hasDeferredActiveISCSI, revoking bool, res *fenceResolution) error {
+// applyISCSIFence converges a volume's iSCSI fence. revoking marks a fence
+// that may be revoking a node (an unpublish, a stale-grant revoke: records
+// being removed). Such a fence always reloads, even when it wrote nothing: the
+// reload ledger is per process, so a retried revoke whose allowlist an earlier
+// attempt (or another controller) already wrote, with the reload never
+// confirmed, must not trust it. A publish that changed nothing still reloads
+// only when one is owed.
+func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, hasDeferredActiveISCSI, revoking bool, res *fenceResolution) error {
 	target, err := d.resolvedISCSITarget(ctx, res, ds, datasetName)
 	if err != nil {
 		return err
