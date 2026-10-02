@@ -55,7 +55,7 @@ func TestStartupDiffSendsAVolumeWithForeignShareIDsToThePerVolumePath(t *testing
 		t.Helper()
 		id, err := strconv.Atoi(property(t, f, volumeID, PropNVMeoFNamespaceID))
 		require.NoError(t, err)
-		namespace := f.client.MockClient.NVMeNamespaces[id]
+		namespace := f.client.NVMeNamespaces[id]
 		require.NotNil(t, namespace)
 		return namespace
 	}
@@ -82,7 +82,7 @@ func TestStartupDiffSendsAVolumeWithForeignShareIDsToThePerVolumePath(t *testing
 		},
 		"subsystem not named for the volume": func(t *testing.T, f *diffFixture) {
 			t.Helper()
-			f.client.MockClient.NVMeSubsystems[f.subsystemOf(t, "diff-1").ID].Name = "renamed"
+			f.client.NVMeSubsystems[f.subsystemOf(t, "diff-1").ID].Name = "renamed"
 		},
 	}
 	for name, diverge := range cases {
@@ -98,7 +98,7 @@ func TestStartupDiffSendsAVolumeWithForeignShareIDsToThePerVolumePath(t *testing
 			namespace := namespaceOf(t, f, "diff-1")
 			assert.Equal(t, "zvol/pool/parent/diff-1", namespace.DevicePath, "the stored namespace serves this zvol again")
 			assert.Equal(t, strconv.Itoa(namespace.SubsystemID), property(t, f, "diff-1", PropNVMeoFSubsystemID))
-			subsystem := f.client.MockClient.NVMeSubsystems[namespace.SubsystemID]
+			subsystem := f.client.NVMeSubsystems[namespace.SubsystemID]
 			require.NotNil(t, subsystem)
 			assert.False(t, subsystem.AllowAnyHost)
 			associations, err := f.client.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
