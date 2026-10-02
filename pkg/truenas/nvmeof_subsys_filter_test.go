@@ -252,3 +252,62 @@ func TestNVMeoFAssociationListsRetryTheFilterAfterTheRejectionExpires(t *testing
 	empty := []interface{}{}
 	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, empty, subsysFilterFor(7), empty}, server.calls("nvmet.host_subsys.query"))
 }
+
+func filteredQueries(calls []interface{}) int {
+	n := 0
+	for _, c := range calls {
+		if l, _ := c.([]interface{}); len(l) > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// When a rejection expires, one call re-probes the filter; concurrent calls
+// list unfiltered meanwhile instead of each sending the rejected filter again.
+func TestNVMeoFAssociationListsReprobeTheFilterOnceAfterExpiry(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	now := time.Unix(1_000_000, 0)
+	originalClock := filterClock
+	filterClock = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	t.Cleanup(func() { filterClock = originalClock })
+	server := &subsysFilterServer{rejectFilter: true, rejectCode: -32001, rejectErrname: "EINVAL"}
+	client := server.start(t)
+	_, err := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+	require.NoError(t, err)
+
+	mu.Lock()
+	now = now.Add(filterRejectionTTL + time.Second)
+	mu.Unlock()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, callErr := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+			assert.NoError(t, callErr)
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, 2, filteredQueries(server.calls("nvmet.host_subsys.query")), "the first rejection, then one re-probe")
+}
+
+// A wall clock stepped back must not stretch the rejection: a negative age
+// counts as expired.
+func TestNVMeoFAssociationListsReprobeAfterTheClockStepsBack(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_000_000, 0)
+	originalClock := filterClock
+	filterClock = func() time.Time { return now }
+	t.Cleanup(func() { filterClock = originalClock })
+	server := &subsysFilterServer{rejectFilter: true, rejectCode: -32001, rejectErrname: "EINVAL"}
+	client := server.start(t)
+	_, err := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+	require.NoError(t, err)
+
+	now = now.Add(-time.Hour)
+	_, err = client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+	require.NoError(t, err)
+	assert.Equal(t, 2, filteredQueries(server.calls("nvmet.host_subsys.query")))
+}

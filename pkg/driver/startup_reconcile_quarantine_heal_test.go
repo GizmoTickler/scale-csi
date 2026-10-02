@@ -89,16 +89,18 @@ func TestStartupQuarantineOfADetachedVolumeClears(t *testing.T) {
 		"a detached volume's quarantine is never cleared")
 }
 
-// A quarantined volume whose dataset was deleted has nothing left to fence:
-// the sweep forgets its quarantine.
+// A quarantined volume whose dataset was deleted (after its detach) has
+// nothing left to fence: the sweep's re-run ends its quarantine.
 func TestStartupQuarantineOfADeletedVolumeClears(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	d, client, _ := quarantinedStartupDriver(t)
+	d, client, kube := quarantinedStartupDriver(t)
 
+	require.NoError(t, kube.StorageV1().VolumeAttachments().Delete(ctx, "va-q1", metav1.DeleteOptions{}))
 	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/q1", false, false))
 	d.reconcileStalePublicationRecords(ctx, nil, nil, time.Now())
-	require.Zero(t, d.startupQuarantineCount(), "a deleted volume's quarantine is never cleared")
+	require.Eventually(t, func() bool { return d.startupQuarantineCount() == 0 }, 3*time.Second, 10*time.Millisecond,
+		"a deleted volume's quarantine is never cleared")
 }
 
 // In additive mode the stored record also carries the grant's provenance,

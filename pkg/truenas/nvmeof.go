@@ -270,7 +270,7 @@ func subsysIDFilter(subsysID int) [][]interface{} {
 // unrelated exception as -32001 EINVAL, which must not switch the filter off
 // for the life of the controller). A transient error leaves it on.
 func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejectedAt *atomic.Int64) (interface{}, error) {
-	if since := rejectedAt.Load(); since == 0 || filterClock().Sub(time.Unix(0, since)) >= filterRejectionTTL {
+	if filterProbeDue(rejectedAt) {
 		result, err := c.Call(ctx, method, subsysIDFilter(subsysID), map[string]interface{}{})
 		if err == nil {
 			return result, nil
@@ -291,6 +291,22 @@ func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID i
 		return result, nil
 	}
 	return c.Call(ctx, method, []interface{}{}, map[string]interface{}{})
+}
+
+// filterProbeDue is whether this call tries the subsys.id filter: never
+// rejected, or the rejection has expired and this call is the one that won the
+// re-probe (the others list unfiltered meanwhile). An age that went negative
+// (the wall clock stepped back) counts as expired.
+func filterProbeDue(rejectedAt *atomic.Int64) bool {
+	since := rejectedAt.Load()
+	if since == 0 {
+		return true
+	}
+	now := filterClock()
+	if age := now.Sub(time.Unix(0, since)); age >= 0 && age < filterRejectionTTL {
+		return false
+	}
+	return rejectedAt.CompareAndSwap(since, now.UnixNano())
 }
 
 // filterRejectionTTL is how long a rejected subsys.id filter stays off;

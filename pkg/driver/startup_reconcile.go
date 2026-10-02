@@ -70,8 +70,7 @@ type startupQuarantine struct {
 }
 
 // healStartupQuarantines asks the startup loop to re-run each quarantined
-// volume whose blocking stale record is gone, and forgets the quarantine of a
-// volume whose dataset is gone. The stale-record revoke signals its own
+// volume whose blocking stale record is gone or whose dataset reads NotFound. The stale-record revoke signals its own
 // volume, but the record can also go another way (an operator, or a revoke
 // that found it already gone); the periodic stale-record sweep calls this, so
 // no quarantine outlives its cause by more than one sweep. Each quarantined
@@ -87,8 +86,11 @@ func (d *Driver) healStartupQuarantines(ctx context.Context) {
 	for volumeID, q := range quarantined {
 		dataset, err := d.truenasClient.DatasetGet(ctx, q.datasetName)
 		if truenas.IsNotFoundError(err) {
-			// The volume was deleted: nothing is left to fence.
-			d.clearStartupQuarantineVolume(volumeID)
+			// Possibly deleted, but a pool not yet imported reads NotFound for
+			// every dataset too: the re-run decides from the attachments. A
+			// deleted volume has none left, and its targeted pass ends the
+			// quarantine; a still-attached one keeps it and is retried.
+			d.requestStartupAttachmentReconcile(q.datasetName)
 			continue
 		}
 		if err != nil {
