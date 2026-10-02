@@ -281,7 +281,7 @@ func (d *Driver) reconcileStalePublicationRecords(
 	state *kubernetesReconcileState,
 	now time.Time,
 ) {
-	defer d.healStartupQuarantines(ctx, datasets)
+	defer d.healStartupQuarantines(ctx)
 	if state == nil {
 		return
 	}

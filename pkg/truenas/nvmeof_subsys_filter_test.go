@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
@@ -213,4 +214,41 @@ func TestNVMeoFAssociationListsRememberAnEINVALRejection(t *testing.T) {
 	}
 	empty := []interface{}{}
 	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, empty}, server.calls("nvmet.host_subsys.query"))
+}
+
+// Any other -32001 errno is not a rejection of the filter.
+func TestNVMeoFAssociationListsKeepFilterAfterAnotherErrno(t *testing.T) {
+	ctx := context.Background()
+	server := &subsysFilterServer{rejectFilter: true, rejectCode: -32001, rejectErrname: "EBUSY"}
+	client := server.start(t)
+
+	for i := 0; i < 2; i++ {
+		_, err := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+		require.NoError(t, err)
+	}
+	empty := []interface{}{}
+	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, subsysFilterFor(7), empty}, server.calls("nvmet.host_subsys.query"))
+}
+
+// A remembered rejection expires: middlewared reports unrelated exceptions as
+// -32001 EINVAL too, so the filter is tried again later.
+func TestNVMeoFAssociationListsRetryTheFilterAfterTheRejectionExpires(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_000_000, 0)
+	originalClock := filterClock
+	filterClock = func() time.Time { return now }
+	t.Cleanup(func() { filterClock = originalClock })
+	server := &subsysFilterServer{rejectFilter: true, rejectCode: -32001, rejectErrname: "EINVAL"}
+	client := server.start(t)
+
+	_, err := client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+	require.NoError(t, err)
+	now = now.Add(filterRejectionTTL - time.Second)
+	_, err = client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+	require.NoError(t, err)
+	now = now.Add(2 * time.Second)
+	_, err = client.NVMeoFHostSubsysListBySubsystem(ctx, 7)
+	require.NoError(t, err)
+	empty := []interface{}{}
+	assert.Equal(t, []interface{}{subsysFilterFor(7), empty, empty, subsysFilterFor(7), empty}, server.calls("nvmet.host_subsys.query"))
 }

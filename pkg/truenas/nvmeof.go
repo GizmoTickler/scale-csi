@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -263,11 +264,13 @@ func subsysIDFilter(subsysID int) [][]interface{} {
 // The filter is an optimisation only: callers still re-filter the rows
 // client-side, so a backend that ignores it returns the right answer. A
 // filtered call that fails with an API error (not a transport failure) is
-// retried once unfiltered. Only a rejection of the filter itself
-// (filterRejected) is remembered so later calls skip the filtered attempt; a
-// transient middleware error leaves the filter on for the next call.
-func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejected *atomic.Bool) (interface{}, error) {
-	if !rejected.Load() {
+// retried once unfiltered. A rejection of the filter itself (filterRejected)
+// is remembered for filterRejectionTTL, so later calls skip the filtered
+// attempt; after that the filter is tried again (middlewared also reports an
+// unrelated exception as -32001 EINVAL, which must not switch the filter off
+// for the life of the controller). A transient error leaves it on.
+func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID int, rejectedAt *atomic.Int64) (interface{}, error) {
+	if since := rejectedAt.Load(); since == 0 || filterClock().Sub(time.Unix(0, since)) >= filterRejectionTTL {
 		result, err := c.Call(ctx, method, subsysIDFilter(subsysID), map[string]interface{}{})
 		if err == nil {
 			return result, nil
@@ -280,13 +283,22 @@ func (c *Client) queryBySubsystem(ctx context.Context, method string, subsysID i
 		if unfilteredErr != nil {
 			return nil, unfilteredErr
 		}
-		if filterRejected(apiErr) && !rejected.Swap(true) {
-			klog.Warningf("%s rejected a subsys.id filter (%v); listing the whole table and filtering client-side from now on", method, err)
+		if filterRejected(apiErr) {
+			if rejectedAt.Swap(filterClock().UnixNano()) == 0 {
+				klog.Warningf("%s rejected a subsys.id filter (%v); listing the whole table and filtering client-side for %v", method, err, filterRejectionTTL)
+			}
 		}
 		return result, nil
 	}
 	return c.Call(ctx, method, []interface{}{}, map[string]interface{}{})
 }
+
+// filterRejectionTTL is how long a rejected subsys.id filter stays off;
+// filterClock is the clock it is measured on. Vars so tests can move them.
+var (
+	filterRejectionTTL = 10 * time.Minute
+	filterClock        = time.Now
+)
 
 // NVMeoFHostSubsysListBySubsystem lists the exact allowed-host associations
 // for one subsystem. The query is filtered by subsys.id on the server; TrueNAS

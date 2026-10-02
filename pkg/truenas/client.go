@@ -794,8 +794,10 @@ type Client struct {
 	// the unfiltered query works, remember it so later calls go straight to
 	// the whole-table read instead of paying a rejected call first. Results
 	// are always re-filtered client-side either way.
-	hostSubsysServerFilterRejected atomic.Bool
-	portSubsysServerFilterRejected atomic.Bool
+	// When the server last rejected the subsys.id filter (unix nanoseconds,
+	// 0 for never); see queryBySubsystem.
+	hostSubsysServerFilterRejected atomic.Int64
+	portSubsysServerFilterRejected atomic.Int64
 
 	dispatcher *jobDispatcher
 

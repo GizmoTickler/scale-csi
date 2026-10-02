@@ -70,40 +70,63 @@ type startupQuarantine struct {
 }
 
 // healStartupQuarantines asks the startup loop to re-run each quarantined
-// volume whose blocking stale record is gone. The stale-record revoke signals
-// its own volume, but the record can also go another way (an operator, or a
-// revoke that found it already gone); the periodic stale-record sweep calls
-// this with the datasets it just listed, so no quarantine outlives its cause
-// by more than one sweep. Quarantines are rare: this reads only theirs.
-func (d *Driver) healStartupQuarantines(ctx context.Context, datasets []*truenas.Dataset) {
+// volume whose blocking stale record is gone, and forgets the quarantine of a
+// volume whose dataset is gone. The stale-record revoke signals its own
+// volume, but the record can also go another way (an operator, or a revoke
+// that found it already gone); the periodic stale-record sweep calls this, so
+// no quarantine outlives its cause by more than one sweep. Each quarantined
+// dataset is read on its own (quarantines are rare): a listing's user
+// properties carry no source, and records read from it would always look gone.
+func (d *Driver) healStartupQuarantines(ctx context.Context) {
 	d.startupReconcileTargetsMu.Lock()
-	quarantined := make([]startupQuarantine, 0, len(d.startupQuarantined))
-	for _, q := range d.startupQuarantined {
-		quarantined = append(quarantined, q)
+	quarantined := make(map[string]startupQuarantine, len(d.startupQuarantined))
+	for volumeID, q := range d.startupQuarantined {
+		quarantined[volumeID] = q
 	}
 	d.startupReconcileTargetsMu.Unlock()
-	if len(quarantined) == 0 {
-		return
-	}
-	byName := make(map[string]*truenas.Dataset, len(datasets))
-	for _, dataset := range datasets {
-		if dataset != nil {
-			byName[dataset.Name] = dataset
+	for volumeID, q := range quarantined {
+		dataset, err := d.truenasClient.DatasetGet(ctx, q.datasetName)
+		if truenas.IsNotFoundError(err) {
+			// The volume was deleted: nothing is left to fence.
+			d.clearStartupQuarantineVolume(volumeID)
+			continue
 		}
-	}
-	for _, q := range quarantined {
-		dataset := byName[q.datasetName]
-		if dataset == nil {
+		if err != nil {
+			klog.V(2).Infof("Quarantined volume %s: dataset unreadable, not re-run yet: %v", volumeID, err)
 			continue
 		}
 		records, err := d.publications().records(ctx, q.datasetName, dataset)
 		if err != nil {
-			klog.V(2).Infof("Quarantined volume %s: publication records unreadable, not re-run yet: %v", q.datasetName, err)
+			klog.V(2).Infof("Quarantined volume %s: publication records unreadable, not re-run yet: %v", volumeID, err)
 			continue
 		}
 		if _, blocked := records[q.staleKey]; !blocked {
 			d.requestStartupAttachmentReconcile(q.datasetName)
 		}
+	}
+}
+
+// clearStartupQuarantinesWithoutAttachment forgets the quarantine of each
+// targeted dataset whose volume has no attachment in this pass's snapshot.
+func (d *Driver) clearStartupQuarantinesWithoutAttachment(
+	targets map[string]struct{},
+	volumes map[string]*startupFencingVolume,
+) {
+	d.startupReconcileTargetsMu.Lock()
+	var cleared []string
+	for volumeID, q := range d.startupQuarantined {
+		if _, targeted := targets[q.datasetName]; !targeted {
+			continue
+		}
+		if _, attached := volumes[volumeID]; attached {
+			continue
+		}
+		delete(d.startupQuarantined, volumeID)
+		cleared = append(cleared, volumeID)
+	}
+	d.startupReconcileTargetsMu.Unlock()
+	for _, volumeID := range cleared {
+		ClearStartupFencingUnconverged(volumeID)
 	}
 }
 
@@ -284,6 +307,10 @@ func (d *Driver) reconcilePublishedAttachmentsFor(ctx context.Context, targets m
 	}
 	sort.Strings(volumeIDs)
 	if targets != nil {
+		// A targeted volume with no attachment left (detached, or its PV gone)
+		// has no worker in this pass and nothing to fence: its quarantine ends
+		// here, or it would hold the gauge and the loop forever.
+		d.clearStartupQuarantinesWithoutAttachment(targets, volumes)
 		// Collection errors about volumes this pass does not touch are not
 		// this pass's to report; the next full pass still sees them.
 		collectionErrors = nil
@@ -699,6 +726,10 @@ func (d *Driver) refreshStartupIdentities(
 			candidate, err := newPublicationRecord(publication.identity, publication.mode, publication.readonly)
 			if err == nil {
 				candidate.keepCONodeID(publication.nodeID)
+				// Additive provenance is filled in later from the stored
+				// record; only the identity decides whether to re-read it.
+				candidate.CSIAddedNFSHosts = previous.CSIAddedNFSHosts
+				candidate.CSIAddedNVMeNQNs = previous.CSIAddedNVMeNQNs
 				if samePublicationRecordExceptTime(previous, candidate) {
 					continue
 				}
