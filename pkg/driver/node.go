@@ -885,8 +885,8 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 
 		// Clean up the empty mount point (only reached once nothing is mounted there)
-		if err := removeMountPoint(stagingPath); err != nil {
-			klog.Warningf("Failed to remove staging directory: %v", err)
+		if err := cleanupMountPoint(stagingPath, "staging path"); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1300,8 +1300,8 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	}
 
 	// Remove the empty mount point (only reached once nothing is mounted there)
-	if err := removeMountPoint(targetPath); err != nil {
-		klog.Warningf("Failed to remove target path: %v", err)
+	if err := cleanupMountPoint(targetPath, "target path"); err != nil {
+		return nil, err
 	}
 	d.deletePublicationRecord(targetPath)
 
@@ -3086,14 +3086,41 @@ func unmountFully(ctx context.Context, path, what string) error {
 	return nil
 }
 
+// errMountPointNotEmpty is a directory that still holds files once nothing is
+// mounted on it.
+var errMountPointNotEmpty = errors.New("directory is not empty")
+
 // removeMountPoint removes an unmounted mount point without descending into
-// it: absent is fine, a directory goes only when empty, a file (a raw-block
-// bind target) goes. Never recursive: what is under a mount point is a
-// volume's data.
+// it (mount-utils CleanupMountPoint): absent is fine, a directory goes only
+// when empty, a file (a raw-block bind target) goes. A directory with files
+// in it is errMountPointNotEmpty. Never recursive: what is under a mount point
+// may be a volume's data.
 func removeMountPoint(path string) error {
 	err := os.Remove(path)
 	if err == nil || os.IsNotExist(err) {
 		return nil
 	}
+	if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("%w: %w", errMountPointNotEmpty, err)
+	}
 	return err
+}
+
+// cleanupMountPoint removes an unmounted mount point. A directory that still
+// has files in it fails the call: reporting success would leave kubelet's own
+// teardown failing with ENOTEMPTY forever, and the files are not ours to
+// delete. what names the path ("staging path", "target path").
+func cleanupMountPoint(path, what string) error {
+	err := removeMountPoint(path)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errMountPointNotEmpty):
+		return status.Errorf(codes.Internal,
+			"%s %s is not empty after unmount; its contents (on the node's disk, not the volume) are left in place and must be removed by hand",
+			what, path)
+	default:
+		klog.Warningf("Failed to remove %s %s: %v", what, path, err)
+		return nil
+	}
 }

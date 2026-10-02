@@ -54,8 +54,10 @@ func TestNodeUnpublishNeverDeletesThroughAStackedMount(t *testing.T) {
 	assert.FileExists(t, file, "a file on the still-mounted share was deleted")
 }
 
-// A directory left with files in it after the unmount is not ours to empty.
-func TestNodeUnpublishLeavesANonEmptyUnmountedDirectory(t *testing.T) {
+// A directory left with files in it after the unmount is not ours to empty,
+// and not removable either: the call fails (mount-utils CleanupMountPoint)
+// rather than report success and leave kubelet failing with ENOTEMPTY.
+func TestNodeUnpublishFailsOnANonEmptyUnmountedDirectory(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "mount", "umount")
 	targetPath := filepath.Join(t.TempDir(), "pod", "mount")
 	require.NoError(t, os.MkdirAll(targetPath, 0o750))
@@ -67,6 +69,49 @@ func TestNodeUnpublishLeavesANonEmptyUnmountedDirectory(t *testing.T) {
 		VolumeId:   "pvc-nfs-1",
 		TargetPath: targetPath,
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), "target path "+targetPath+" is not empty after unmount")
 	assert.FileExists(t, file)
+
+	// Emptied by hand, the retry removes the directory.
+	require.NoError(t, os.Remove(file))
+	_, err = d.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "pvc-nfs-1",
+		TargetPath: targetPath,
+	})
+	require.NoError(t, err)
+	assert.NoDirExists(t, targetPath)
+}
+
+func TestNodeUnstageFailsOnANonEmptyUnmountedDirectory(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "mount", "umount")
+	stagingPath := filepath.Join(t.TempDir(), "globalmount")
+	require.NoError(t, os.MkdirAll(stagingPath, 0o750))
+	file := filepath.Join(stagingPath, "left-behind")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	_, err := d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId:          "pvc-nfs-1",
+		StagingTargetPath: stagingPath,
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), "staging path "+stagingPath+" is not empty after unmount")
+	assert.FileExists(t, file)
+}
+
+// Absent is fine and a file (a raw-block bind target) is removed.
+func TestRemoveMountPoint(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, removeMountPoint(filepath.Join(dir, "absent")))
+	file := filepath.Join(dir, "block-target")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	require.NoError(t, removeMountPoint(file))
+	assert.NoFileExists(t, file)
+	full := filepath.Join(dir, "full")
+	require.NoError(t, os.MkdirAll(filepath.Join(full, "sub"), 0o750))
+	require.ErrorIs(t, removeMountPoint(full), errMountPointNotEmpty)
+	assert.DirExists(t, filepath.Join(full, "sub"))
 }

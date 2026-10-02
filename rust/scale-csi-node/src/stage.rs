@@ -501,15 +501,39 @@ pub(crate) async fn bounded_path_call<T: Send + 'static>(
     }
 }
 
-/// Removes an unmounted mount point without descending into it: absent is
-/// fine, a directory goes only when empty, a file (a raw-block bind target)
-/// goes. Never recursive: what is under a mount point is a volume's data.
-pub(crate) fn remove_mount_point(path: &str) -> std::io::Result<()> {
+/// Removes an unmounted mount point without descending into it (mount-utils
+/// CleanupMountPoint): absent is fine, a directory goes only when empty, a
+/// file (a raw-block bind target) goes. Never recursive: what is under a mount
+/// point may be a volume's data.
+fn remove_mount_point(path: &str) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
         Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
         Ok(_) => std::fs::remove_file(path),
+    }
+}
+
+/// rmdir(2)'s answer for a directory that still has entries.
+fn is_not_empty(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST))
+}
+
+/// Removes an unmounted mount point. A directory that still has files in it
+/// fails the call: reporting success would leave kubelet's own teardown
+/// failing with ENOTEMPTY forever, and the files are not ours to delete.
+/// `what` names the path ("staging path", "target path").
+pub(crate) fn cleanup_mount_point(path: &str, what: &str) -> Result<(), Status> {
+    match remove_mount_point(path) {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_empty(&e) => Err(Status::internal(format!(
+            "{what} {path} is not empty after unmount; its contents (on the node's disk, not the volume) are left in place and must be removed by hand"
+        ))),
+        Err(e) => {
+            warn!("Failed to remove {what} {path}: {e}");
+            Ok(())
+        }
     }
 }
 
@@ -636,9 +660,7 @@ pub async fn node_unstage(
         }
     } else {
         unmount_fully(state, staging, "staging path", deadline).await?;
-        if let Err(e) = remove_mount_point(staging) {
-            warn!("Failed to remove staging directory: {e}");
-        }
+        cleanup_mount_point(staging, "staging path")?;
     }
     if nfs {
         state.records.delete_stage(staging);
@@ -771,6 +793,23 @@ pub fn create_symlink_atomic(target: &Path, link: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mount_point_is_removed_only_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        cleanup_mount_point(&path("absent"), "target path").expect("absent is fine");
+        std::fs::write(path("block-target"), b"").unwrap();
+        cleanup_mount_point(&path("block-target"), "target path").expect("a raw-block bind target goes");
+        assert!(!Path::new(&path("block-target")).exists());
+        std::fs::create_dir(path("empty")).unwrap();
+        cleanup_mount_point(&path("empty"), "target path").unwrap();
+        assert!(!Path::new(&path("empty")).exists());
+        std::fs::create_dir_all(dir.path().join("full/sub")).unwrap();
+        let err = cleanup_mount_point(&path("full"), "target path").unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(dir.path().join("full/sub").exists(), "never recursive");
+    }
 
     #[test]
     fn symlink_replacement_rules() {

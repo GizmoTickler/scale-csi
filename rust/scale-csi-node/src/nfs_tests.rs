@@ -770,16 +770,54 @@ async fn unpublish_never_deletes_through_a_mount_still_stacked_underneath() {
     assert!(exists(&file), "a file on the still-mounted share was deleted");
 }
 
-/// A directory left with files in it after the unmount is not ours to empty.
+/// A directory left with files in it after the unmount is not ours to empty,
+/// and not removable either: the call fails (mount-utils CleanupMountPoint)
+/// rather than report success and leave kubelet failing with ENOTEMPTY.
 #[tokio::test]
-async fn unstage_leaves_a_non_empty_unmounted_directory_in_place() {
+async fn unstage_fails_on_a_non_empty_unmounted_directory_and_keeps_it() {
     let n = nfs_node(NFS_ON);
     let staging = n.path("staging/globalmount");
     std::fs::create_dir_all(&staging).unwrap();
     n.host.mount(&staging, SOURCE, "nfs4");
     let file = format!("{staging}/left-behind");
     std::fs::write(&file, b"x").unwrap();
+    let err = node_unstage(&n.state, &unstage_request(&staging), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message()
+            .contains(&format!("staging path {staging} is not empty after unmount")),
+        "{err:?}"
+    );
+    assert!(!n.host.is_mounted(&staging));
+    assert!(exists(&file));
+
+    // Emptied by hand, the retry finishes.
+    std::fs::remove_file(&file).unwrap();
     node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
+    assert!(!exists(&staging));
+}
+
+#[tokio::test]
+async fn unpublish_fails_on_a_non_empty_unmounted_directory_and_keeps_it() {
+    let n = nfs_node(NFS_ON);
+    let target = n.path("pods/p1/volumes/kubernetes.io~csi/pv/mount");
+    std::fs::create_dir_all(&target).unwrap();
+    n.host.mount(&target, SOURCE, "nfs4");
+    let file = format!("{target}/left-behind");
+    std::fs::write(&file, b"x").unwrap();
+    let req = csi::NodeUnpublishVolumeRequest {
+        volume_id: VOLUME.into(),
+        target_path: target.clone(),
+    };
+    let err = node_unpublish(&n.state, &req, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message()
+            .contains(&format!("target path {target} is not empty after unmount")),
+        "{err:?}"
+    );
     assert!(exists(&file));
 }
 
