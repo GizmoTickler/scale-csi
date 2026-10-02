@@ -1219,3 +1219,26 @@ func TestChartObserveBusyBeforeDeletePlumbing(t *testing.T) {
 		t.Errorf("the schema must reject zfs.observeBusyBeforeDelete=sometimes by name; got:\n%s", out)
 	}
 }
+
+// TestDashboardBusyPanelDescribesOnFailureMode: the delete-observability panel
+// must not claim the busy scans run before every destroy; by default
+// (zfs.observeBusyBeforeDelete: on-failure) they run only after a failed one.
+func TestDashboardBusyPanelDescribesOnFailureMode(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(chartDir(t), "templates", "grafana-dashboard.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	start := strings.Index(content, `"description":"Best-effort delete observability`)
+	if start < 0 {
+		t.Fatal("the delete-observability panel description is missing")
+	}
+	end := strings.Index(content[start+15:], `","`)
+	description := content[start : start+15+end]
+	if strings.Contains(description, "immediately before a dataset destroy") {
+		t.Errorf("the panel still says the scans run before every destroy: %s", description)
+	}
+	if !strings.Contains(description, "on-failure") {
+		t.Errorf("the panel must name the default on-failure mode: %s", description)
+	}
+}
