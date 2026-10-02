@@ -157,8 +157,11 @@ type Driver struct {
 	// above: the cache feeds only read-only CSI listing pages, an empty
 	// starting token always refetches, and no delete/authorization decision
 	// ever reads it.
-	volumePageCacheMu   sync.Mutex
-	volumePageCache     []string // sorted dataset names of the walk's frozen listing
+	volumePageCacheMu sync.Mutex
+	volumePageCache   []listedVolume // the walk's frozen listing, sorted by name
+	// volumePageDeleted is the volumes this controller deleted since the
+	// frozen listing was taken; its later pages leave them out.
+	volumePageDeleted   map[string]struct{}
 	volumePageCacheTime time.Time
 
 	// Ready flag (atomic for safe concurrent access)

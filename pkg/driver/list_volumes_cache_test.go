@@ -12,9 +12,9 @@ import (
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
-// The ListVolumes walk's frozen view holds only the sorted dataset names for
-// its TTL: each page is hydrated by name anyway, so keeping the listing's
-// decoded datasets pinned about 4.5 MB per 1,000 volumes for nothing.
+// The ListVolumes walk's frozen view holds three small fields per volume for
+// its TTL (name, capacity, whether it carries ZFS record keys), never the
+// listing's decoded datasets, which pinned about 4.5 MB per 1,000 volumes.
 func TestListVolumesPageCacheHoldsOnlyNames(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
@@ -32,9 +32,13 @@ func TestListVolumesPageCacheHoldsOnlyNames(t *testing.T) {
 	require.Len(t, first.Entries, 2)
 	assert.Equal(t, "vol-a", first.Entries[0].GetVolume().GetVolumeId())
 	d.volumePageCacheMu.Lock()
-	cached := append([]string(nil), d.volumePageCache...)
+	cached := append([]listedVolume(nil), d.volumePageCache...)
 	d.volumePageCacheMu.Unlock()
-	assert.Equal(t, []string{"pool/parent/vol-a", "pool/parent/vol-b", "pool/parent/vol-c"}, cached)
+	names := make([]string, 0, len(cached))
+	for _, volume := range cached {
+		names = append(names, volume.name)
+	}
+	assert.Equal(t, []string{"pool/parent/vol-a", "pool/parent/vol-b", "pool/parent/vol-c"}, names)
 
 	second, err := d.ListVolumes(ctx, &csi.ListVolumesRequest{MaxEntries: 2, StartingToken: first.NextToken})
 	require.NoError(t, err)

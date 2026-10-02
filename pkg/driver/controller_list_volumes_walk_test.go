@@ -147,13 +147,17 @@ func TestListVolumesContinuationRefetchesAfterTTL(t *testing.T) {
 	assert.Equal(t, []string{"vol-3", "vol-4"}, listWalkPageIDs(t, resp))
 }
 
-// TestListVolumesHydrationMissSkipsDeletedEntry: a dataset deleted between the
-// walk's frozen listing and the page's hydration read simply drops out of the
-// page — no error, and the page math (token advance) is unaffected.
+// TestListVolumesHydrationMissSkipsDeletedEntry: a dataset with ZFS record
+// keys is re-read by name for its page; one deleted between the walk's frozen
+// listing and that re-read simply drops out of the page — no error, and the
+// page math (token advance) is unaffected.
 func TestListVolumesHydrationMissSkipsDeletedEntry(t *testing.T) {
 	mock := truenas.NewMockClient()
 	for i := 0; i < 5; i++ {
-		seedListWalkVolume(mock, fmt.Sprintf("vol-%d", i))
+		ds := seedListWalkVolume(mock, fmt.Sprintf("vol-%d", i))
+		seedListWalkPublicationRecord(t, ds, publicationRecord{
+			Version: publicationRecordVersion, Node: "node-a", EncodedID: "encoded-node-a", State: publicationStatePublished,
+		}, "local")
 	}
 	d := newListWalkDriver(mock)
 
@@ -161,7 +165,7 @@ func TestListVolumesHydrationMissSkipsDeletedEntry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "2", resp.NextToken)
 
-	// vol-2 is in the frozen view but gone by the time page 2 hydrates it.
+	// vol-2 is in the frozen view but gone by the time page 2 re-reads it.
 	delete(mock.Datasets, listWalkParent+"/vol-2")
 
 	resp, err = d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 2, StartingToken: "2"})
@@ -175,6 +179,33 @@ func TestListVolumesHydrationMissSkipsDeletedEntry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"vol-4"}, listWalkPageIDs(t, resp))
 	assert.Empty(t, resp.NextToken)
+}
+
+// A volume this controller deletes mid-walk is left out of the walk's later
+// pages even though nothing re-reads it; the token math is unchanged.
+func TestListVolumesSkipsAVolumeDeletedMidWalk(t *testing.T) {
+	mock := truenas.NewMockClient()
+	for i := 0; i < 5; i++ {
+		seedListWalkVolume(mock, fmt.Sprintf("vol-%d", i))
+	}
+	d := newListWalkDriver(mock)
+
+	resp, err := d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 2})
+	require.NoError(t, err)
+	require.Equal(t, "2", resp.NextToken)
+
+	_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "vol-2"})
+	require.NoError(t, err)
+
+	resp, err = d.ListVolumes(context.Background(), &csi.ListVolumesRequest{MaxEntries: 2, StartingToken: "2"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"vol-3"}, listWalkPageIDs(t, resp))
+	assert.Equal(t, "4", resp.NextToken)
+
+	// A new walk lists what is there.
+	resp, err = d.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"vol-0", "vol-1", "vol-3", "vol-4"}, listWalkPageIDs(t, resp))
 }
 
 // seedListWalkPublicationRecord stores a publication record user property the
@@ -272,16 +303,25 @@ func TestControllerGetCapabilitiesAdvertisesListVolumesPublishedNodes(t *testing
 	assert.True(t, advertised[csi.ControllerServiceCapability_RPC_LIST_VOLUMES_PUBLISHED_NODES])
 }
 
-// TestListVolumesWalkAPICallBudget pins the P-2 API shape: a full walk costs
-// exactly ONE path-scoped listing call (fresh page only) plus ONE id-filtered
-// DatasetGetByNames hydration per page — and ZERO pool.dataset.query
-// DatasetList calls, whose cost scaled with total system dataset count.
+// TestListVolumesWalkAPICallBudget pins the API shape: a full walk costs
+// exactly ONE path-scoped listing call (fresh page only), one id-filtered
+// DatasetGetByNames re-read for each page that holds a dataset with ZFS
+// publication record keys (and only those datasets), and ZERO
+// pool.dataset.query DatasetList calls, whose cost scaled with total system
+// dataset count. Until v1.22 every page was re-read: 1 + pages calls.
 func TestListVolumesWalkAPICallBudget(t *testing.T) {
 	client := newAPICallCountingClient()
 	for i := 0; i < 5; i++ {
-		seedListWalkVolume(client.MockClient, fmt.Sprintf("vol-%d", i))
+		ds := seedListWalkVolume(client.MockClient, fmt.Sprintf("vol-%d", i))
+		if i == 3 {
+			// A volume whose ZFS records the import has not moved yet.
+			seedListWalkPublicationRecord(t, ds, publicationRecord{
+				Version: publicationRecordVersion, Node: "node-a", EncodedID: "encoded-node-a", State: publicationStatePublished,
+			}, "local")
+		}
 	}
-	d := newListWalkDriver(client)
+	reads := &recordingDatasetGetByNames{apiCallCountingClient: client}
+	d := newListWalkDriver(reads)
 
 	token := ""
 	pages := 0
@@ -298,9 +338,21 @@ func TestListVolumesWalkAPICallBudget(t *testing.T) {
 
 	total, methods := client.callSnapshot()
 	assert.Equal(t, 1, methods["DatasetQueryByParent"], "one listing per walk")
-	assert.Equal(t, pages, methods["DatasetGetByNames"], "one page hydration per page")
+	assert.Equal(t, [][]string{{listWalkParent + "/vol-3"}}, reads.names,
+		"only the dataset with ZFS record keys is re-read")
 	assert.Zero(t, methods["DatasetList"], "the full-system-materializing filtered query must not run")
-	assert.Equal(t, 1+pages, total, "no other backend call may hide in the walk")
+	assert.Equal(t, 2, total, "no other backend call may hide in the walk")
+}
+
+// recordingDatasetGetByNames records the names each DatasetGetByNames reads.
+type recordingDatasetGetByNames struct {
+	*apiCallCountingClient
+	names [][]string
+}
+
+func (c *recordingDatasetGetByNames) DatasetGetByNames(ctx context.Context, names []string) (map[string]*truenas.Dataset, error) {
+	c.names = append(c.names, append([]string(nil), names...))
+	return c.apiCallCountingClient.DatasetGetByNames(ctx, names)
 }
 
 // failingResourceQueryClient forces listAllManagedDatasets onto its paged
