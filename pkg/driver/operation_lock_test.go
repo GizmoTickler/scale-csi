@@ -37,9 +37,9 @@ func TestLockModeCompatibility(t *testing.T) {
 	for _, held := range modes {
 		for _, wanted := range modes {
 			var table operationLockTable
-			ok, _ := table.tryAcquire("volume:v", held)
+			ok := table.tryAcquire("volume:v", held)
 			require.True(t, ok)
-			got, _ := table.tryAcquire("volume:v", wanted)
+			got := table.tryAcquire("volume:v", wanted)
 			assert.Equal(t, compatible[[2]lockMode{held, wanted}], got, "held %s, wanted %s", held, wanted)
 		}
 	}
@@ -313,4 +313,107 @@ func TestLockPublishResolvesTheNodeIdentityAfterTheWait(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, associations, 1)
 	assert.Equal(t, "nqn.2014-08.org.nvmexpress:uuid:new", associations[0].HostNQN)
+}
+
+// Ten publishes of one RWX volume arrive while another publish holds it: one
+// waits, the other nine return Aborted at once instead of each holding an
+// attacher worker for the whole wait.
+func TestLockOnlyOneAttachWaiterPerVolume(t *testing.T) {
+	setAttachLockWait(t, 5*time.Second)
+	d, _ := newLockTestVolume(t, "rwx")
+	key := volumeLockKey("rwx")
+	require.True(t, d.acquireOperationLockMode(key, lockAttach)) // a publish in flight
+	const publishes = 10
+	type result struct {
+		err error
+		at  time.Duration
+	}
+	results := make(chan result, publishes)
+	start := time.Now()
+	for i := range publishes {
+		go func() {
+			_, err := d.ControllerPublishVolume(context.Background(), lockTestPublishRequest(t, "rwx",
+				"worker-"+strconv.Itoa(i), csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER))
+			results <- result{err, time.Since(start)}
+		}()
+	}
+	for range publishes - 1 {
+		select {
+		case r := <-results:
+			assert.Equal(t, codes.Aborted, status.Code(r.err))
+			assert.Less(t, r.at, time.Second, "a second waiter was parked")
+		case <-time.After(3 * time.Second):
+			t.Fatal("more than one publish is waiting on the volume")
+		}
+	}
+	select {
+	case r := <-results:
+		t.Fatalf("the waiting publish returned before the holder let go: %v", r.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	d.releaseOperationLockMode(key, lockAttach)
+	r := <-results
+	require.NoError(t, r.err, "the waiting publish goes ahead once the holder lets go")
+}
+
+// While the startup worker waits for a volume's lock, no new shared holder
+// is let in ahead of it: attach and data holders that overlap one another
+// could otherwise keep the volume from ever being free for it.
+func TestLockExclusiveWaiterHoldsBackNewSharedHolders(t *testing.T) {
+	d := &Driver{}
+	key := volumeLockKey("v")
+	require.True(t, d.acquireOperationLockMode(key, lockData)) // a snapshot in flight
+	got := make(chan bool, 1)
+	go func() { got <- d.acquireOperationLockWait(context.Background(), key, 5*time.Second) }()
+	require.Eventually(t, func() bool {
+		if d.acquireOperationLockMode(key, lockAttach) {
+			d.releaseOperationLockMode(key, lockAttach)
+			return false
+		}
+		return true
+	}, 3*time.Second, time.Millisecond, "a publish was let in ahead of the waiting startup worker")
+	d.releaseOperationLockMode(key, lockData)
+	require.True(t, <-got)
+	d.releaseOperationLock(key)
+	// Once it has the lock and lets go, shared holders come in again.
+	require.True(t, d.acquireOperationLockMode(key, lockAttach))
+	d.releaseOperationLockMode(key, lockAttach)
+	assert.Empty(t, d.heldOperationLocks())
+}
+
+// An exclusive waiter that gives up lets the shared waiter it held back go.
+func TestLockExclusiveWaiterGivingUpReleasesTheSharedWaiter(t *testing.T) {
+	d := &Driver{}
+	key := volumeLockKey("v")
+	require.True(t, d.acquireOperationLockMode(key, lockAttach))
+	exclusive := make(chan bool, 1)
+	go func() { exclusive <- d.acquireOperationLockWait(context.Background(), key, 100*time.Millisecond) }()
+	require.Eventually(t, func() bool {
+		if d.acquireOperationLockMode(key, lockData) {
+			d.releaseOperationLockMode(key, lockData)
+			return false
+		}
+		return true
+	}, 3*time.Second, time.Millisecond)
+	require.False(t, <-exclusive)
+	assert.True(t, d.acquireOperationLockMode(key, lockData), "the exclusive waiter's hold-back outlived it")
+	d.releaseOperationLockMode(key, lockData)
+	d.releaseOperationLockMode(key, lockAttach)
+	assert.Empty(t, d.heldOperationLocks())
+	d.operationLocks.mu.Lock()
+	defer d.operationLocks.mu.Unlock()
+	assert.Empty(t, d.operationLocks.held, "an entry outlived its holders and waiters")
+}
+
+// The debug endpoint names the modes a volume is held in.
+func TestLockDebugStateShowsModes(t *testing.T) {
+	d := newDebugTestDriver()
+	require.True(t, d.acquireOperationLockMode(volumeLockKey("x"), lockAttach))
+	require.True(t, d.acquireOperationLockMode(volumeLockKey("x"), lockData))
+	require.True(t, d.acquireOperationLock(volumeLockKey("y")))
+	server := NewDebugServer(d, "127.0.0.1:0")
+	require.NotNil(t, server)
+	state, _ := fetchDebugState(t, server)
+	assert.Equal(t, []string{"volume:x(attach+data)", "volume:y"}, state.OperationLocks)
+	assert.Equal(t, []string{"volume:x", "volume:y"}, d.heldOperationLocks())
 }

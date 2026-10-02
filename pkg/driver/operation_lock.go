@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -54,18 +55,42 @@ func (m lockMode) String() string {
 // short of the attacher's 120 s timeout, and long enough to cover a typical
 // conflicting operation (a publish of the same volume, an expand), so the
 // attacher no longer backs off for longer than the conflict lasted.
+//
+// At most one attach-class operation waits per volume: any further one
+// returns Aborted at once. Without that cap, an RWX volume with ten or more
+// VolumeAttachments in flight would park every attacher worker on one key
+// and stall attaches cluster-wide. One waiter costs at most one worker per
+// contended volume, and it waits for a release, not for the bound: behind
+// another publish or unpublish that is a few seconds. A shorter wait behind
+// attach-class holders would only turn that into an Aborted and the
+// attacher's backoff, which is what the wait is there to avoid.
 var attachLockWait = 8 * time.Second
 
-// heldLock is one key's holders. released is closed, and replaced, whenever
-// a holder lets go, so a waiter re-checks without polling.
+// heldLock is one key's holders and waiters. released is closed, and
+// replaced, whenever a holder lets go or a waiter gives up, so a waiter
+// re-checks without polling.
+//
+// An exclusive waiter (the startup worker; nothing else waits exclusively)
+// holds back new shared holders while it waits: otherwise attach and data
+// holders that overlap one another could keep the key from ever being free
+// for it. Shared holders already in keep their hold; the waiter's own wait
+// is bounded.
 type heldLock struct {
 	exclusive bool
 	attach    bool
 	data      bool
 	released  chan struct{}
+
+	attachWaiting    bool
+	exclusiveWaiting int
 }
 
 func (h *heldLock) empty() bool { return !h.exclusive && !h.attach && !h.data }
+
+// unused is whether the entry can go: no holder and no waiter.
+func (h *heldLock) unused() bool {
+	return h.empty() && !h.attachWaiting && h.exclusiveWaiting == 0
+}
 
 // admits is whether mode can be taken alongside the current holders.
 func (h *heldLock) admits(mode lockMode) bool {
@@ -74,9 +99,9 @@ func (h *heldLock) admits(mode lockMode) bool {
 	}
 	switch mode {
 	case lockAttach:
-		return !h.attach
+		return !h.attach && h.exclusiveWaiting == 0
 	case lockData:
-		return !h.data
+		return !h.data && h.exclusiveWaiting == 0
 	default:
 		return h.empty()
 	}
@@ -104,17 +129,19 @@ func (h *heldLock) holds(mode lockMode) bool {
 	}
 }
 
+// signal wakes the waiters to re-check.
+func (h *heldLock) signal() {
+	close(h.released)
+	h.released = make(chan struct{})
+}
+
 // operationLockTable is the driver's per-key operation locks.
 type operationLockTable struct {
 	mu   sync.Mutex
 	held map[string]*heldLock
 }
 
-// tryAcquire takes key in mode if no holder conflicts. Otherwise it returns
-// the channel closed at the next release, for a waiter.
-func (t *operationLockTable) tryAcquire(key string, mode lockMode) (acquired bool, released <-chan struct{}) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *operationLockTable) entryLocked(key string) *heldLock {
 	if t.held == nil {
 		t.held = make(map[string]*heldLock)
 	}
@@ -123,11 +150,89 @@ func (t *operationLockTable) tryAcquire(key string, mode lockMode) (acquired boo
 		h = &heldLock{released: make(chan struct{})}
 		t.held[key] = h
 	}
+	return h
+}
+
+// tryAcquire takes key in mode if it is admitted now.
+func (t *operationLockTable) tryAcquire(key string, mode lockMode) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h := t.entryLocked(key)
 	if !h.admits(mode) {
-		return false, h.released
+		return false
 	}
 	h.set(mode, true)
+	return true
+}
+
+// acquireOrPark takes key in mode, or registers the caller as a waiter and
+// returns the channel to wait on. A second attach-class waiter is refused
+// (parked false, no channel).
+func (t *operationLockTable) acquireOrPark(key string, mode lockMode) (acquired, parked bool, released <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h := t.entryLocked(key)
+	if h.admits(mode) {
+		h.set(mode, true)
+		return true, false, nil
+	}
+	switch mode {
+	case lockAttach:
+		if h.attachWaiting {
+			return false, false, nil
+		}
+		h.attachWaiting = true
+	case lockExclusive:
+		h.exclusiveWaiting++
+	case lockData:
+	}
+	return false, true, h.released
+}
+
+// retryParked is a waiter's re-check: it takes key in mode and stops waiting
+// if admitted, or returns the channel to wait on next.
+func (t *operationLockTable) retryParked(key string, mode lockMode) (acquired bool, released <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h := t.entryLocked(key)
+	if mode == lockExclusive {
+		// Its own pending flag must not hold it back.
+		if !h.empty() {
+			return false, h.released
+		}
+	} else if !h.admits(mode) {
+		return false, h.released
+	}
+	t.unparkLocked(h, mode)
+	h.set(mode, true)
 	return true, nil
+}
+
+// giveUp ends a wait that did not acquire.
+func (t *operationLockTable) giveUp(key string, mode lockMode) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h, ok := t.held[key]
+	if !ok {
+		return
+	}
+	t.unparkLocked(h, mode)
+	h.signal() // a shared waiter held back by this one re-checks
+	if h.unused() {
+		delete(t.held, key)
+	}
+}
+
+func (t *operationLockTable) unparkLocked(h *heldLock, mode lockMode) {
+	switch mode {
+	case lockAttach:
+		h.attachWaiting = false
+	case lockExclusive:
+		if h.exclusiveWaiting > 0 {
+			h.exclusiveWaiting--
+		}
+	case lockData:
+	}
 }
 
 func (t *operationLockTable) release(key string, mode lockMode) {
@@ -138,16 +243,40 @@ func (t *operationLockTable) release(key string, mode lockMode) {
 		return
 	}
 	h.set(mode, false)
-	close(h.released)
-	if h.empty() {
+	h.signal()
+	if h.unused() {
 		delete(t.held, key)
-		return
 	}
-	h.released = make(chan struct{})
 }
 
-// keys is every key held in any mode, sorted.
+// keys is every key held in any mode, sorted. A key held in a shared mode
+// carries its modes, as "volume:x(attach+data)".
 func (t *operationLockTable) keys() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, 0, len(t.held))
+	for key, h := range t.held {
+		if h.empty() {
+			continue
+		}
+		var modes []string
+		if h.attach {
+			modes = append(modes, lockAttach.String())
+		}
+		if h.data {
+			modes = append(modes, lockData.String())
+		}
+		if len(modes) > 0 {
+			key += "(" + strings.Join(modes, "+") + ")"
+		}
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// heldKeys is every key held in any mode, bare and sorted.
+func (t *operationLockTable) heldKeys() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	out := make([]string, 0, len(t.held))
@@ -168,7 +297,7 @@ func (d *Driver) acquireOperationLock(key string) bool {
 
 // acquireOperationLockMode takes key in mode without waiting.
 func (d *Driver) acquireOperationLockMode(key string, mode lockMode) bool {
-	ok, _ := d.operationLocks.tryAcquire(key, mode)
+	ok := d.operationLocks.tryAcquire(key, mode)
 	if ok {
 		d.operationLockTaken(key)
 	}
@@ -191,14 +320,18 @@ func (d *Driver) acquireOperationLockWait(ctx context.Context, key string, wait 
 }
 
 // acquireOperationLockModeWait takes key in mode, waiting up to wait for the
-// conflicting holders to let go.
+// conflicting holders to let go. An attach-class caller that finds another
+// attach-class caller already waiting on key returns false at once.
 func (d *Driver) acquireOperationLockModeWait(ctx context.Context, key string, mode lockMode, wait time.Duration) bool {
-	ok, released := d.operationLocks.tryAcquire(key, mode)
-	if ok {
+	if wait <= 0 {
+		return d.acquireOperationLockMode(key, mode)
+	}
+	acquired, parked, released := d.operationLocks.acquireOrPark(key, mode)
+	if acquired {
 		d.operationLockTaken(key)
 		return true
 	}
-	if wait <= 0 {
+	if !parked {
 		return false
 	}
 	timer := time.NewTimer(wait)
@@ -207,11 +340,13 @@ func (d *Driver) acquireOperationLockModeWait(ctx context.Context, key string, m
 		select {
 		case <-released:
 		case <-timer.C:
+			d.operationLocks.giveUp(key, mode)
 			return false
 		case <-ctx.Done():
+			d.operationLocks.giveUp(key, mode)
 			return false
 		}
-		if ok, released = d.operationLocks.tryAcquire(key, mode); ok {
+		if acquired, released = d.operationLocks.retryParked(key, mode); acquired {
 			d.operationLockTaken(key)
 			return true
 		}
@@ -228,7 +363,13 @@ func (d *Driver) releaseOperationLockMode(key string, mode lockMode) {
 	d.operationLocks.release(key, mode)
 }
 
-// heldOperationLocks is every key held in any mode, sorted.
+// heldOperationLocks is every key held in any mode, bare and sorted.
 func (d *Driver) heldOperationLocks() []string {
+	return d.operationLocks.heldKeys()
+}
+
+// describedOperationLocks is heldOperationLocks with each shared hold's
+// modes, for the debug endpoint.
+func (d *Driver) describedOperationLocks() []string {
 	return d.operationLocks.keys()
 }
