@@ -126,6 +126,34 @@ async fn an_unreadable_device_skips_the_pass() {
     assert!(disconnects(&n).is_empty());
 }
 
+/// A staged multipath head whose founding controller went away (another path
+/// still live) is identified through its block device, so the pass still
+/// runs and an orphan is collected.
+#[tokio::test]
+async fn a_head_without_its_founding_controller_does_not_skip_the_pass() {
+    let n = gc_node(GC);
+    let staged = "nqn.2011-06.com.example:staged";
+    kernel(&n, |k| {
+        k.add_live(staged, "192.0.2.20"); // subsystem 0 founded by nvme0
+        k.add_live(staged, "192.0.2.21"); // second path, nvme1
+        k.add_live(NQN, "192.0.2.20"); // an orphan of ours
+        k.lose_founding_controller(staged);
+    });
+    let registry = n.state.nvme_sessions.as_ref().unwrap();
+    registry.record(staged).unwrap();
+    registry.record(NQN).unwrap();
+    let device = kernel(&n, |k| k.device(staged).unwrap());
+    assert!(device.ends_with("nvme0n1"), "{device}");
+    assert!(!n.dir.path().join("sys/class/nvme/nvme0").exists());
+    stage_link(&n, &device);
+
+    gc_nvmeof(&n.state, &stop()).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    gc_nvmeof(&n.state, &stop()).await;
+    assert_eq!(disconnects(&n), [format!("nvme disconnect -n {NQN}")]);
+    assert!(registry.has(staged), "the staged session is kept");
+}
+
 #[tokio::test]
 async fn a_dry_run_disconnects_nothing() {
     let n = gc_node(&format!("{GC}  dryRun: true\n"));

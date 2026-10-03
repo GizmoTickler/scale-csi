@@ -826,3 +826,126 @@ func TestNVMeoFDisconnectUnknownFailureStillFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "disconnect failed")
 	assert.Contains(t, err.Error(), "exit status 1")
 }
+
+// A native-multipath head disk is named after the subsystem instance, which
+// the kernel takes from the founding controller. When that controller goes
+// away while other paths stay live, /sys/class/nvme/nvmeX disappears, and the
+// NQN lookup used to fail, pausing session GC for the whole protocol. The
+// block device's own sysfs node resolves to the subsystem, which survives.
+func TestGetNVMeInfoFromDeviceSurvivesLossOfTheFoundingController(t *testing.T) {
+	sys := t.TempDir()
+	subsys := filepath.Join(sys, "devices", "virtual", "nvme-subsystem", "nvme-subsys0")
+	require.NoError(t, os.MkdirAll(subsys, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(subsys, "subsysnqn"), []byte("nqn.2011-06.com.truenas:uuid:x:pvc-1\n"), 0o600))
+	head := filepath.Join(subsys, "nvme0n1")
+	require.NoError(t, os.MkdirAll(head, 0o750))
+	require.NoError(t, os.Symlink(subsys, filepath.Join(head, "device")))
+	require.NoError(t, os.MkdirAll(filepath.Join(sys, "block"), 0o750))
+	require.NoError(t, os.Symlink(head, filepath.Join(sys, "block", "nvme0n1")))
+	// Surviving controllers exist; the founding one (nvme0) does not.
+	require.NoError(t, os.MkdirAll(filepath.Join(sys, "class", "nvme", "nvme1"), 0o750))
+
+	nqn, err := GetNVMeInfoFromDeviceAt(sys, "/dev/nvme0n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nqn.2011-06.com.truenas:uuid:x:pvc-1", nqn)
+}
+
+// The controller-class lookup still works when the block node has no
+// subsysnqn to offer.
+func TestGetNVMeInfoFromDeviceFallsBackToTheController(t *testing.T) {
+	sys := t.TempDir()
+	ctrl := filepath.Join(sys, "class", "nvme", "nvme3")
+	require.NoError(t, os.MkdirAll(ctrl, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(ctrl, "subsysnqn"), []byte("nqn.local\n"), 0o600))
+	nqn, err := GetNVMeInfoFromDeviceAt(sys, "/dev/nvme3n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nqn.local", nqn)
+
+	_, err = GetNVMeInfoFromDeviceAt(sys, "/dev/nvme9n1")
+	require.Error(t, err, "no block node and no controller is still a failed lookup")
+}
+
+// fakeMultipathHead builds the sysfs of a native-multipath head disk
+// nvme<instance>n1: the subsystem device carries subsysnqn and links each
+// controller by name, the head's device is the subsystem, and each
+// controller in states (name -> state) has its class directory. A founding
+// controller left out of states models one that went away.
+func fakeMultipathHead(t *testing.T, sys string, instance int, nqn string, states map[string]string) {
+	t.Helper()
+	subsys := filepath.Join(sys, "devices", "virtual", "nvme-subsystem", fmt.Sprintf("nvme-subsys%d", instance))
+	require.NoError(t, os.MkdirAll(subsys, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(subsys, "subsysnqn"), []byte(nqn+"\n"), 0o600))
+	head := filepath.Join(subsys, fmt.Sprintf("nvme%dn1", instance))
+	require.NoError(t, os.MkdirAll(head, 0o750))
+	require.NoError(t, os.Symlink(subsys, filepath.Join(head, "device")))
+	require.NoError(t, os.MkdirAll(filepath.Join(sys, "block"), 0o750))
+	require.NoError(t, os.Symlink(head, filepath.Join(sys, "block", filepath.Base(head))))
+	for name, state := range states {
+		ctrl := filepath.Join(sys, "class", "nvme", name)
+		require.NoError(t, os.MkdirAll(ctrl, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(ctrl, "state"), []byte(state+"\n"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(ctrl, "transport"), []byte("tcp\n"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(ctrl, "subsysnqn"), []byte(nqn+"\n"), 0o600))
+		require.NoError(t, os.Symlink(ctrl, filepath.Join(subsys, name)))
+	}
+}
+
+// writeRecordingNVMe installs a fake nvme that appends its argv to a log and
+// returns the log's path.
+func writeRecordingNVMe(t *testing.T) string {
+	t.Helper()
+	log := filepath.Join(t.TempDir(), "nvme.log")
+	writeFakeNVMe(t, "#!/bin/sh\necho \"$*\" >> '"+log+"'\n")
+	return log
+}
+
+// The founding controller (nvme0) of a multipath head is gone; nvme1 and
+// nvme2 are paths of the same subsystem. The rescan goes to a live one of
+// them: /dev/nvme0 no longer exists.
+func TestNVMeRescanUsesALiveControllerWhenTheFounderIsGone(t *testing.T) {
+	sys := t.TempDir()
+	fakeMultipathHead(t, sys, 0, "nqn.test:pvc-1", map[string]string{"nvme1": "connecting", "nvme2": "live"})
+	log := writeRecordingNVMe(t)
+	require.NoError(t, NVMeRescanAt(context.Background(), sys, "/dev/nvme0n1"))
+	got, err := os.ReadFile(log)
+	require.NoError(t, err)
+	assert.Equal(t, "ns-rescan /dev/nvme2\n", string(got))
+}
+
+// With its founding controller live the head is rescanned through it, as
+// before; a non-multipath namespace through its own controller; and with no
+// sysfs evidence through the controller its name points at.
+func TestNVMeRescanControllerSelection(t *testing.T) {
+	sys := t.TempDir()
+	fakeMultipathHead(t, sys, 0, "nqn.test:a", map[string]string{"nvme0": "live", "nvme1": "live"})
+	got, err := nvmeNamespaceControllerAt(sys, "nvme0n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nvme0", got)
+
+	ctrl := filepath.Join(sys, "class", "nvme", "nvme7")
+	require.NoError(t, os.MkdirAll(filepath.Join(ctrl, "nvme7n1"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(ctrl, "transport"), []byte("pcie\n"), 0o600))
+	require.NoError(t, os.Symlink(ctrl, filepath.Join(ctrl, "nvme7n1", "device")))
+	require.NoError(t, os.Symlink(filepath.Join(ctrl, "nvme7n1"), filepath.Join(sys, "block", "nvme7n1")))
+	got, err = nvmeNamespaceControllerAt(sys, "nvme7n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nvme7", got)
+
+	got, err = nvmeNamespaceControllerAt(sys, "nvme9n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nvme9", got)
+
+	_, err = nvmeNamespaceControllerAt(sys, "nvme9n1p1")
+	require.Error(t, err, "a partition is not a namespace")
+}
+
+// A multipath head's device is the subsystem, which has no transport; the
+// transport is read from a controller of the subsystem, not from the founding
+// one the head is named after.
+func TestIsNVMeFabricSurvivesLossOfTheFoundingController(t *testing.T) {
+	sys := t.TempDir()
+	fakeMultipathHead(t, sys, 0, "nqn.test:pvc-1", map[string]string{"nvme1": "live"})
+	fabric, err := isNVMeFabricAt(sys, "/dev/nvme0n1")
+	require.NoError(t, err)
+	assert.True(t, fabric)
+}

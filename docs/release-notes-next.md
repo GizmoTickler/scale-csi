@@ -1,6 +1,57 @@
-# Release notes — next (v1.24.0 draft)
+# Release notes — next (v1.24.1 draft)
 
-## v1.24.0 (draft) — fewer TrueNAS calls to delete a volume and to move an iSCSI volume
+## v1.24.1 (draft) — an NVMe-oF head disk outlives its first path, also on expand
+
+Nothing to configure. Two fixes to the same mistake, in both node agents
+(the Rust agent, the default since v1.21.0, and the Go node plugin): a
+multipath head disk was looked up through the controller its name points at.
+
+- **A namespace's NQN is read through its block device.** With native NVMe
+  multipath, the head disk `nvmeXnY` is named after the subsystem instance,
+  which the kernel takes from the controller that founded the subsystem. The
+  node read the subsystem NQN from `/sys/class/nvme/nvmeX`, that founding
+  controller. Once that one path went away while the others stayed live, the
+  lookup failed, although the volume itself kept working. The node now reads
+  `/sys/block/nvmeXnY/device/subsysnqn` first: for a multipath head that is
+  the subsystem, which lives as long as any path does; for a non-multipath
+  namespace it is the controller. The controller lookup stays as the
+  fallback. Until the lost path came back, in both agents:
+  - session GC skipped its NVMe-oF pass on that node, so no orphaned session
+    was collected (nothing was disconnected wrongly);
+  - a raw-block NodePublishVolume, a block NodeExpandVolume and a repeated
+    NodeStageVolume of that volume failed with `Internal` ("failed to
+    identify ...");
+  - the `fast_io_fail_tmo` convergence passed over that subsystem's
+    controllers.
+- **NodeExpandVolume rescans through a live controller.** The rescan ran
+  `nvme ns-rescan /dev/nvmeX`, X again taken from the head's name. With the
+  founding controller gone that node no longer exists, so the expand failed
+  after the ownership check. The node now picks a controller of the head's
+  subsystem from `/sys/block/nvmeXnY/device` (the subsystem links each of
+  its controllers by name), preferring a `live` one and the founding one
+  when it is still there; one live path is enough, because the kernel
+  updates the head's capacity from whichever path rescans. A non-multipath
+  namespace is rescanned through its own controller, and with no sysfs
+  evidence the name's controller is used, as before. The Go plugin's
+  `IsNVMeFabric` (no caller in the node today) reads the transport the same
+  way; the subsystem itself has no `transport` attribute. The Rust agent tells NVMe from iSCSI by the
+  device name alone, so it had no transport lookup to fix.
+
+The old lookup could only fail, never answer with another subsystem: the
+kernel keeps the founding controller's instance number reserved while the
+subsystem exists (`nvme_free_ctrl` does not release a controller instance
+that is also the subsystem's, `nvme_release_subsystem` does), so
+`/sys/class/nvme/nvmeX` cannot be reused by another subsystem's controller
+in the meantime. Checked against the Linux 7.2.8 source,
+`drivers/nvme/host/core.c`.
+
+### Rolling back to v1.24.0
+
+Nothing to undo. Rolled back, the NQN lookup, the rescan and the transport
+check go through the founding controller again.
+
+
+## v1.24.0 — fewer TrueNAS calls to delete a volume and to move an iSCSI volume
 
 One default changes (`zfs.observeBusyBeforeDelete`, below); nothing else to
 configure.

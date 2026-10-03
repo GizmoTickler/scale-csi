@@ -538,6 +538,38 @@ async fn a_kernel_filesystem_grows_after_a_rescan() {
     assert!(rescan.is_some() && resize.is_some() && rescan < resize, "{calls:?}");
 }
 
+/// A raw-block volume on a multipath head whose founding controller went
+/// away (another path still live) grows: its ownership is read through the
+/// block device, and the rescan goes to the live controller, not /dev/nvme0.
+#[tokio::test]
+async fn kernel_raw_block_expansion_survives_loss_of_the_founding_controller() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    {
+        let mut host = n.host.0.lock().unwrap();
+        let k = host.kernel.as_mut().unwrap();
+        assert_eq!(k.add_controller(NQN, "192.0.2.21", "live", "off"), "nvme1");
+        k.lose_founding_controller(NQN);
+    }
+    let size = set_size(&n, "nvme0n1", 10 << 30);
+    n.host.0.lock().unwrap().kernel.as_mut().unwrap().on_rescan = Some((size, format!("{}\n", (20i64 << 30) / 512)));
+    std::fs::create_dir_all(n.path("pods/p")).unwrap();
+    let target = n.path("pods/p/dev");
+    std::fs::write(&target, b"").unwrap();
+    let resp = crate::capacity::node_expand_volume(&n.state, &expand_request(&n, &target, 20 << 30, block()), None)
+        .await
+        .unwrap();
+    assert_eq!(resp.capacity_bytes, 20 << 30);
+    let rescans: Vec<String> = nvme_calls(&n)
+        .into_iter()
+        .filter(|c| c.starts_with("nvme ns-rescan"))
+        .collect();
+    let live = n.daemon.dev_dir.path().join("nvme1");
+    assert_eq!(rescans, [format!("nvme ns-rescan {}", live.display())]);
+}
+
 #[tokio::test]
 async fn kernel_raw_block_expansion_checks_ownership_and_never_resizes() {
     let n = kernel_node(SINGLE);
@@ -601,6 +633,33 @@ async fn a_kernel_publish_checks_raw_block_ownership() {
     other.target_path = n.path("pods/q/volumeDevices/publish/pv");
     let err = crate::publish::node_publish(&n.state, &other, None).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+}
+
+/// A multipath head whose founding controller went away (another path still
+/// live) is still this volume's: its ownership is read through the block
+/// device, so a raw-block publish is not refused with an internal error.
+#[tokio::test]
+async fn a_raw_block_publish_survives_loss_of_the_founding_controller() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    {
+        let mut host = n.host.0.lock().unwrap();
+        let k = host.kernel.as_mut().unwrap();
+        k.add_live(NQN, "192.0.2.21");
+        k.lose_founding_controller(NQN);
+    }
+    assert!(!n.dir.path().join("sys/class/nvme/nvme0").exists());
+    let publish = csi::NodePublishVolumeRequest {
+        volume_id: VOLUME.into(),
+        staging_target_path: n.path("staging/globalmount"),
+        target_path: n.path("pods/p/volumeDevices/publish/pv"),
+        volume_capability: Some(block()),
+        volume_context: kernel_context(),
+        ..Default::default()
+    };
+    crate::publish::node_publish(&n.state, &publish, None).await.unwrap();
 }
 
 /// The handover race: the other plugin disconnected the subsystem, this one

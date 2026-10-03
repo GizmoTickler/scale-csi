@@ -234,6 +234,12 @@ pub fn controller_of(device: &str) -> Option<&str> {
     (digits(ctrl) && digits(ns)).then(|| &name[..4 + ctrl.len()])
 }
 
+/// A controller name, `nvmeN`.
+fn is_controller_name(name: &str) -> bool {
+    name.strip_prefix("nvme")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// A namespace device name, `nvmeNnM`.
 pub fn is_namespace_name(name: &str) -> bool {
     controller_of(name).is_some() && !name.contains('/')
@@ -379,9 +385,45 @@ impl Nvme {
         }
     }
 
-    /// `nvme ns-rescan /dev/nvmeN` for the controller owning a namespace device.
+    /// The controller to address a namespace device through (Go
+    /// nvmeNamespaceControllerAt). A native multipath head `nvmeXnY` is named
+    /// after the subsystem instance, inherited from the founding controller;
+    /// once that controller is gone, `/dev/nvmeX` no longer exists although
+    /// other paths are live. `/sys/block/<dev>/device` is the subsystem for a
+    /// head (it links each of its controllers by name) and the controller for
+    /// a non-multipath namespace. A live controller is preferred, the one the
+    /// name points at first; with no sysfs evidence, the name's controller.
+    pub fn controller_for(&self, device: &str) -> Result<String> {
+        let named = controller_of(device).with_context(|| format!("invalid NVMe namespace device: {device}"))?;
+        // controller_of validated the file name as `nvmeNnM`.
+        let name = Path::new(device).file_name().unwrap_or_default();
+        let link = self.sysfs.join("block").join(name).join("device");
+        let mut candidates = glob_names(&link, is_controller_name);
+        if candidates.is_empty()
+            && link.join("transport").exists()
+            && let Some(own) = std::fs::canonicalize(&link)
+                .ok()
+                .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+                .filter(|n| is_controller_name(n))
+        {
+            candidates.push(own);
+        }
+        // Sorted by glob_names; the named controller first.
+        candidates.sort_by_key(|c| c != named);
+        let live = candidates.iter().find(|c| {
+            std::fs::read_to_string(self.sysfs.join("class/nvme").join(c).join("state"))
+                .is_ok_and(|s| s.trim() == "live")
+        });
+        Ok(live
+            .or(candidates.first())
+            .cloned()
+            .unwrap_or_else(|| named.to_string()))
+    }
+
+    /// `nvme ns-rescan /dev/nvmeN` through a live controller of a namespace
+    /// device's subsystem (see `controller_for`).
     pub async fn rescan(&self, device: &str, deadline: Option<Instant>) -> Result<()> {
-        let controller = controller_of(device).with_context(|| format!("invalid NVMe namespace device: {device}"))?;
+        let controller = self.controller_for(device)?;
         let path = self.dev.join(controller);
         let path = path.to_string_lossy();
         let out = self
@@ -523,9 +565,27 @@ impl Nvme {
         }
     }
 
-    /// The subsystem NQN of a namespace device, from its controller in sysfs.
+    /// The subsystem NQN of a namespace device (Go GetNVMeInfoFromDevice).
+    ///
+    /// The block device is asked first: for a native multipath head
+    /// (`nvmeXnY`), `/sys/block/nvmeXnY/device` is the subsystem
+    /// (`nvme-subsysX`), which carries `subsysnqn` and lives as long as any
+    /// path does. The name's `nvmeX` is only the subsystem instance, inherited
+    /// from the founding controller: once that controller is gone,
+    /// `/sys/class/nvme/nvmeX` no longer exists although the subsystem still
+    /// has live paths. For a non-multipath namespace, `device` is the
+    /// controller, which carries `subsysnqn` too. The controller named after
+    /// the namespace stays as the fallback.
     pub fn nqn_of_device(&self, device: &str) -> Result<String> {
         let controller = controller_of(device).with_context(|| format!("invalid NVMe device name: {device}"))?;
+        // controller_of validated the file name as `nvmeNnM`.
+        let name = Path::new(device).file_name().unwrap_or_default();
+        let block = self.sysfs.join("block").join(name).join("device/subsysnqn");
+        if let Ok(nqn) = std::fs::read_to_string(&block)
+            && !nqn.trim().is_empty()
+        {
+            return Ok(nqn.trim().to_string());
+        }
         let class = self.sysfs.join("class/nvme").join(controller);
         for path in [class.join("subsysnqn"), class.join("subsystem/subsysnqn")] {
             if let Ok(nqn) = std::fs::read_to_string(&path) {
@@ -841,6 +901,42 @@ mod tests {
         }
     }
 
+    /// A native multipath head is named after the subsystem instance, which
+    /// the kernel takes from the founding controller. Once that controller is
+    /// gone while other paths stay live, `/sys/class/nvme/nvmeX` disappears;
+    /// the block device's own sysfs node still resolves to the subsystem.
+    #[test]
+    fn nqn_of_a_head_survives_loss_of_the_founding_controller() {
+        let root = tempfile::tempdir().unwrap();
+        let n = nvme(&Script::new(vec![]), root.path());
+        let sys = root.path().join("sys");
+        let subsys = sys.join("devices/virtual/nvme-subsystem/nvme-subsys0");
+        touch(&subsys.join("subsysnqn"), "nqn.head\n");
+        let head = subsys.join("nvme0n1");
+        std::fs::create_dir_all(&head).unwrap();
+        std::os::unix::fs::symlink(&subsys, head.join("device")).unwrap();
+        std::fs::create_dir_all(sys.join("block")).unwrap();
+        std::os::unix::fs::symlink(&head, sys.join("block/nvme0n1")).unwrap();
+        // A surviving controller exists; the founding one (nvme0) does not.
+        touch(&sys.join("class/nvme/nvme1/subsysnqn"), "nqn.head\n");
+        assert_eq!(n.nqn_of_device("/dev/nvme0n1").unwrap(), "nqn.head");
+
+        // The block node is read first.
+        touch(&sys.join("class/nvme/nvme0/subsysnqn"), "nqn.stale\n");
+        assert_eq!(n.nqn_of_device("/dev/nvme0n1").unwrap(), "nqn.head");
+
+        // An empty block attribute falls back to the controller.
+        touch(&sys.join("block/nvme4n1/device/subsysnqn"), "\n");
+        touch(&sys.join("class/nvme/nvme4/subsysnqn"), "nqn.ctrl\n");
+        assert_eq!(n.nqn_of_device("/dev/nvme4n1").unwrap(), "nqn.ctrl");
+
+        // No block node and no controller is still a failed lookup; a
+        // partition is not a namespace even when a block node exists.
+        assert!(n.nqn_of_device("/dev/nvme9n1").is_err());
+        touch(&sys.join("block/nvme0n1p1/device/subsysnqn"), "nqn.head\n");
+        assert!(n.nqn_of_device("/dev/nvme0n1p1").is_err());
+    }
+
     #[tokio::test]
     async fn connect_outcomes() {
         let target = Target {
@@ -1086,6 +1182,52 @@ mod tests {
                 "head={head}: re-checked until the timeout"
             );
         }
+    }
+
+    /// The founding controller (nvme0) of a multipath head is gone; nvme1
+    /// and nvme2 are paths of the same subsystem. The rescan goes to a live
+    /// one of them: /dev/nvme0 no longer exists.
+    #[tokio::test]
+    async fn rescan_survives_loss_of_the_founding_controller() {
+        let root = tempfile::tempdir().unwrap();
+        let sys = root.path().join("sys");
+        let subsys = sys.join("devices/virtual/nvme-subsystem/nvme-subsys0");
+        touch(&subsys.join("subsysnqn"), "nqn.head\n");
+        let head = subsys.join("nvme0n1");
+        std::fs::create_dir_all(&head).unwrap();
+        std::os::unix::fs::symlink(&subsys, head.join("device")).unwrap();
+        std::fs::create_dir_all(sys.join("block")).unwrap();
+        std::os::unix::fs::symlink(&head, sys.join("block/nvme0n1")).unwrap();
+        for (controller, state) in [("nvme1", "connecting"), ("nvme2", "live")] {
+            let dir = sys.join("class/nvme").join(controller);
+            touch(&dir.join("state"), &format!("{state}\n"));
+            std::os::unix::fs::symlink(&dir, subsys.join(controller)).unwrap();
+        }
+        let script = Script::new(vec![(Some(0), "", false)]);
+        nvme(&script, root.path()).rescan("/dev/nvme0n1", None).await.unwrap();
+        assert_eq!(
+            script.calls(),
+            [format!("nvme ns-rescan {}", root.path().join("dev/nvme2").display())]
+        );
+
+        // With the founder back and live, it is used, as before.
+        let founder = sys.join("class/nvme/nvme0");
+        touch(&founder.join("state"), "live\n");
+        std::os::unix::fs::symlink(&founder, subsys.join("nvme0")).unwrap();
+        let n = nvme(&Script::new(vec![]), root.path());
+        assert_eq!(n.controller_for("/dev/nvme0n1").unwrap(), "nvme0");
+
+        // A non-multipath namespace: its device is its own controller.
+        let ctrl = sys.join("class/nvme/nvme7");
+        touch(&ctrl.join("transport"), "pcie\n");
+        std::fs::create_dir_all(ctrl.join("nvme7n1")).unwrap();
+        std::os::unix::fs::symlink(&ctrl, ctrl.join("nvme7n1/device")).unwrap();
+        std::os::unix::fs::symlink(ctrl.join("nvme7n1"), sys.join("block/nvme7n1")).unwrap();
+        assert_eq!(n.controller_for("/dev/nvme7n1").unwrap(), "nvme7");
+
+        // No sysfs evidence: the name's controller; a partition is refused.
+        assert_eq!(n.controller_for("/dev/nvme9n1").unwrap(), "nvme9");
+        assert!(n.controller_for("/dev/nvme9n1p1").is_err());
     }
 
     #[tokio::test]

@@ -689,9 +689,17 @@ mod tests {
         for (_, a) in &portals {
             assert!(slots.running_to(*a) <= MAX_RECONNECTS_PER_ADDR);
         }
-        // Each reconnect thread names its volume and path for top -H.
-        let names = thread_names();
-        assert!(names.contains(&reconnect_thread_name("nqn.test:reboot000", 0)), "no thread named {:?} in {names:?}", reconnect_thread_name("nqn.test:reboot000", 0));
+        // Each reconnect thread names its volume and path for top -H. The
+        // name is set by the new thread itself once it first runs, so a busy
+        // test process may not have scheduled it yet: wait for it, bounded.
+        let want = reconnect_thread_name("nqn.test:reboot000", 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut names = thread_names();
+        while !names.contains(&want) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            names = thread_names();
+        }
+        assert!(names.contains(&want), "no thread named {want:?} in {names:?}");
         // The target goes away: the blocked reconnects fail, and each ended
         // thread gives its slot back.
         drop(portals);
