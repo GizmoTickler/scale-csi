@@ -32,8 +32,11 @@ WebSocket JSON-RPC 2.0 API (`wss://<host>/api/current`) — no SSH, no REST.
 | Helm | 3.8+ (OCI chart support) |
 | Node architectures | `linux/amd64` images |
 
-> **TrueNAS 27 removed the REST API.** scale-csi never used it: it speaks the
-> WebSocket JSON-RPC API exclusively, so the REST removal does not affect it.
+> **TrueNAS 27 needs scale-csi v1.25.0 or later.** The REST API removal does not
+> affect scale-csi (it speaks only the WebSocket JSON-RPC API), but TrueNAS 27's
+> NVMe/TCP target rejects writes over 4 MiB and its dataset API changed for
+> encrypted volumes; v1.25.0 handles both. Upgrade the driver first — see
+> [upgrades](docs/guides/upgrades.md).
 
 | `protocol` | Access modes | Volume modes | Node requirement |
 |---|---|---|---|

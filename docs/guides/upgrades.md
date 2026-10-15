@@ -135,10 +135,23 @@ automatically on `helm upgrade`.
 TrueNAS upgrades reboot the NAS. Every volume is unreachable for the length of
 the reboot, so treat it as a storage maintenance window.
 
-> **TrueNAS 27 removed the REST API.** scale-csi does not use it — it speaks
-> only the WebSocket JSON-RPC API — so moving to 27.0 needs no driver or
-> configuration change. Check the [compatibility table](../reference/compatibility.md)
-> for the driver release you run before upgrading TrueNAS.
+> **Upgrade scale-csi to v1.25.0 or later BEFORE moving TrueNAS to 27.0.**
+> The REST API removal does not affect scale-csi (it speaks only the WebSocket
+> JSON-RPC API), but TrueNAS 27 changed two things that do:
+>
+> - **NVMe/TCP:** TrueNAS 27's kernel (6.18.52) rejects any NVMe/TCP command
+>   larger than 4 MiB while still advertising no transfer limit (MDTS=0).
+>   Older drivers let initiators issue up to 32 MiB writes, which fail
+>   (`I/O Error (sct 0x0 / sc 0xf) DNR`) and drop ext4 to read-only. v1.25.0
+>   clamps `max_sectors_kb` on every head and path device at stage
+>   (`nvmeof.maxSectorsKB`, default `auto`). See
+>   [troubleshooting](../troubleshooting.md) if you already upgraded.
+> - **Encryption:** `pool.dataset.create` no longer accepts
+>   `encryption_options.algorithm` and requires `pbkdf2iters` ≥ 1,300,000;
+>   older drivers fail every encrypted `CreateVolume`.
+>
+> Check the [compatibility table](../reference/compatibility.md) for the driver
+> release you run before upgrading TrueNAS.
 
 ### What happens to mounted volumes during a NAS outage
 
@@ -241,4 +254,4 @@ a window when brief I/O stalls are acceptable.
 - **25.x → 26.0:** CSI snapshots created by older driver versions without the
   `scale-csi:csi_snapshot_name` property are omitted from `ListSnapshots`
   afterwards; restore and delete by snapshot ID keep working.
-- **26.x → 27.0:** no driver action required (see the note above).
+- **26.x → 27.0:** upgrade scale-csi to v1.25.0 or later first (see the note above).

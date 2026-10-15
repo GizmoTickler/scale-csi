@@ -998,6 +998,7 @@ curated tables above explain how the important ones interact. Lists of objects
 | `nvmeof.connect.nrIOQueues` | `null` | --nr-io-queues / --nr-write-queues. |
 | `nvmeof.connect.nrWriteQueues` | `null` |  |
 | `nvmeof.connect.keepAliveTmo` | `null` | --keep-alive-tmo (seconds). |
+| `nvmeof.maxSectorsKB` | `auto` | Request-size clamp for the kernel initiator (both node agents). |
 | `nvmeof.dataPath` | `kernel` | Node data path for volumes whose StorageClass does not set the `nvmeof/dataPath` parameter: kernel (default) — `nvme connect` plus native kernel NVMe multipath. |
 | `nvmeof.ublk.enabled` | `false` | Make the ublk data path available to StorageClasses that opt in with `nvmeof/dataPath: ublk` while dataPath above stays kernel. |
 | `nvmeof.ublk.maxVolumesPerNode` | `32` | Volumes one node must be able to serve through this data path at once. |

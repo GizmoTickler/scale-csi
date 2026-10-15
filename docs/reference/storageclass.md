@@ -1105,7 +1105,7 @@ restarting the controller never changes an existing volume's authmethod.
 
 ZFS-native encryption at rest (GF-Sprint 1) is strictly opt-in and is configured
 per StorageClass. It works for NFS filesystems and for iSCSI/NVMe-oF zvols alike
-(both dataset types were probed creating encrypted on nas01, 26.0.0-BETA.1). Two
+(both dataset types were probed creating encrypted on TrueNAS 26.0.0-BETA.1). Two
 things must be true for a class to use it:
 
 1. The controller is opted in via Helm (`encryption.enabled: true`). With this
@@ -1278,7 +1278,7 @@ only in your Kubernetes Secret; nothing on the appliance can re-derive the key.
 
 The consequences, in plain words:
 
-- **A nas01 reboot locks every encrypted volume.** Because the key is not in the
+- **A TrueNAS reboot locks every encrypted volume.** Because the key is not in the
   TrueNAS database, every passphrase dataset comes back from a reboot LOCKED,
   and nothing on the appliance auto-unlocks it. A locked zvol has **no backing
   block device** (`/dev/zvol/<name>` is gone), and a locked filesystem has

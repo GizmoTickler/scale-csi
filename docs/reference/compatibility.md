@@ -7,7 +7,7 @@ pages link here instead of repeating version numbers.
 
 | TrueNAS release | Status | Notes |
 |---|---|---|
-| 27.0 | Supported | TrueNAS 27 removed the REST API. scale-csi uses only the WebSocket JSON-RPC 2.0 API (`wss://<host>:<port>/api/current`), so it is unaffected. |
+| 27.0 | Supported from v1.25.0 | The REST API removal does not matter (scale-csi uses only the WebSocket JSON-RPC 2.0 API at `wss://<host>:<port>/api/current`). Requires scale-csi v1.25.0+: its NVMe/TCP target rejects commands > 4 MiB while advertising MDTS=0 (handled by `nvmeof.maxSectorsKB`), and encrypted creates reject `encryption_options.algorithm`. See [upgrades](../guides/upgrades.md). |
 | 26.x | Supported | The release the maintainer runs in production. The driver detects and caches the 26.0 `zfs.resource.snapshot.*` API generation automatically. |
 | 25.10 | Supported | Oldest release with NVMe-oF support in the driver; the driver rejects NVMe-oF on anything older. |
 | 25.04 | Not supported | The NFS and iSCSI clients still understand the 25.04 snapshot API generation, but this release is no longer tested. |
