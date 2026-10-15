@@ -284,7 +284,7 @@ and ZFS user properties.
 The driver stores **all durable per-volume CSI metadata** as ZFS user properties
 prefixed with `scale-csi:` — there is no external database for it, which is what
 makes the driver restart-recoverable and ZFS-replication-friendly (see the
-[disaster-recovery guide](guides/disaster-recovery.md)). Two exceptions are
+[disaster-recovery guide](../guides/disaster-recovery.md)). Two exceptions are
 **not** ZFS properties and must be managed/recovered separately: CHAP **secret
 material** (a request-scoped CSI Secret) and the TrueNAS `iscsi.auth` **peer
 object** (configuration-database state). The per-volume CHAP *policy* (tag and
@@ -350,7 +350,7 @@ The driver fully supports the `Snapshot` copy method in VolSync:
    pins the source snapshot) or a detached send/receive copy (no origin
    dependency).
 
-See [Snapshots and Clones Guide](guides/snapshots.md) for detailed usage instructions.
+See [Snapshots and Clones Guide](../guides/snapshots.md) for detailed usage instructions.
 
 ## Controller topology, node mode, and leader election
 
@@ -391,7 +391,7 @@ Node identity is a stable base64url encoding (name + block-transport identity)
 carried on the CSINode registration with an `sc1.` prefix. The node-first
 migration (upgrade the DaemonSet, wait for every CSINode to re-register, watch
 `scale_csi_fencing_deferred_total`) is described in
-[Production](production.md#upgrades).
+[Production](../production.md#upgrades).
 
 ## Crash-consistency model
 
@@ -415,7 +415,7 @@ fails closed and may require manual cleanup.
 - **Recovery nonce** (`recovery_nonce`) is a write-then-verify token: a detected
   lost race returns retryable `Aborted` rather than double-owning a dataset. It
   is not an atomic compare-and-swap — the strongest concurrency contract remains
-  the singleton controller (see [Production → Concurrency contract](production.md#concurrency-contract)).
+  the singleton controller (see [Production → Concurrency contract](../production.md#concurrency-contract)).
 - **Tombstone ledger** records deferred-destroy snapshots. The ledger key is a
   hash of the tombstone snapshot ID; v2 additionally stores the snapshot's
   `CreateTXG` as an immutable identity predicate (degrading to the v1 check when

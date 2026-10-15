@@ -29,7 +29,8 @@ There are no `--csi-version`, `--csi-name`, `--driver-config-file`,
 use single-dash form as shown (Go `flag`), and the plugin speaks over the Unix
 socket mounted by Nomad's `csi_plugin` block.
 
-Start from one complete strict config in [`examples/`](../examples). The same
+Start from one complete strict config in [`examples/`](../../examples/)
+(`scale-nfs.yaml`, `scale-iscsi.yaml`, or `scale-nvmeof.yaml`). The same
 non-secret configuration must be available to controller and node tasks. Only
 the controller needs `TRUENAS_API_KEY`; inject it through Nomad Variables or
 Vault instead of embedding it in the job file.
@@ -52,7 +53,7 @@ job "scale-csi-controller" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/gizmotickler/scale-csi:v1.6.0"
+        image = "ghcr.io/gizmotickler/scale-csi:vX.Y.Z" # CHANGEME: the release you verified
         args = [
           "-config=/etc/scale-csi/config.yaml",
           "-endpoint=unix:///csi/csi.sock",
@@ -109,7 +110,7 @@ job "scale-csi-node" {
       driver = "docker"
 
       config {
-        image      = "ghcr.io/gizmotickler/scale-csi:v1.6.0"
+        image      = "ghcr.io/gizmotickler/scale-csi:vX.Y.Z" # CHANGEME: the release you verified
         privileged = true
         args = [
           "-config=/etc/scale-csi/config.yaml",

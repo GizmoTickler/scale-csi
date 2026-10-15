@@ -66,8 +66,26 @@ golangci-lint run
 If you modify the Helm chart, validate it:
 
 ```bash
-helm lint charts/scale-csi
+helm lint --strict charts/scale-csi
+go test ./test/chart/...
 ```
+
+If you change `charts/scale-csi/values.yaml`, regenerate the "All values"
+table in the chart README:
+
+```bash
+python3 hack/chart-values-table.py
+```
+
+### 5. Documentation and examples
+
+Documentation lives in [`docs/`](../docs/README.md) and runnable examples in
+[`examples/`](../examples/README.md). Every Helm values file in
+`examples/helm/` must render with `helm template` against the in-tree chart,
+and every relative link must resolve; the commands are listed in
+[Validating the examples](../examples/README.md#validating-the-examples).
+Use RFC 2606/5737 placeholders (`truenas.example.com`, `192.0.2.10`) — never a
+real hostname, domain, or address.
 
 ## Submitting Changes
 
