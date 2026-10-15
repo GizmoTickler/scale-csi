@@ -1,0 +1,83 @@
+# StatefulSet with one block-backed volume per replica.
+#
+#   kubectl apply -f statefulset.yaml
+#   kubectl get pvc -l app=scale-web       # data-scale-web-0, -1, -2
+#   kubectl delete -f statefulset.yaml
+#
+# Deleting a StatefulSet keeps its PVCs (Kubernetes default). Remove them
+# explicitly to release the volumes:
+#   kubectl delete pvc -l app=scale-web
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scale-web
+  labels:
+    app: scale-web
+spec:
+  clusterIP: None
+  selector:
+    app: scale-web
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: scale-web
+spec:
+  serviceName: scale-web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scale-web
+  template:
+    metadata:
+      labels:
+        app: scale-web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - echo "$(hostname)" > /data/index.html && httpd -f -p 8080 -h /data
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: scale-web
+      spec:
+        # Any ReadWriteOnce class works; block protocols suit per-replica data.
+        storageClassName: scale-iscsi
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

@@ -2,6 +2,21 @@
 
 All protocols use the unified provisioner `csi.scale.io`.
 
+**On this page:** [Parameters](#parameters-the-driver-understands) ·
+[Periodic snapshots](#driver-managed-periodic-snapshots-gf2e2) ·
+[ZFS performance classes](#zfs-performance-classes) ·
+[Block-protocol tuning](#block-protocol-tuning) · [NFS](#nfs) ·
+[NFSv4 ACLs](#nfsv4-acls) · [iSCSI](#iscsi) · [iSCSI CHAP](#iscsi-chap) ·
+[Encryption at rest](#encryption-at-rest) · [NVMe-oF](#nvme-of) ·
+[Restore mode](#restore-mode) · [Policies and binding](#policies-and-binding) ·
+[Adding `protocol` safely](#upgrade-add-protocol-safely) ·
+[Troubleshooting](#troubleshooting)
+
+Task-oriented walkthroughs live in the guides:
+[Getting started](../getting-started.md), [Snapshots](../guides/snapshots.md),
+[Encryption](../guides/encryption.md). Ready-to-apply StorageClasses are in
+the chart values examples under [`examples/helm/`](../../examples/helm/).
+
 | `protocol` | Access modes | Volume modes |
 |---|---|---|
 | `nfs` | RWO, ROX, RWX | Filesystem |

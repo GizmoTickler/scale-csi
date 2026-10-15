@@ -1,0 +1,68 @@
+# A second, independent driver instance — for a second TrueNAS, or a second
+# failure domain with its own backend.
+#
+#   helm install scale-csi-b oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi-b --create-namespace --values values-second-instance.yaml
+#
+# The chart has no controller topology settings: a node reports its
+# topology.kubernetes.io/zone and /region labels automatically, but the
+# controller does not route volumes to a backend by zone (see
+# docs/guides/topology.md). Separate backends therefore run as separate driver
+# instances. Each instance needs its own:
+#   * csiDriverName (the CSIDriver object and provisioner name are cluster-wide)
+#   * zfs.parentDataset (one parent per instance, never shared)
+#   * driverInstanceId (derived from the two above when empty)
+#   * metrics and registrar health ports (node pods use host networking).
+#
+# LIMITATION: the node liveness sidecar listens on host port 9808 in every
+# instance and that port is not configurable, so the node plugins of two
+# instances cannot run on the same node. Give each instance a disjoint set of
+# nodes (node.nodeSelector / node.affinity here, and the opposite selector on
+# the first instance). Volumes of an instance can only be mounted on that
+# instance's nodes.
+
+csiDriverName: csi-b.scale.io
+
+truenas:
+  host: truenas-b.example.com
+  existingSecret: truenas-api-key
+
+zfs:
+  parentDataset: tank/k8s/volumes
+
+nfs:
+  enabled: true
+  server: 198.51.100.10
+  shareAllowedNetworks:
+    - 198.51.100.0/24
+iscsi:
+  enabled: false
+nvmeof:
+  enabled: false
+
+metrics:
+  port: 9819
+
+sidecars:
+  nodeDriverRegistrar:
+    healthProbe:
+      port: 9820
+
+# Run this instance's node plugin only on the nodes served by backend B. The
+# first instance needs the inverse (e.g. a NotIn affinity on the same label).
+node:
+  nodeSelector:
+    topology.kubernetes.io/zone: zone-b
+
+storageClasses:
+  - name: scale-nfs-zone-b
+    protocol: nfs
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    # Let the scheduler place the pod first; pair it with node affinity on
+    # the workload (or allowedTopologies set outside the chart) so pods using
+    # this class land in zone-b.
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: [nfsvers=4.1, hard, noatime]
+    extraParameters: {}

@@ -10,22 +10,34 @@ Scale CSI leverages native ZFS capabilities for instant snapshots and space-effi
 
 ### Installing Snapshot CRDs and Controller
 
-If not already installed:
+If not already installed (many distributions and managed clusters ship
+them), install the CRDs and the snapshot-controller from the
+external-snapshotter release that matches the chart's snapshotter sidecar
+(`sidecars.snapshotter.image` in
+[`values.yaml`](../../charts/scale-csi/values.yaml)):
 
 ```bash
-# Install VolumeSnapshot CRDs
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml
+# Keep this in step with the csi-snapshotter tag in values.yaml
+SNAPSHOTTER_VERSION=v8.6.0
+BASE="https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/${SNAPSHOTTER_VERSION}"
 
-# Install snapshot controller
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml
+# VolumeSnapshot CRDs
+kubectl apply -f "${BASE}/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml"
+kubectl apply -f "${BASE}/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml"
+kubectl apply -f "${BASE}/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml"
+
+# Snapshot controller (installs into kube-system)
+kubectl apply -f "${BASE}/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml"
+kubectl apply -f "${BASE}/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml"
 ```
+
+A complete snapshot → restore walkthrough is in
+[`examples/workloads/snapshot-restore.yaml`](../../examples/workloads/snapshot-restore.yaml).
 
 ## Creating a VolumeSnapshotClass
 
-Create a VolumeSnapshotClass that references the Scale CSI driver:
+Create a VolumeSnapshotClass that references the Scale CSI driver, or let the
+chart create one with `snapshotClass.create: true`:
 
 ```yaml
 apiVersion: snapshot.storage.k8s.io/v1

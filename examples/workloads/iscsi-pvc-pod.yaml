@@ -1,0 +1,59 @@
+# Smoke test: a 1 GiB iscsi volume and a pod that writes to it.
+#
+#   kubectl apply -f iscsi-pvc-pod.yaml
+#   kubectl wait --for=condition=Ready pod/scale-iscsi-test --timeout=180s
+#   kubectl exec scale-iscsi-test -- cat /data/hello.txt
+#   kubectl delete -f iscsi-pvc-pod.yaml
+#
+# Uses the "scale-iscsi" StorageClass from examples/helm/values-iscsi.yaml.
+# With WaitForFirstConsumer the PVC stays Pending until the pod is scheduled.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-iscsi-test
+spec:
+  storageClassName: scale-iscsi
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scale-iscsi-test
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: busybox:1.37
+      command:
+        - sh
+        - -c
+        - echo "hello from $(hostname) at $(date)" > /data/hello.txt && sleep 3600
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: scale-iscsi-test

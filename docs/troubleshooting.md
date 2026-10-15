@@ -309,7 +309,7 @@ generation). If it persists:
        timeout: 30
    ```
 
-### Snapshot Issues
+### Snapshots
 
 #### Symptom: Snapshot creation fails
 
@@ -566,5 +566,5 @@ Gated alerts (only rendered when the named feature is on):
 | `ScaleCSIScheduledSnapshotTaskEnsureFailed` | warning | `zfs.snapshotSchedule` | [Driver-managed periodic snapshots](reference/storageclass.md#driver-managed-periodic-snapshots-gf2e2) |
 | `ScaleCSIScheduledSnapshotTaskDeleteFailed` | warning | `zfs.snapshotSchedule` | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
 | `ScaleCSINASTimezoneUnresolved` | warning | `zfs.snapshotSchedule` | [Periodic-snapshot tasks](production.md#rollback-runbook-driver-managed-periodic-snapshot-tasks) |
-| `ScaleCSISnapshotHoldFailed` | warning | `zfs.holdCsiSnapshots` | [Snapshot Issues](#snapshot-issues) |
+| `ScaleCSISnapshotHoldFailed` | warning | `zfs.holdCsiSnapshots` | [Snapshots](#snapshots) |
 | `ScaleCSIClonePromoteRefused` | warning | `zfs.promoteRestoredClones` | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |

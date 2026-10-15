@@ -1,0 +1,49 @@
+# Minimal NVMe-oF (NVMe/TCP) install. Requires TrueNAS 25.10 or later.
+#
+#   helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi --values values-nvmeof.yaml
+#
+# Prerequisites: docs/getting-started.md (NVMe-oF service running, nvme-cli and
+# the nvme-tcp module on every node).
+
+truenas:
+  host: truenas.example.com
+  existingSecret: truenas-api-key
+
+zfs:
+  parentDataset: tank/k8s/volumes
+  zvolBlocksize: 16K
+
+nfs:
+  enabled: false
+iscsi:
+  enabled: false
+
+nvmeof:
+  enabled: true
+  transport: tcp
+  # Storage IP the driver creates the NVMe/TCP port on and nodes connect to.
+  address: 192.0.2.10
+  port: 4420
+  # With fencing.mode "off" (the default) every node that may mount a volume
+  # must be listed: the output of `nvme show-hostnqn` on that node. See
+  # docs/getting-started.md for a one-liner that collects them all.
+  # Alternatives: fencing.mode "strict" (per-volume grants, see
+  # values-production.yaml) or subsystemAllowAnyHost: true on an isolated
+  # storage network.
+  subsystemHosts:
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000001
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000002
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000003
+  subsystemAllowAnyHost: false
+
+storageClasses:
+  - name: scale-nvmeof
+    protocol: nvmeof
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters:
+      csi.storage.k8s.io/fstype: xfs

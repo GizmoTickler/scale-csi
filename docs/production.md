@@ -1,21 +1,20 @@
 # Production deployment
 
-This guide describes the current scale-csi repository and bundled Helm chart,
-based on the v1.6.0 release line. Review the [deployment guide](deployment.md)
-for installation examples and the chart's
-[values reference](../charts/scale-csi/README.md) for every setting.
+This is the production contract for scale-csi: prerequisites, availability,
+security, monitoring, upgrades, and known limitations. Install with
+[Installation](guides/installation.md) (or [Getting started](getting-started.md)
+the first time); every chart setting is in the
+[values reference](../charts/scale-csi/README.md). A ready-made starting point
+is [`examples/helm/values-production.yaml`](../examples/helm/values-production.yaml).
 
 ## Prerequisites
 
 ### TrueNAS and API access
 
-The NFS and iSCSI clients target the snapshot API generations used by TrueNAS
-SCALE 25.04+ (`pool.snapshot.*` for mutations) and 26.0 (which adds
-`zfs.resource.snapshot.*` for the user-property reads, rename, and destroy
-operations that moved). TrueNAS 25.04 is the documented floor; the 24.x
-`zfs.snapshot.*` generation is no longer supported. The client detects and
-caches the 26.0 resource API separately. NVMe-oF is different: the driver
-rejects it before TrueNAS 25.10.
+Supported TrueNAS and Kubernetes releases are listed in the
+[compatibility reference](reference/compatibility.md). The client detects and
+caches the 26.0 `zfs.resource.snapshot.*` API generation separately from the
+`pool.snapshot.*` mutations, and the driver rejects NVMe-oF before TrueNAS 25.10.
 
 The repository's automated conformance is the `TestCSISanity` suite, which runs
 the official kubernetes-csi `csi-sanity` specs against the driver over a real
@@ -40,9 +39,16 @@ builds; they are not reproducible from this repository's automated tests and do
 not replace validating your own appliance and node data path.
 
 Use a user-linked API key over HTTPS. API keys inherit the roles of their user.
-On role-based TrueNAS releases, the built-in `SHARING_ADMIN` plus
-`REPLICATION_ADMIN` roles cover the dataset/share and snapshot operations used
-by the driver; `FULL_ADMIN` is not required. A custom privilege must cover the
+On role-based TrueNAS releases, a privilege with the built-in `SHARING_ADMIN`,
+`REPLICATION_ADMIN`, `DATASET_DELETE`, and `SNAPSHOT_DELETE` roles covers every
+method the driver calls; `FULL_ADMIN` is not required. `SHARING_ADMIN` plus
+`REPLICATION_ADMIN` alone is **not** enough: in the TrueNAS 26.0 role metadata
+`pool.dataset.delete` is granted only by `DATASET_DELETE`, and
+`pool.snapshot.delete` / `zfs.resource.snapshot.destroy` only by
+`SNAPSHOT_DELETE`, so PVC and VolumeSnapshot deletion would fail. Step-by-step
+user, privilege, and key creation is in
+[Getting started](getting-started.md#22-create-a-dedicated-api-user-and-key).
+A custom privilege must cover the
 equivalent dataset create/update/delete, NFS/iSCSI/NVMe sharing, snapshot
 read/create/update/clone/rename/delete/hold/release, service read/reload, and
 `system.info` operations. The opt-in GF2 data-protection features exercise a few
@@ -428,7 +434,7 @@ that layer and stay flat. Operationally:
   driver-fixable overhead: the driver's per-operation API call budgets are
   already pinned at their proven floors by the golden API-call-count tests
   (`pkg/driver/api_call_count_test.go`; see the
-  [architecture doc's round-trip table](architecture.md#api-call-cost-golden-round-trip-counts)),
+  [architecture doc's round-trip table](development/architecture.md#api-call-cost-golden-round-trip-counts)),
   so each unavoidable `pool.dataset.*` round trip simply costs what the
   middleware charges for it.
 
@@ -582,6 +588,28 @@ still accepted and ignored). `NodeGetVolumeStats` still refuses to stat a stale
 mount: it runs a bounded mount check first and returns `Internal` when the mount
 is unresponsive, so a dead NFS hard mount cannot hang kubelet's stats loop.
 
+Setup steps (ServiceMonitor, PrometheusRule, dashboards, plain Prometheus) are
+in [Observability](observability.md).
+
+### Backend health
+
+Backend health is reported separately from process liveness, so a TrueNAS
+outage never restart-loops the driver:
+
+- `/readyz` on the controller and `scale_csi_truenas_connection_status` show
+  whether the controller holds a working API connection.
+  `ScaleCSITrueNASConnectionDown` and `ScaleCSIHighTrueNASAPIFailureRate` alert
+  on them.
+- `scale_csi_circuit_breaker_state` shows whether the optional circuit breaker
+  (`resilience.circuitBreaker.enabled`) is shedding calls.
+- `scale_csi_nas_timezone_unresolved_total` counts failures to read the NAS
+  civil timezone, or a timezone that no longer matches the one recorded when a
+  driver-managed snapshot task was created. While it rises
+  (`ScaleCSINASTimezoneUnresolved`), deletion of volumes with driver-managed
+  periodic snapshots fails closed. Confirm the API user can read
+  `system.general.config`, then follow the
+  [periodic-snapshot runbook](#rollback-runbook-driver-managed-periodic-snapshot-tasks).
+
 Watch these series:
 
 - `scale_csi_operations_total` and `scale_csi_operations_duration_seconds` for
@@ -677,14 +705,16 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 ## Upgrades
 
+The step-by-step procedure (CRD, `helm upgrade`, verification, rollback, and
+upgrading TrueNAS itself) is in [Upgrades](guides/upgrades.md). The points
+below are the production contract behind it.
+
 1. Render and validate the release before applying it:
 
    ```bash
-   helm lint charts/scale-csi
-   helm template scale-csi charts/scale-csi \
-     --set truenas.host=truenas.example \
-     --set truenas.existingSecret=scale-csi-api \
-     --set zfs.parentDataset=tank/kubernetes >/tmp/scale-csi.yaml
+   helm template scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+     --namespace scale-csi --version <X.Y.Z> \
+     --values values.yaml > scale-csi-rendered.yaml
    ```
 
    `values.schema.json` rejects unknown and invalid values during Helm

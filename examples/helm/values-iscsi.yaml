@@ -1,0 +1,42 @@
+# Minimal iSCSI install.
+#
+#   helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi --values values-iscsi.yaml
+#
+# Prerequisites: docs/getting-started.md (iSCSI service running, a portal that
+# listens on the storage IP below, open-iscsi with iscsid on every node).
+
+truenas:
+  host: truenas.example.com
+  existingSecret: truenas-api-key
+
+zfs:
+  parentDataset: tank/k8s/volumes
+  # Volume block size of new zvols.
+  zvolBlocksize: 16K
+
+nfs:
+  enabled: false
+
+iscsi:
+  enabled: true
+  # Must equal the listen IP of an existing TrueNAS iSCSI portal (not
+  # 0.0.0.0, not a hostname). Empty falls back to truenas.host.
+  portal: 192.0.2.10
+  portalPort: 3260
+
+nvmeof:
+  enabled: false
+
+storageClasses:
+  - name: scale-iscsi
+    protocol: iscsi
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    # Provision when the pod is scheduled, not when the PVC is created.
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters:
+      # Filesystem for Filesystem-mode volumes (ext4 is the default).
+      csi.storage.k8s.io/fstype: ext4
