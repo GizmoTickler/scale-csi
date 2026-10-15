@@ -30,7 +30,7 @@ zfs:
 nvmeof:
   enabled: true
   transport: tcp
-  transportAddress: truenas.example.com
+  transportAddress: 192.0.2.10
   transportServiceId: 4420
   subsystemAllowAnyHost: false
   # Replace this with `nvme show-hostnqn` output from every eligible node.

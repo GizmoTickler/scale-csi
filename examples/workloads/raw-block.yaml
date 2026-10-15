@@ -1,0 +1,50 @@
+# Raw block volume: the pod sees an unformatted block device instead of a
+# mounted filesystem (databases and storage engines that manage their own
+# on-disk format). Works with the iscsi and nvmeof protocols.
+#
+#   kubectl apply -f raw-block.yaml
+#   kubectl exec scale-block-test -- blockdev --getsize64 /dev/xvda
+#   kubectl delete -f raw-block.yaml
+#
+# Change storageClassName to "scale-iscsi" for iSCSI.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-block-test
+spec:
+  storageClassName: scale-nvmeof
+  volumeMode: Block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scale-block-test
+spec:
+  containers:
+    - name: app
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      # Opening a raw device generally needs root inside the container.
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      volumeDevices:
+        - name: data
+          devicePath: /dev/xvda
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: scale-block-test

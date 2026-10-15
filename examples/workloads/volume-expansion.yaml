@@ -1,0 +1,71 @@
+# Online volume expansion.
+#
+# 1. Create a 1 GiB volume and a pod using it:
+#      kubectl apply -f volume-expansion.yaml
+#      kubectl wait --for=condition=Ready pod/scale-expand-test --timeout=180s
+#      kubectl exec scale-expand-test -- df -h /data
+#
+# 2. Grow it (the StorageClass must have allowVolumeExpansion: true; volumes
+#    can only grow, never shrink):
+#      kubectl patch pvc scale-expand-test --type merge \
+#        -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
+#
+# 3. Watch the resize finish, then check the filesystem from the pod:
+#      kubectl get pvc scale-expand-test -w      # CAPACITY becomes 2Gi
+#      kubectl describe pvc scale-expand-test    # resize events
+#      kubectl exec scale-expand-test -- df -h /data
+#
+# NFS grows the dataset quota and needs nothing on the node. iSCSI and
+# NVMe-oF grow the zvol, then the node plugin grows the filesystem while the
+# volume stays mounted. One exception: a volume staged through the optional
+# userspace NVMe/TCP data path (ublk) only grows after it is staged again,
+# e.g. after the pod restarts.
+#
+#   kubectl delete -f volume-expansion.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-expand-test
+spec:
+  storageClassName: scale-nfs
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scale-expand-test
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: scale-expand-test

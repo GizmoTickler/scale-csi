@@ -1,0 +1,48 @@
+# Minimal NFS install.
+#
+#   helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi --values values-nfs.yaml
+#
+# Prerequisites: docs/getting-started.md (TrueNAS NFS service running, parent
+# dataset created, API-key Secret "truenas-api-key" in the release namespace).
+
+truenas:
+  # Hostname or IP the controller uses for the WebSocket API (TCP 443).
+  # With the default TLS verification it must match the TrueNAS certificate.
+  host: truenas.example.com
+  # Secret in the release namespace holding the key "api-key".
+  existingSecret: truenas-api-key
+
+zfs:
+  # Exclusive parent dataset: every volume is created beneath it.
+  parentDataset: tank/k8s/volumes
+
+nfs:
+  enabled: true
+  # Address the nodes mount from. Empty falls back to truenas.host.
+  server: 192.0.2.10
+  # Networks allowed to mount the exports the driver creates. Empty allows
+  # every network; restrict it to your node network.
+  shareAllowedNetworks:
+    - 192.0.2.0/24
+
+# The chart enables iSCSI by default; turn off what you do not use.
+iscsi:
+  enabled: false
+nvmeof:
+  enabled: false
+
+# Replaces the chart's default class list.
+storageClasses:
+  - name: scale-nfs
+    protocol: nfs
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    # NFS version and client options are node-side mount options.
+    mountOptions:
+      - nfsvers=4.1
+      - hard
+      - noatime
+    extraParameters: {}

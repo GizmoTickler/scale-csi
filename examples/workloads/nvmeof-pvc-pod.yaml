@@ -1,0 +1,59 @@
+# Smoke test: a 1 GiB nvmeof volume and a pod that writes to it.
+#
+#   kubectl apply -f nvmeof-pvc-pod.yaml
+#   kubectl wait --for=condition=Ready pod/scale-nvmeof-test --timeout=180s
+#   kubectl exec scale-nvmeof-test -- cat /data/hello.txt
+#   kubectl delete -f nvmeof-pvc-pod.yaml
+#
+# Uses the "scale-nvmeof" StorageClass from examples/helm/values-nvmeof.yaml.
+# With WaitForFirstConsumer the PVC stays Pending until the pod is scheduled.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-nvmeof-test
+spec:
+  storageClassName: scale-nvmeof
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scale-nvmeof-test
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: busybox:1.37
+      command:
+        - sh
+        - -c
+        - echo "hello from $(hostname) at $(date)" > /data/hello.txt && sleep 3600
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: scale-nvmeof-test

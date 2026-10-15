@@ -1,0 +1,61 @@
+# Argo CD: install scale-csi from its public OCI chart.
+#
+#   kubectl apply -n argocd -f application.yaml
+#
+# The chart is public, so no repository credentials are needed. For Argo CD
+# releases that predate native OCI sources this form (registry path in
+# repoURL without "oci://", chart name in `chart`) is the one that works.
+#
+# Create the namespace and the API-key Secret first, outside Argo CD or with
+# your secret tooling (the Secret needs the key "api-key"):
+#
+#   kubectl create namespace scale-csi
+#   kubectl label namespace scale-csi pod-security.kubernetes.io/enforce=privileged
+#   kubectl -n scale-csi create secret generic truenas-api-key \
+#     --from-literal=api-key='<your-truenas-api-key>'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: scale-csi
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/gizmotickler/charts
+    chart: scale-csi
+    # CHANGEME: the chart version you reviewed (no "v" prefix). Releases:
+    # https://github.com/GizmoTickler/scale-csi/releases
+    targetRevision: 1.24.1
+    helm:
+      releaseName: scale-csi
+      valuesObject:
+        truenas:
+          host: truenas.example.com
+          existingSecret: truenas-api-key
+        zfs:
+          parentDataset: tank/k8s/volumes
+        nfs:
+          enabled: true
+          server: 192.0.2.10
+          shareAllowedNetworks:
+            - 192.0.2.0/24
+        iscsi:
+          enabled: false
+        nvmeof:
+          enabled: false
+        storageClasses:
+          - name: scale-nfs
+            protocol: nfs
+            isDefault: false
+            reclaimPolicy: Delete
+            allowVolumeExpansion: true
+            volumeBindingMode: Immediate
+            mountOptions: [nfsvers=4.1, hard, noatime]
+            extraParameters: {}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: scale-csi
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

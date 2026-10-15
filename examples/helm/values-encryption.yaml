@@ -1,0 +1,58 @@
+# ZFS-native encryption at rest for one NFS StorageClass.
+#
+#   kubectl apply -f ../workloads/encryption-secret.yaml   # edit it first
+#   helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi --values values-encryption.yaml
+#
+# Read docs/guides/encryption.md first. Two hazards to accept up front:
+#   * A TrueNAS reboot leaves every encrypted volume LOCKED until the
+#     controller re-unlocks it; pods see I/O errors in that window.
+#   * Losing the passphrase Secret is permanent data loss.
+# Encryption is chosen at create time and cannot be added to, or removed
+# from, an existing volume.
+
+truenas:
+  host: truenas.example.com
+  existingSecret: truenas-api-key
+
+zfs:
+  parentDataset: tank/k8s/volumes
+
+# Opt the controller into encryption management (unlock on publish, the
+# locked-volume reconciler). With this off, classes cannot request encryption.
+encryption:
+  enabled: true
+
+nfs:
+  enabled: true
+  server: 192.0.2.10
+  shareAllowedNetworks:
+    - 192.0.2.0/24
+iscsi:
+  enabled: false
+nvmeof:
+  enabled: false
+
+storageClasses:
+  - name: scale-nfs
+    protocol: nfs
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: [nfsvers=4.1, hard, noatime]
+    extraParameters: {}
+  # Setting encryptionSecretName makes the chart emit `encryption: "true"`
+  # plus the provisioner, controller-publish, and node-stage secret refs.
+  # The chart never sees the passphrase itself.
+  - name: scale-nfs-encrypted
+    protocol: nfs
+    encryptionSecretName: scale-nfs-encrypted
+    # Defaults to the release namespace when empty.
+    encryptionSecretNamespace: ""
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: [nfsvers=4.1, hard, noatime]
+    extraParameters: {}
