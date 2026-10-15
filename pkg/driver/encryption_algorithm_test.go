@@ -219,3 +219,98 @@ func TestCreateVolumeReplayIgnoresBackendAlgorithmSupport(t *testing.T) {
 	assert.Len(t, client.createPayloads(), 1, "the replay sends no create")
 	assert.Equal(t, "AES-128-GCM", replay.GetVolume().GetVolumeContext()[volumeContextEncryptionKey])
 }
+
+// TestValidateEncryptionSecretRejectsMalformedPbkdf2Iters: a present pbkdf2iters
+// that is not a positive integer is InvalidArgument naming the key, never
+// silently dropped (which provisioned with the backend default).
+//
+// PRE-FIX PROOF: parseEncryptionSecret dropped these values and validation
+// returned no error.
+func TestValidateEncryptionSecretRejectsMalformedPbkdf2Iters(t *testing.T) {
+	for _, raw := range []string{"garbage", "1.3e6", "0", "-5"} {
+		t.Run(raw, func(t *testing.T) {
+			secret := parseEncryptionSecret(map[string]string{"passphrase": "longenough1", "pbkdf2iters": raw})
+			_, err := validateEncryptionSecret(secret)
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, err.Error(), `"pbkdf2iters"`)
+		})
+	}
+	t.Run("through CreateVolume, before any create", func(t *testing.T) {
+		d, client := newAlgorithmTestDriver(truenas27)
+		_, err := d.CreateVolume(context.Background(), encryptedCreateRequest("enc-garbage",
+			map[string]string{"passphrase": "longenough1", "pbkdf2iters": "garbage"}))
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Empty(t, client.createPayloads())
+	})
+}
+
+// TestCreateVolumePbkdf2ItersFloorByTrueNASVersion: pool.dataset.create requires
+// pbkdf2iters >= 100,000 on 25.10 and >= 1,300,000 on 26+ (27 applies it). A
+// value below the floor is InvalidArgument before any create; an unset value
+// reads no version at all.
+//
+// PRE-FIX PROOF: below-floor values reached pool.dataset.create (the mock
+// rejects them as the API does) and surfaced as a backend error, not
+// InvalidArgument; unparseable versions were not refused.
+func TestCreateVolumePbkdf2ItersFloorByTrueNASVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version string
+		iters   string
+		wantErr codes.Code
+	}{
+		{"1,000,000 on 27 is below the floor", truenas27, "1000000", codes.InvalidArgument},
+		{"1,000,000 on 26 is below the floor", truenas26, "1000000", codes.InvalidArgument},
+		{"1,300,000 on 27 passes", truenas27, "1300000", codes.OK},
+		{"200,000 on 25.10 passes", truenas2510, "200000", codes.OK},
+		{"50,000 on 25.10 is below the floor", truenas2510, "50000", codes.InvalidArgument},
+		{"unparseable version uses the 26+ floor", "TrueNAS-MASTER", "200000", codes.InvalidArgument},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, client := newAlgorithmTestDriver(tc.version)
+			_, err := d.CreateVolume(context.Background(), encryptedCreateRequest("enc-iters",
+				map[string]string{"passphrase": "longenough1", "pbkdf2iters": tc.iters}))
+			assert.Equal(t, 1, client.GetSystemInfoCalls, "the floor is checked against the version")
+			if tc.wantErr != codes.OK {
+				require.Error(t, err)
+				assert.Equal(t, tc.wantErr, status.Code(err))
+				assert.Contains(t, err.Error(), `"pbkdf2iters"`)
+				assert.Empty(t, client.createPayloads(), "no pool.dataset.create is issued")
+				return
+			}
+			require.NoError(t, err)
+			payloads := client.createPayloads()
+			require.Len(t, payloads, 1)
+			assert.JSONEq(t, tc.iters, string(encryptionOptionsOf(t, payloads[0])["pbkdf2iters"]))
+		})
+	}
+	t.Run("the message names the floor and the version", func(t *testing.T) {
+		d, _ := newAlgorithmTestDriver(truenas27)
+		_, err := d.CreateVolume(context.Background(), encryptedCreateRequest("enc-iters-msg",
+			map[string]string{"passphrase": "longenough1", "pbkdf2iters": "1000000"}))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "1300000")
+		assert.Contains(t, err.Error(), truenas27)
+	})
+	t.Run("unreadable version is Unavailable", func(t *testing.T) {
+		d, client := newAlgorithmTestDriver(truenas27)
+		client.SystemInfoErr = errors.New("connection reset")
+		_, err := d.CreateVolume(context.Background(), encryptedCreateRequest("enc-iters-unreadable",
+			map[string]string{"passphrase": "longenough1", "pbkdf2iters": "1300000"}))
+		require.Error(t, err)
+		assert.Equal(t, codes.Unavailable, status.Code(err))
+		assert.Empty(t, client.createPayloads())
+	})
+	t.Run("unset reads no version and sends no pbkdf2iters", func(t *testing.T) {
+		d, client := newAlgorithmTestDriver(truenas27)
+		_, err := d.CreateVolume(context.Background(), encryptedCreateRequest("enc-iters-unset",
+			map[string]string{"passphrase": "longenough1"}))
+		require.NoError(t, err)
+		assert.Zero(t, client.GetSystemInfoCalls)
+		payloads := client.createPayloads()
+		require.Len(t, payloads, 1)
+		assert.NotContains(t, encryptionOptionsOf(t, payloads[0]), "pbkdf2iters")
+	})
+}

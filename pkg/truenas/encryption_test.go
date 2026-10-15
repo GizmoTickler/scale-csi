@@ -713,3 +713,39 @@ func TestMockDatasetCreateEncryptionAlgorithmByVersion(t *testing.T) {
 		assert.Equal(t, 1, m.GetSystemInfoCalls)
 	})
 }
+
+// TestMockDatasetCreatePbkdf2ItersFloorByVersion mirrors the create model's
+// pbkdf2iters Field(ge=...): 100,000 on 25.10, 1,300,000 on 26.0 and 27.0. Zero
+// is omitted from the wire and always accepted.
+func TestMockDatasetCreatePbkdf2ItersFloorByVersion(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		iters   int
+		wantErr bool
+	}{
+		{"TrueNAS-SCALE-25.10.0", 50000, true},
+		{"TrueNAS-SCALE-25.10.0", 100000, false},
+		{"TrueNAS-26.0.0", 1000000, true},
+		{"TrueNAS-27.0.0-RC.1", 1299999, true},
+		{"TrueNAS-27.0.0-RC.1", 1300000, false},
+		{"TrueNAS-27.0.0-RC.1", 0, false},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", tc.version, tc.iters), func(t *testing.T) {
+			m := NewMockClient()
+			m.SystemVersion = tc.version
+			_, err := m.DatasetCreate(context.Background(), &DatasetCreateParams{
+				Name: "pool/enc", Type: "FILESYSTEM",
+				Encryption:        boolPtr(true),
+				InheritEncryption: boolPtr(false),
+				EncryptionOptions: &EncryptionOptions{Passphrase: "drill-pass-1", Pbkdf2Iters: tc.iters},
+			})
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "encryption_options.pbkdf2iters")
+				assert.Empty(t, m.Datasets)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}

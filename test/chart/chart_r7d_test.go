@@ -326,7 +326,7 @@ func TestReleaseNotesNextTitlesThisRelease(t *testing.T) {
 	lines := strings.SplitN(content, "\n", 2)
 	title := lines[0]
 
-	const wantVersion = "v1.24.2"
+	const wantVersion = "v1.25.0"
 	if !strings.Contains(title, wantVersion) {
 		t.Errorf("release notes title %q does not name this release (%s)", title, wantVersion)
 	}

@@ -852,7 +852,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if preflightErr := d.preflightRefquotaFloor(shareType, capacityBytes); preflightErr != nil {
 		return nil, preflightErr
 	}
-	if preflightErr := d.preflightEncryptionAlgorithm(ctx); preflightErr != nil {
+	if preflightErr := d.preflightEncryptionCreate(ctx); preflightErr != nil {
 		return nil, preflightErr
 	}
 	if shareType == ShareTypeNFS {

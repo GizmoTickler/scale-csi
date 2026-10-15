@@ -60,6 +60,16 @@ const encryptionDefaultAlgorithm = "AES-256-GCM"
 // 25.10 honors a requested suite.
 const encryptionFixedAlgorithmMajor = 26
 
+// pbkdf2iters floors of the pool.dataset.create encryption_options model
+// (`Field(ge=...)`): 25.10 accepts >= 100,000 (default 350,000); 26.0 and 27.0
+// require >= 1,300,000 (default 1,300,000). 26.0 discarded the value on create;
+// 27.0 applies it (NAS-142001), so a value below the floor is a validation
+// error there. The driver enforces the floor before any create.
+const (
+	encryptionPbkdf2ItersFloorLegacy = 100000
+	encryptionPbkdf2ItersFloor       = 1300000
+)
+
 // encryptionMinPassphraseLen is the ZFS minimum passphrase length. ZFS rejects a
 // passphrase shorter than 8 characters; the driver enforces it before any API
 // call so a bad secret fails fast with InvalidArgument.
@@ -70,7 +80,7 @@ const encryptionMinPassphraseLen = 8
 // existed (P-0 probe, nas01 26.0.0-BETA.1; TrueNAS 27 removed that method). A
 // value outside this set is rejected with InvalidArgument before any API call.
 // A member other than encryptionDefaultAlgorithm is only creatable on TrueNAS
-// < 26 (see preflightEncryptionAlgorithm); on 26+ every new encrypted dataset is
+// < 26 (see preflightEncryptionCreate); on 26+ every new encrypted dataset is
 // AES-256-GCM.
 var encryptionAlgorithms = map[string]struct{}{
 	"AES-128-CCM": {},
@@ -91,6 +101,10 @@ type encryptionSecret struct {
 	PassphrasePrevious string
 	Algorithm          string
 	Pbkdf2Iters        int
+	// Pbkdf2ItersRaw is the trimmed `pbkdf2iters` value as written ("" when the
+	// key is absent), kept so validation can REJECT a malformed value instead of
+	// silently provisioning with the backend default.
+	Pbkdf2ItersRaw string
 }
 
 // encryptionResolution is the validated result threaded from CreateVolume down to
@@ -129,6 +143,7 @@ func parseEncryptionSecret(secrets map[string]string) encryptionSecret {
 		Algorithm:          strings.TrimSpace(secrets[encryptionSecretKeyAlgorithm]),
 	}
 	if raw := strings.TrimSpace(secrets[encryptionSecretKeyPbkdf2Iters]); raw != "" {
+		parsed.Pbkdf2ItersRaw = raw
 		if iters, err := strconv.Atoi(raw); err == nil && iters > 0 {
 			parsed.Pbkdf2Iters = iters
 		}
@@ -156,6 +171,15 @@ func validateEncryptionSecret(secret encryptionSecret) (string, error) {
 		return "", status.Errorf(codes.InvalidArgument,
 			"encryption algorithm %q is not supported by the backend (supported: AES-128-CCM, AES-192-CCM, AES-256-CCM, AES-128-GCM, AES-192-GCM, AES-256-GCM)",
 			algorithm)
+	}
+	// A present pbkdf2iters must be a positive integer. It used to be dropped
+	// silently when it was not, provisioning with the backend default the
+	// operator never asked for. The version-dependent floor is checked later,
+	// in preflightEncryptionCreate, where the backend version is known.
+	if secret.Pbkdf2ItersRaw != "" && secret.Pbkdf2Iters <= 0 {
+		return "", status.Errorf(codes.InvalidArgument,
+			"encryption Secret key %q must be a positive integer (TrueNAS 26+ requires at least %d; omit the key to use the backend default)",
+			encryptionSecretKeyPbkdf2Iters, encryptionPbkdf2ItersFloor)
 	}
 	return algorithm, nil
 }
@@ -736,7 +760,7 @@ func (d *Driver) destroyRefusedEncryptedContentSource(
 // is never stamped as a property.
 //
 // encryption_options.algorithm is sent ONLY for a non-default suite, which
-// preflightEncryptionAlgorithm admits only on TrueNAS < 26. The default
+// preflightEncryptionCreate admits only on TrueNAS < 26. The default
 // (AES-256-GCM) is what every supported release applies when the key is
 // absent, and TrueNAS 27 rejects the key outright (extra="forbid").
 func applyEncryptionToCreateParams(ctx context.Context, params *truenas.DatasetCreateParams) {
@@ -757,43 +781,60 @@ func applyEncryptionToCreateParams(ctx context.Context, params *truenas.DatasetC
 	}
 }
 
-// preflightEncryptionAlgorithm refuses a fresh encrypted create that names a
-// non-default suite on a backend that cannot honor it. TrueNAS 26.0 accepts
-// encryption_options.algorithm but silently creates AES-256-GCM anyway (so the
-// stamp would lie), and TrueNAS 27 rejects the key (NAS-142001). Only 25.x
-// honors it.
+// preflightEncryptionCreate checks the parts of a fresh encrypted create that
+// depend on the backend version, before anything is created:
 //
-// The default suite costs nothing: no system.info read, +0 RTT. A non-default
-// suite reads the version through the client's cached system.info. It fails
-// CLOSED: a version that does not parse is treated as >= 26, and an unreadable
-// one is Unavailable (retryable) — the non-default suite is never sent blind.
+//   - A non-default suite. TrueNAS 26.0 accepts encryption_options.algorithm but
+//     silently creates AES-256-GCM anyway (so the stamp would lie), and TrueNAS
+//     27 rejects the key (NAS-142001). Only 25.x honors it.
+//   - The pbkdf2iters floor: >= 1,300,000 on 26+ (27 applies the value and
+//     rejects one below the floor), >= 100,000 on 25.x.
+//
+// A create with neither costs nothing: no system.info read, +0 RTT. Otherwise
+// the version comes from the client's cached system.info. It fails CLOSED: a
+// version that does not parse is treated as >= 26, and an unreadable one is
+// Unavailable (retryable) — neither value is ever sent blind.
 //
 // It runs below the already-exists check, like the other create preflights: a
 // replay of an already-provisioned volume sends no create, so the backend's
 // current version says nothing about it, and refusing it would wedge a volume
 // that exists.
-func (d *Driver) preflightEncryptionAlgorithm(ctx context.Context) error {
+func (d *Driver) preflightEncryptionCreate(ctx context.Context) error {
 	res := encryptionResolutionFromContext(ctx)
-	if res == nil || res.Algorithm == encryptionDefaultAlgorithm {
+	if res == nil || (res.Algorithm == encryptionDefaultAlgorithm && res.Pbkdf2Iters == 0) {
 		return nil
 	}
 	info, err := d.truenasClient.GetSystemInfo(ctx)
 	if err != nil {
 		return status.Errorf(codes.Unavailable,
-			"encryption algorithm %q requires TrueNAS < %d.0, but the TrueNAS version could not be read: %v",
-			res.Algorithm, encryptionFixedAlgorithmMajor, err)
+			"the encryption Secret sets a version-dependent option (algorithm or pbkdf2iters), but the TrueNAS "+
+				"version could not be read: %v", err)
 	}
-	if info == nil || info.VersionMajor == 0 || info.VersionMajor >= encryptionFixedAlgorithmMajor {
-		version := "unknown"
-		if info != nil && info.Version != "" {
-			version = info.Version
-		}
+	version := "unknown"
+	if info != nil && info.Version != "" {
+		version = info.Version
+	}
+	// An unparseable version (major 0) is treated as the newest rules.
+	modern := info == nil || info.VersionMajor == 0 || info.VersionMajor >= encryptionFixedAlgorithmMajor
+	if res.Algorithm != encryptionDefaultAlgorithm && modern {
 		return status.Errorf(codes.InvalidArgument,
 			"encryption algorithm %q cannot be honored by TrueNAS %s: TrueNAS %d.0 and later always create "+
 				"encrypted datasets with %s (27.0 rejects the algorithm option outright). Remove the %q key from "+
 				"the StorageClass encryption Secret, or set it to %s",
 			res.Algorithm, version, encryptionFixedAlgorithmMajor, encryptionDefaultAlgorithm,
 			encryptionSecretKeyAlgorithm, encryptionDefaultAlgorithm)
+	}
+	if res.Pbkdf2Iters != 0 {
+		floor := encryptionPbkdf2ItersFloorLegacy
+		if modern {
+			floor = encryptionPbkdf2ItersFloor
+		}
+		if res.Pbkdf2Iters < floor {
+			return status.Errorf(codes.InvalidArgument,
+				"encryption Secret key %q is %d, below the minimum of %d that TrueNAS %s requires. Raise it to at "+
+					"least %d, or remove the key to use the backend default",
+				encryptionSecretKeyPbkdf2Iters, res.Pbkdf2Iters, floor, version, floor)
+		}
 	}
 	return nil
 }

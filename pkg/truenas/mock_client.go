@@ -145,6 +145,7 @@ type MockClient struct {
 	//     encrypted dataset is AES-256-GCM.
 	//   - >= 27: algorithm is no longer part of the model (NAS-142001,
 	//     extra="forbid"), so a create that sends it is a validation error.
+	// and the pbkdf2iters floor: >= 100,000 below 26, >= 1,300,000 from 26.
 	// SystemInfoErr makes GetSystemInfo fail; GetSystemInfoCalls counts calls.
 	SystemVersion      string
 	SystemInfoErr      error
@@ -668,6 +669,22 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	if params.EncryptionOptions != nil && params.EncryptionOptions.Algorithm != "" && mockMajor >= 27 {
 		return nil, fmt.Errorf("failed to create dataset: %w",
 			UnsupportedDatasetPropertyError(datasetType, "encryption_options.algorithm"))
+	}
+	// pbkdf2iters is Field(ge=...) in the create model: >= 100,000 on 25.10,
+	// >= 1,300,000 on 26.0 and 27.0. Zero is omitted from the wire (omitempty)
+	// and means the backend default.
+	if opts := params.EncryptionOptions; opts != nil && opts.Pbkdf2Iters != 0 {
+		floor := 100000
+		if mockMajor >= 26 {
+			floor = 1300000
+		}
+		if opts.Pbkdf2Iters < floor {
+			return nil, fmt.Errorf("failed to create dataset: %w", &APIError{
+				Code: -32602,
+				Message: fmt.Sprintf("[EINVAL] data.%s.encryption_options.pbkdf2iters: Input should be greater than or equal to %d",
+					datasetType, floor),
+			})
+		}
 	}
 	if existing, exists := m.Datasets[params.Name]; exists {
 		// Match the real client's idempotent AlreadyExists fallback while

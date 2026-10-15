@@ -1138,7 +1138,7 @@ stringData:
   passphrase:         "correct-horse-battery"   # required, >= 8 characters (ZFS minimum)
   passphrasePrevious: "old-passphrase-here"     # optional; opens the rotation window
   algorithm:          "AES-256-GCM"             # optional; omit it (TrueNAS 26+ is always AES-256-GCM)
-  pbkdf2iters:        "1300000"                 # optional; positive integer override
+  pbkdf2iters:        "1300000"                 # optional; >= 1300000 on TrueNAS 26+, >= 100000 on 25.10
 ```
 
 - `passphrase` is required and must be **at least 8 characters** — the ZFS
@@ -1157,7 +1157,12 @@ stringData:
   publish never send the algorithm.
 - `pbkdf2iters` overrides the key-derivation iteration count (the backend
   default is 1,300,000). Higher values add unlock CPU latency; unlock is off the
-  steady-state I/O path, so the default is acceptable.
+  steady-state I/O path, so the default is acceptable. A value that is not a
+  positive integer is rejected with `InvalidArgument`. A new volume's
+  `CreateVolume` also checks the value against the backend's minimum —
+  1,300,000 on TrueNAS 26+ (or when the version cannot be identified), 100,000
+  on 25.10 — and rejects a lower value with `InvalidArgument` before anything is
+  created.
 - `passphrasePrevious` is optional and only meaningful during rotation (below).
 
 ### Encryption is create-time only

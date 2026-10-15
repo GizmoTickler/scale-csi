@@ -1,9 +1,9 @@
-# Release notes — next (v1.24.2 draft)
+# Release notes — next (v1.25.0 draft)
 
-## v1.24.2 (draft) — encrypted volumes can be created on TrueNAS 27
+## v1.25.0 (draft) — encrypted volumes can be created on TrueNAS 27
 
 Nothing to configure, unless an encryption Secret names a suite other than
-`AES-256-GCM` (below).
+`AES-256-GCM` or sets `pbkdf2iters` (below).
 
 TrueNAS 27 removed `encryption_options.algorithm` from `pool.dataset.create`
 (NAS-142001), and that request model rejects keys it does not know. The driver
@@ -25,9 +25,21 @@ rotation and delete never send the algorithm.
   the message says to remove the key. On 25.10 the suite is still sent and
   honored. If the TrueNAS version does not parse, the request is refused as on
   26+; if it cannot be read, `CreateVolume` returns `Unavailable` and is
-  retried. Only a non-default suite reads the version, from the client's
-  cached `system.info`; the default path makes no extra call.
-- **A replay of an existing volume is not refused.** The check runs only when
+  retried. The version is read from the client's cached `system.info`, and
+  only when the Secret names a non-default suite or sets `pbkdf2iters`; a
+  Secret with neither makes no extra call.
+- **`pbkdf2iters` is validated, not dropped.** A value that is not a positive
+  integer used to be ignored silently, and the volume got the backend default;
+  it is now `InvalidArgument`. The value is also checked against the minimum
+  `pool.dataset.create` accepts: 1,300,000 on TrueNAS 26 and 27, 100,000 on
+  25.10. TrueNAS 26.0 discarded the value on create, so a lower one went
+  unnoticed there; 27 applies it and rejects a lower one. A new volume whose
+  Secret is below the minimum now fails `CreateVolume` with `InvalidArgument`
+  naming the minimum and the TrueNAS version, before anything is created. An
+  unparseable version gets the 26+ minimum; an unreadable one is `Unavailable`.
+  Like the algorithm check, this reads the cached version only when the Secret
+  sets `pbkdf2iters`.
+- **A replay of an existing volume is not refused.** These checks run only when
   a dataset is about to be created. A retried `CreateVolume` for a volume that
   already exists sends no create, so it behaves as before whatever the Secret
   says.
@@ -41,7 +53,9 @@ unlock and rotation work. `zfs get encryption <dataset>` shows the real suite.
 ### Rolling back to v1.24.1
 
 Encrypted creates fail on TrueNAS 27 again. On 25.10 and 26.0 nothing changes
-for a Secret without `algorithm` or with `AES-256-GCM`.
+for a Secret without `algorithm` or with `AES-256-GCM`. A malformed
+`pbkdf2iters` is silently ignored again, and one below the backend minimum
+fails at `pool.dataset.create` instead of before it.
 
 
 ## v1.24.1 — an NVMe-oF head disk outlives its first path, also on expand
