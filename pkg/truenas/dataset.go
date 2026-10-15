@@ -319,7 +319,11 @@ type DatasetCreateParams struct {
 	// PROBED accepted on BOTH pool.dataset.create type models (P-1 FILESYSTEM,
 	// P-2 VOLUME, nas01 26.0.0-BETA.1): the create shape is
 	//   {"encryption":true,"inherit_encryption":false,
-	//    "encryption_options":{"algorithm":"AES-256-GCM","passphrase":"<>"}}
+	//    "encryption_options":{"passphrase":"<>"}}
+	// The probe also carried "algorithm":"AES-256-GCM"; the driver no longer
+	// sends it for the default suite, because TrueNAS 27 removed it from the
+	// model (NAS-142001, extra="forbid" => validation error). See
+	// EncryptionOptions.Algorithm.
 	// When Encryption is non-nil the driver MUST also set InheritEncryption=false
 	// (that probe shape), so a passphrase dataset becomes its own encryption_root.
 	// Encryption is create-time only: ZFS cannot encrypt an existing dataset in
@@ -335,6 +339,12 @@ type DatasetCreateParams struct {
 // it is request-scoped and must never be persisted to a dataset property, log,
 // gRPC status, Event, or volume context. Pbkdf2Iters is optional; TrueNAS
 // defaults it to 1300000 (P-1) when zero.
+//
+// Algorithm is version-dependent and MUST stay omitempty: TrueNAS 25.10 honors
+// it, 26.0 accepts but silently discards it (always AES-256-GCM), and 27.0
+// removed it from the create model (extra="forbid"), so any value — even
+// "AES-256-GCM" — fails validation there. The driver sets it only for an
+// explicitly requested non-default suite on a backend older than 26.
 type EncryptionOptions struct {
 	Algorithm   string `json:"algorithm,omitempty"`
 	Passphrase  string `json:"passphrase,omitempty"`

@@ -1,0 +1,83 @@
+# NFS, iSCSI, and NVMe-oF from one installation.
+#
+#   helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi --values values-multi-protocol.yaml
+#
+# With more than one protocol enabled, every StorageClass MUST set `protocol`;
+# a class without it fails provisioning with InvalidArgument instead of
+# silently picking NFS.
+
+truenas:
+  host: truenas.example.com
+  existingSecret: truenas-api-key
+
+zfs:
+  parentDataset: tank/k8s/volumes
+  zvolBlocksize: 16K
+
+nfs:
+  enabled: true
+  server: 192.0.2.10
+  shareAllowedNetworks:
+    - 192.0.2.0/24
+
+iscsi:
+  enabled: true
+  portal: 192.0.2.10
+
+nvmeof:
+  enabled: true
+  address: 192.0.2.10
+  subsystemHosts:
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000001
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000002
+
+storageClasses:
+  # Shared filesystem; the cluster default class.
+  - name: scale-nfs
+    protocol: nfs
+    isDefault: true
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: [nfsvers=4.1, hard, noatime]
+    extraParameters: {}
+  # General-purpose block storage.
+  - name: scale-iscsi
+    protocol: iscsi
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters:
+      csi.storage.k8s.io/fstype: ext4
+  # Fast block storage; Retain keeps the zvol if the PVC is deleted.
+  - name: scale-nvmeof
+    protocol: nvmeof
+    isDefault: false
+    reclaimPolicy: Retain
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters:
+      csi.storage.k8s.io/fstype: xfs
+  # Snapshot restores into this class are independent send/receive copies
+  # rather than ZFS clones that pin their source snapshot.
+  - name: scale-nvmeof-detached
+    protocol: nvmeof
+    snapshotRestoreMode: detached
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters:
+      csi.storage.k8s.io/fstype: xfs
+
+# Create a VolumeSnapshotClass (needs the snapshot CRDs and controller; see
+# docs/guides/snapshots.md).
+snapshotClass:
+  create: true
+  name: scale-csi
+  deletionPolicy: Delete

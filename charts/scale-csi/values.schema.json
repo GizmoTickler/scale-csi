@@ -1498,6 +1498,15 @@
           "type": "integer",
           "minimum": 1
         },
+        "maxSectorsKB": {
+          "description": "Request-size clamp written to queue/max_sectors_kb on the multipath head and every path device before a kernel-initiator volume is formatted, mounted or published: auto (NVMe/TCP with MDTS=0 -> 4096 KiB), a whole number of KiB (at least 4), or off/0.",
+          "anyOf": [
+            {"type": "string", "pattern": "^(auto|off|0|[4-9]|[1-9][0-9]+)$"},
+            {"type": "integer", "const": 0},
+            {"type": "integer", "minimum": 4},
+            {"type": "boolean", "const": false}
+          ]
+        },
         "dataPath": {
           "description": "Node data path for NVMe-oF volumes whose StorageClass does not set nvmeof/dataPath.",
           "type": "string",

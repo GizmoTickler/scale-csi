@@ -1,6 +1,154 @@
-# Release notes — next (v1.24.1 draft)
+# Release notes — next (v1.25.0 draft)
 
-## v1.24.1 (draft) — an NVMe-oF head disk outlives its first path, also on expand
+## v1.25.0 (draft) — TrueNAS 27 compatibility
+
+Two fixes for TrueNAS 27.0 (Linux 6.18.52, middleware API v27): NVMe/TCP
+volumes no longer fail writes larger than 4 MiB, and encrypted volumes can be
+created again. Plus a documentation overhaul with getting-started, examples
+(Helm, Flux, Argo CD, workloads) and a compatibility matrix.
+
+### NVMe/TCP request-size clamp (`nvmeof.maxSectorsKB`)
+
+New chart value `nvmeof.maxSectorsKB` (default `auto`); nothing to configure
+for the fix to apply. Both node agents (the Rust agent, the default, and the Go
+node plugin).
+
+#### Problem
+
+TrueNAS 27.0.0-RC.1 ships Linux 6.18.52. Its NVMe/TCP target
+(`nvmet_tcp_map_data()`) now rejects any command carrying more than
+`NVMET_TCP_MAXH2CDATA` (4 MiB) of data with `NVME_SC_SGL_INVALID_DATA | DNR`,
+while Identify Controller still reports MDTS=0 (no limit). A Linux initiator
+trusts MDTS, leaves `max_sectors_kb` at 32768 and issues commands of up to
+32 MiB: `I/O Error (sct 0x0 / sc 0xf) DNR`, ext4 aborts its journal and
+remounts read-only, Postgres crash-loops. A freshly staged volume failed
+within about five seconds of mounting.
+
+The size that reaches the wire is bounded by the hidden PATH devices
+(`nvme<S>c<C>n<N>`), not only by the multipath head (`nvme<S>n<N>`): with the
+head capped at 4096 KiB and the paths left at 32768, a 12 MiB write still went
+out on a path (its request queue merges bios back up to its own limit). Path
+devices have no `/dev` node and send no uevents, so udev cannot fix this, and
+there is no `nvme_core`/`nvme_tcp` module parameter for it.
+
+#### Fix
+
+- **The stage clamps every device of the subsystem before anything uses it.**
+  After the paths are connected and before the volume is formatted, mounted
+  or linked for raw-block publish, the node writes `queue/max_sectors_kb` on
+  the head and on every path device under every controller of the subsystem
+  (found through `/sys/class/nvme-subsystem/<subsys>/<controller>/`; every
+  subsystem directory carrying the NQN, so `nvme_core.multipath=N` is covered
+  too). It waits (up to 10 s) for every live controller's path device, since
+  the namespace scan that creates it runs after `nvme connect` returns.
+- **`auto` (default):** NVMe/TCP subsystems are clamped to 4096 KiB when the
+  controller reports MDTS=0 (`nvme id-ctrl -o json`, asked of one live
+  controller, and only when some device is above 4096, so a converged
+  subsystem costs sysfs reads only). If MDTS cannot be read the clamp applies
+  anyway. A controller that reports MDTS is left alone: the kernel honors it.
+  RDMA is left alone. **A whole number** is a fixed ceiling for every
+  subsystem, any transport. **`off` / `0`** disables it. A value is only ever
+  lowered, never raised.
+- **Fail-safe.** A clamp that is required and cannot be proven in place (a
+  write fails or reads back higher, the subsystem or a live path's device is
+  missing) fails the stage with `Internal` and a `NVMeMaxSectorsClampFailed`
+  event naming the device; kubelet retries. The volume is never mounted
+  unprotected.
+- **Re-stage and interchange.** Every replay of a stage (already mounted, raw
+  block already linked, kubelet retry, plugin restart) re-applies the clamp
+  after topping up missing paths, so a path device the top-up just created is
+  covered. The clamp reads and writes kernel state only, so a volume connected
+  by one node agent and re-staged by the other converges the same way; both
+  run the same vectors (`pkg/util/testdata/nvme_max_sectors_vectors.json`).
+- **Path devices created later.** A controller reconnect keeps its path
+  device (`ctrl_loss_tmo=-1` never deletes a controller), so new path devices
+  come only from a connect: the re-stage top-up (clamped inline) or a connect
+  made outside the plugin, which the session-GC tick (`sessionGC.interval`,
+  default 300 s) clamps on subsystems staged under this driver. `sessionGC.dryRun`
+  only logs.
+- **Observability.** One info line per stage with every device's before and
+  after value (`NVMe-oF max_sectors_kb for <nqn>: policy=auto transport=tcp
+  mdts=0 limit=4096KiB changed=5 devices=[nvme3c3n1 32768->4096, ...]`);
+  `scale_csi_nvme_controller_tunable_corrections_total{tunable="max_sectors_kb"}`
+  counts lowered devices (`corrected`) and failed clamps (`error`).
+- The ublk data path is unaffected (its own initiator, no kernel path devices).
+
+#### Upgrade notes
+
+- Upgrade the node plugin before, or together with, TrueNAS 27. Volumes staged
+  by an older release are clamped on their next re-stage or the next
+  session-GC tick after the upgrade; to protect a node immediately, write
+  `4096` to `queue/max_sectors_kb` of each head and path device by hand (see
+  the troubleshooting entry).
+- The ConfigMap carries `maxSectorsKB` only when it is not `auto`, so a
+  default install's ConfigMap is unchanged. A rolled-back binary rejects the
+  key (strict parsing): remove a non-default value before rolling back.
+- Chart schema: a string `auto`, `off`, or a whole number (0, or at least 4).
+
+#### Rolling back
+
+Rolled back, nothing clamps any more; values already written stay until the
+device goes away (a disconnect, a reboot).
+
+### Encrypted volumes can be created on TrueNAS 27
+
+Nothing to configure, unless an encryption Secret names a suite other than
+`AES-256-GCM` or sets `pbkdf2iters` (below).
+
+TrueNAS 27 removed `encryption_options.algorithm` from `pool.dataset.create`
+(NAS-142001), and that request model rejects keys it does not know. The driver
+sent `"algorithm": "AES-256-GCM"` on every encrypted create, so on TrueNAS 27
+every encrypted `CreateVolume` failed with a validation error. Plaintext volumes
+were not affected, nor were existing encrypted volumes: unlock, publish, key
+rotation and delete never send the algorithm.
+
+- **The default suite is no longer sent.** For `AES-256-GCM`, whether the
+  Secret leaves `algorithm` out or names it, the create carries no algorithm.
+  Every supported TrueNAS release creates `AES-256-GCM` when none is given, so
+  the dataset and its `scale-csi:encryption` stamp are the same as before on
+  25.10 and 26.0.
+- **Another suite is refused on TrueNAS 26 and later.** TrueNAS 26.0 accepted
+  a requested suite but created `AES-256-GCM` anyway, so the volume's stamp
+  named a suite the data did not use; 27.0 rejects the option. A Secret whose
+  `algorithm` is anything but `AES-256-GCM` now fails a new volume's
+  `CreateVolume` with `InvalidArgument` on 26+ before anything is created, and
+  the message says to remove the key. On 25.10 the suite is still sent and
+  honored. If the TrueNAS version does not parse, the request is refused as on
+  26+; if it cannot be read, `CreateVolume` returns `Unavailable` and is
+  retried. The version is read from the client's cached `system.info`, and
+  only when the Secret names a non-default suite or sets `pbkdf2iters`; a
+  Secret with neither makes no extra call.
+- **`pbkdf2iters` is validated, not dropped.** A value that is not a positive
+  integer used to be ignored silently, and the volume got the backend default;
+  it is now `InvalidArgument`. The value is also checked against the minimum
+  `pool.dataset.create` accepts: 1,300,000 on TrueNAS 26 and 27, 100,000 on
+  25.10. TrueNAS 26.0 discarded the value on create, so a lower one went
+  unnoticed there; 27 applies it and rejects a lower one. A new volume whose
+  Secret is below the minimum now fails `CreateVolume` with `InvalidArgument`
+  naming the minimum and the TrueNAS version, before anything is created. An
+  unparseable version gets the 26+ minimum; an unreadable one is `Unavailable`.
+  Like the algorithm check, this reads the cached version only when the Secret
+  sets `pbkdf2iters`.
+- **A replay of an existing volume is not refused.** These checks run only when
+  a dataset is about to be created. A retried `CreateVolume` for a volume that
+  already exists sends no create, so it behaves as before whatever the Secret
+  says.
+
+On TrueNAS 26.0, a volume created from a Secret that named another suite is
+`AES-256-GCM` on disk while its `scale-csi:encryption` stamp names the requested
+suite, and so does the `encryption` key of its volume context. The driver only
+checks that the stamp is present; nothing passes the suite back to TrueNAS, so
+unlock and rotation work. `zfs get encryption <dataset>` shows the real suite.
+
+#### Rolling back to v1.24.1
+
+Encrypted creates fail on TrueNAS 27 again. On 25.10 and 26.0 nothing changes
+for a Secret without `algorithm` or with `AES-256-GCM`. A malformed
+`pbkdf2iters` is silently ignored again, and one below the backend minimum
+fails at `pool.dataset.create` instead of before it.
+
+
+## v1.24.1 — an NVMe-oF head disk outlives its first path, also on expand
 
 Nothing to configure. Two fixes to the same mistake, in both node agents
 (the Rust agent, the default since v1.21.0, and the Go node plugin): a

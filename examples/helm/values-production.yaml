@@ -1,0 +1,145 @@
+# Production-oriented starting point (NVMe-oF + NFS).
+#
+#   helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+#     --namespace scale-csi --version <reviewed-version> \
+#     --values values-production.yaml
+#
+# Read docs/production.md before going live. The choices that matter most:
+#
+#   * Controller HA vs. backend fencing. `fencing.mode: additive|strict`
+#     requires exactly ONE controller replica (the chart enforces it). This
+#     file runs two replicas with fencing "off", which keeps the per-volume
+#     publication records (single-node attach exclusivity is always enforced)
+#     but leaves the backend allowlists static. To make the backend enforce
+#     attachments instead, set controller.replicas: 1 and fencing.mode: strict,
+#     following the node-first rollout in charts/scale-csi/README.md.
+#   * Guarded orphan cleanup (reconcile.delete.enabled) is destructive and off
+#     here. Detection and alerts are on.
+
+truenas:
+  host: truenas.example.com
+  port: 443
+  secure: true
+  # Verify the API certificate against your own CA instead of system roots.
+  # Never ship skipTLSVerify: true.
+  caCert: |
+    -----BEGIN CERTIFICATE-----
+    REPLACE-WITH-YOUR-CA-CERTIFICATE
+    -----END CERTIFICATE-----
+  existingSecret: truenas-api-key
+
+# Pin the driver image by digest for immutable rollouts (optional; the tag
+# defaults to v<chart version>).
+# image:
+#   digest: sha256:<manifest-digest>
+
+zfs:
+  parentDataset: tank/k8s/volumes
+  zvolBlocksize: 16K
+  # Properties for new datasets/zvols; empty inherits from the parent.
+  datasetProperties:
+    compression: lz4
+  # Refuse to delete volumes that carry snapshots the driver did not create.
+  destroyForeignSnapshotsOnDelete: false
+
+nfs:
+  enabled: true
+  server: 192.0.2.10
+  shareAllowedNetworks:
+    - 192.0.2.0/24
+
+iscsi:
+  enabled: false
+
+nvmeof:
+  enabled: true
+  address: 192.0.2.10
+  subsystemHosts:
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000001
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000002
+    - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000003
+
+fencing:
+  mode: "off"
+
+controller:
+  # Two replicas: the CSI sidecars use leader election, so one is active and
+  # the other takes over on failure. A PDB (maxUnavailable: 1) renders
+  # automatically when replicas > 1, and the chart adds preferred hostname
+  # anti-affinity while `affinity` is empty.
+  replicas: 2
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+node:
+  # The Rust node agent is the default; `go` selects the Go node plugin from
+  # the same image. Switching needs no volume work.
+  implementation: rust
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  # Cap volumes the scheduler may place on one node (0 = unlimited).
+  maxVolumesPerNode: 0
+
+# Publish CSIStorageCapacity and the pool-usage gauges used by
+# ScaleCSIPoolNearFull. Capacity only affects scheduling for
+# WaitForFirstConsumer classes.
+capacity:
+  enabled: true
+  gaugeEnabled: true
+
+metrics:
+  enabled: true
+  # Requires the Prometheus Operator CRDs (monitoring.coreos.com/v1).
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+    interval: 30s
+  prometheusRule:
+    enabled: true
+    additionalLabels:
+      release: kube-prometheus-stack
+    poolUsageThreshold: 0.85
+  # Grafana sidecar-discoverable dashboard ConfigMap.
+  dashboards:
+    enabled: true
+
+reconcile:
+  enabled: true
+  delete:
+    enabled: false
+
+storageClasses:
+  - name: scale-nvmeof
+    protocol: nvmeof
+    isDefault: true
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters:
+      csi.storage.k8s.io/fstype: xfs
+  - name: scale-nfs
+    protocol: nfs
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: [nfsvers=4.1, hard, noatime]
+    extraParameters: {}
+
+snapshotClass:
+  create: true
+  name: scale-csi
+  deletionPolicy: Delete

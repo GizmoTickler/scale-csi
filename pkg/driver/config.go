@@ -895,6 +895,19 @@ type NVMeoFConfig struct {
 	// every node that stages a volume.
 	Connect NVMeoFConnectConfig `yaml:"connect"`
 
+	// MaxSectorsKB caps queue/max_sectors_kb (KiB) on the multipath head AND
+	// every path device of a kernel-initiator subsystem, written by the node
+	// after the paths are connected and before the volume is formatted,
+	// mounted or published. "auto" (the default, including an absent key)
+	// clamps NVMe/TCP subsystems to 4096 when the controller reports MDTS=0:
+	// a TrueNAS 27 (Linux 6.18) target rejects commands larger than 4 MiB
+	// with "SGL invalid data" while still advertising no limit, and the
+	// initiator then issues up to 32 MiB commands. A whole number is a fixed
+	// ceiling for every subsystem; "off" or 0 disables the clamp. A value is
+	// only ever lowered, never raised. Kept a string so YAML `auto`, `off`
+	// and `4096` all load.
+	MaxSectorsKB string `yaml:"maxSectorsKB"`
+
 	// DataPath is how the node plugin attaches an NVMe-oF volume whose
 	// StorageClass does not choose one with the nvmeof/dataPath parameter:
 	// "kernel" (the default, and the only behavior before this field existed)
@@ -1371,6 +1384,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: multiple YAML documents are not supported")
 	}
 	if err := validateNonNegativeConfig(cfg); err != nil {
+		return nil, err
+	}
+	if _, err := util.ParseNVMeMaxSectorsPolicy(cfg.NVMeoF.MaxSectorsKB); err != nil {
 		return nil, err
 	}
 

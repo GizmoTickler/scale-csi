@@ -2,6 +2,21 @@
 
 All protocols use the unified provisioner `csi.scale.io`.
 
+**On this page:** [Parameters](#parameters-the-driver-understands) ·
+[Periodic snapshots](#driver-managed-periodic-snapshots-gf2e2) ·
+[ZFS performance classes](#zfs-performance-classes) ·
+[Block-protocol tuning](#block-protocol-tuning) · [NFS](#nfs) ·
+[NFSv4 ACLs](#nfsv4-acls) · [iSCSI](#iscsi) · [iSCSI CHAP](#iscsi-chap) ·
+[Encryption at rest](#encryption-at-rest) · [NVMe-oF](#nvme-of) ·
+[Restore mode](#restore-mode) · [Policies and binding](#policies-and-binding) ·
+[Adding `protocol` safely](#upgrade-add-protocol-safely) ·
+[Troubleshooting](#troubleshooting)
+
+Task-oriented walkthroughs live in the guides:
+[Getting started](../getting-started.md), [Snapshots](../guides/snapshots.md),
+[Encryption](../guides/encryption.md). Ready-to-apply StorageClasses are in
+the chart values examples under [`examples/helm/`](../../examples/helm/).
+
 | `protocol` | Access modes | Volume modes |
 |---|---|---|
 | `nfs` | RWO, ROX, RWX | Filesystem |
@@ -1090,7 +1105,7 @@ restarting the controller never changes an existing volume's authmethod.
 
 ZFS-native encryption at rest (GF-Sprint 1) is strictly opt-in and is configured
 per StorageClass. It works for NFS filesystems and for iSCSI/NVMe-oF zvols alike
-(both dataset types were probed creating encrypted on nas01, 26.0.0-BETA.1). Two
+(both dataset types were probed creating encrypted on TrueNAS 26.0.0-BETA.1). Two
 things must be true for a class to use it:
 
 1. The controller is opted in via Helm (`encryption.enabled: true`). With this
@@ -1137,20 +1152,32 @@ metadata:
 stringData:
   passphrase:         "correct-horse-battery"   # required, >= 8 characters (ZFS minimum)
   passphrasePrevious: "old-passphrase-here"     # optional; opens the rotation window
-  algorithm:          "AES-256-GCM"             # optional; default AES-256-GCM
-  pbkdf2iters:        "1300000"                 # optional; positive integer override
+  algorithm:          "AES-256-GCM"             # optional; omit it (TrueNAS 26+ is always AES-256-GCM)
+  pbkdf2iters:        "1300000"                 # optional; >= 1300000 on TrueNAS 26+, >= 100000 on 25.10
 ```
 
 - `passphrase` is required and must be **at least 8 characters** — the ZFS
   minimum. The driver enforces this on the exact, untrimmed value before any API
   call.
-- `algorithm` defaults to `AES-256-GCM`. The accepted set is exactly what
-  `pool.dataset.encryption_algorithm_choices` returns on the probed backend:
-  `AES-128-CCM`, `AES-192-CCM`, `AES-256-CCM`, `AES-128-GCM`, `AES-192-GCM`,
-  `AES-256-GCM`. Anything else is rejected before any API call.
+- `algorithm` is optional and defaults to `AES-256-GCM`; leave it out. On
+  TrueNAS 26.0 and later every new encrypted dataset is `AES-256-GCM`: 26.0
+  ignores a requested suite and 27.0 no longer accepts the option at all. The
+  driver therefore never sends the algorithm for `AES-256-GCM` (absent or
+  explicit), and a Secret that names any other suite fails `CreateVolume` with
+  `InvalidArgument` on TrueNAS 26+ (or when the version cannot be identified),
+  before anything is created. Only TrueNAS 25.10 still honors a non-default
+  suite from `AES-128-CCM`, `AES-192-CCM`, `AES-256-CCM`, `AES-128-GCM`,
+  `AES-192-GCM`; anything outside that set is rejected before any API call.
+  Existing volumes created with another suite are unaffected — unlock and
+  publish never send the algorithm.
 - `pbkdf2iters` overrides the key-derivation iteration count (the backend
   default is 1,300,000). Higher values add unlock CPU latency; unlock is off the
-  steady-state I/O path, so the default is acceptable.
+  steady-state I/O path, so the default is acceptable. A value that is not a
+  positive integer is rejected with `InvalidArgument`. A new volume's
+  `CreateVolume` also checks the value against the backend's minimum —
+  1,300,000 on TrueNAS 26+ (or when the version cannot be identified), 100,000
+  on 25.10 — and rejects a lower value with `InvalidArgument` before anything is
+  created.
 - `passphrasePrevious` is optional and only meaningful during rotation (below).
 
 ### Encryption is create-time only
@@ -1251,7 +1278,7 @@ only in your Kubernetes Secret; nothing on the appliance can re-derive the key.
 
 The consequences, in plain words:
 
-- **A nas01 reboot locks every encrypted volume.** Because the key is not in the
+- **A TrueNAS reboot locks every encrypted volume.** Because the key is not in the
   TrueNAS database, every passphrase dataset comes back from a reboot LOCKED,
   and nothing on the appliance auto-unlocks it. A locked zvol has **no backing
   block device** (`/dev/zvol/<name>` is gone), and a locked filesystem has

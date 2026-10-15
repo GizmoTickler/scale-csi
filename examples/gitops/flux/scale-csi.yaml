@@ -1,0 +1,85 @@
+# Flux v2: install scale-csi from its OCI chart.
+#
+#   kubectl apply -f scale-csi.yaml        # or commit it to your Flux repo
+#
+# Requires Flux 2.6+ (OCIRepository and HelmRelease chartRef at their GA APIs).
+# The API-key Secret is NOT in this file: create "truenas-api-key" in the
+# scale-csi namespace with SOPS, Sealed Secrets, or External Secrets
+# (the Secret needs the key "api-key").
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scale-csi
+  labels:
+    # The node plugin is privileged.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: scale-csi
+  namespace: scale-csi
+spec:
+  interval: 1h
+  url: oci://ghcr.io/gizmotickler/charts/scale-csi
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  ref:
+    # Tracks the newest 1.x release. For change control pin an exact
+    # version you reviewed, e.g. tag: "1.24.1"; see
+    # https://github.com/GizmoTickler/scale-csi/releases
+    semver: ">=1.0.0 <2.0.0"
+  # Optional: verify the keyless cosign signature of the chart.
+  # verify:
+  #   provider: cosign
+  #   matchOIDCIdentity:
+  #     - issuer: "^https://token.actions.githubusercontent.com$"
+  #       subject: "^https://github.com/GizmoTickler/scale-csi/.github/workflows/helm-release.yml@refs/tags/v.*$"
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: scale-csi
+  namespace: scale-csi
+spec:
+  interval: 1h
+  releaseName: scale-csi
+  chartRef:
+    kind: OCIRepository
+    name: scale-csi
+  install:
+    # The chart ships the VolumePublication CRD in crds/. Helm only installs
+    # crds/ on first install; CreateReplace also updates it on upgrade.
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    truenas:
+      host: truenas.example.com
+      existingSecret: truenas-api-key
+    zfs:
+      parentDataset: tank/k8s/volumes
+    nfs:
+      enabled: true
+      server: 192.0.2.10
+      shareAllowedNetworks:
+        - 192.0.2.0/24
+    iscsi:
+      enabled: false
+    nvmeof:
+      enabled: false
+    storageClasses:
+      - name: scale-nfs
+        protocol: nfs
+        isDefault: false
+        reclaimPolicy: Delete
+        allowVolumeExpansion: true
+        volumeBindingMode: Immediate
+        mountOptions: [nfsvers=4.1, hard, noatime]
+        extraParameters: {}

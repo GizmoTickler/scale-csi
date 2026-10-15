@@ -1,0 +1,26 @@
+# Clone an existing PVC into a new one (no VolumeSnapshot needed).
+#
+#   kubectl apply -f nfs-pvc-pod.yaml          # the source volume
+#   kubectl apply -f pvc-clone.yaml
+#   kubectl get pvc scale-nfs-clone
+#
+# The clone must use a StorageClass of the same protocol and be at least as
+# large as the source. Volume-to-volume clones are always ZFS clones,
+# whatever `snapshotRestoreMode` says. Delete the clone before its source.
+#
+#   kubectl delete -f pvc-clone.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-nfs-clone
+spec:
+  storageClassName: scale-nfs
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: scale-nfs-test
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

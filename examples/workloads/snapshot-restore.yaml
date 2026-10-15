@@ -1,0 +1,107 @@
+# Snapshot a volume and restore the snapshot into a new PVC.
+#
+# Prerequisites: the VolumeSnapshot CRDs and the snapshot-controller
+# (docs/guides/snapshots.md#prerequisites). The VolumeSnapshotClass below is
+# what the chart creates with `snapshotClass.create: true`; skip that document
+# if you enabled it.
+#
+# Apply in three steps so each object exists before the next needs it:
+#
+#   # 1. Source volume with some data
+#   kubectl apply -f nfs-pvc-pod.yaml
+#   kubectl wait --for=condition=Ready pod/scale-nfs-test --timeout=180s
+#
+#   # 2. Snapshot class + snapshot; wait until it is ready to use
+#   kubectl apply -f snapshot-restore.yaml -l step=snapshot
+#   kubectl wait --for=jsonpath='{.status.readyToUse}'=true \
+#     volumesnapshot/scale-nfs-test-snap --timeout=120s
+#
+#   # 3. Restore into a new PVC and read the data back
+#   kubectl apply -f snapshot-restore.yaml -l step=restore
+#   kubectl wait --for=condition=Ready pod/scale-nfs-restored --timeout=180s
+#   kubectl exec scale-nfs-restored -- cat /data/hello.txt
+#
+# Clean up (restored volume first; with the default clone restore mode it
+# depends on the snapshot):
+#   kubectl delete -f snapshot-restore.yaml -l step=restore
+#   kubectl delete -f snapshot-restore.yaml -l step=snapshot
+#   kubectl delete -f nfs-pvc-pod.yaml
+#
+# The restored volume is a ZFS clone by default. A StorageClass with
+# `snapshotRestoreMode: detached` restores an independent copy instead.
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: scale-csi
+  labels:
+    step: snapshot
+driver: csi.scale.io
+deletionPolicy: Delete
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: scale-nfs-test-snap
+  labels:
+    step: snapshot
+spec:
+  volumeSnapshotClassName: scale-csi
+  source:
+    persistentVolumeClaimName: scale-nfs-test
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-nfs-restored
+  labels:
+    step: restore
+spec:
+  storageClassName: scale-nfs
+  dataSource:
+    apiGroup: snapshot.storage.k8s.io
+    kind: VolumeSnapshot
+    name: scale-nfs-test-snap
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    # At least the size of the snapshot's source volume.
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scale-nfs-restored
+  labels:
+    step: restore
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: scale-nfs-restored

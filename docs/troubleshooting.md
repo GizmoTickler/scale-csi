@@ -164,6 +164,64 @@ kubectl describe pod <pod-name>
 - Verify TrueNAS dataset isn't set to read-only
 - Check for filesystem errors (run fsck if necessary)
 
+#### Symptom: NVMe-oF I/O errors (`sc 0xf`) and an emergency read-only filesystem after a TrueNAS 27 upgrade
+
+The node's kernel log shows lines like these shortly after a volume mounts (often within
+seconds on a fresh stage, or under the first large write):
+
+```
+nvme3c5n1: I/O Cmd(0x1) @ LBA ..., 65536 blocks, I/O Error (sct 0x0 / sc 0xf) DNR
+EXT4-fs error (device nvme3n1): ... Detected aborted journal
+EXT4-fs (nvme3n1): Remounting filesystem read-only
+```
+
+`sc 0xf` is "Data SGL Length Invalid" (`NVME_SC_SGL_INVALID_DATA`). TrueNAS
+27.0 ships a Linux 6.18 NVMe target whose TCP transport rejects any command
+carrying more than 4 MiB of data (`NVMET_TCP_MAXH2CDATA`), while its Identify
+Controller still reports MDTS=0 ("no limit"). The initiator trusts MDTS and
+issues commands of up to `max_sectors_kb` = 32768 KiB. Databases on the volume
+(Postgres, etc.) crash-loop once the filesystem goes read-only.
+
+The limit must be on the hidden **path** devices (`nvme<S>c<C>n<N>`), not only
+on the multipath head (`nvme<S>n<N>`): the path request queue merges requests
+back up to its own limit, so a head clamped to 4096 KiB with paths left at
+32768 still sends 12 MiB commands. Path devices have no `/dev` node and send no
+uevents, so a udev rule cannot fix this, and there is no `nvme_core` or
+`nvme_tcp` module parameter for it.
+
+The node plugin handles it with `nvmeof.maxSectorsKB` (default `auto`): after
+the paths connect and before the volume is formatted, mounted or published, it
+lowers `queue/max_sectors_kb` to 4096 on the head and every path device of
+NVMe/TCP subsystems whose controller reports MDTS=0, re-applies it on every
+re-stage, and once per `sessionGC.interval` for path devices created later.
+Each stage logs one line, e.g.:
+
+```
+NVMe-oF max_sectors_kb for nqn....: policy=auto transport=tcp mdts=0 limit=4096KiB changed=5 devices=[nvme3c3n1 32768->4096, ..., nvme3n1 32768->4096]
+```
+
+Check a node by hand:
+
+```bash
+for d in /sys/block/nvme*n*; do echo "$(basename "$d") $(cat "$d/queue/max_sectors_kb")"; done
+nvme id-ctrl /dev/nvme3 -o json | jq .mdts    # 0 = the target claims no limit
+kubectl get events -A --field-selector reason=NVMeMaxSectorsClampFailed
+```
+
+- A stage that cannot apply the clamp fails with `refusing to stage NVMe-oF
+  subsystem ... without its request-size clamp` (event
+  `NVMeMaxSectorsClampFailed`) instead of mounting unprotected; kubelet retries
+  it. The message names the device that could not be written.
+- Volumes staged by an older release stay unprotected until they are
+  re-staged or the next session-GC tick (default 300 s) converges them. To
+  protect a running node at once, without restarting pods, write the value by
+  hand on every head and path device of the affected subsystems:
+  `echo 4096 > /sys/block/nvme3c5n1/queue/max_sectors_kb`.
+- A filesystem that already went read-only needs the pod restarted (unstage and
+  re-stage) and, for ext4, an `fsck` if the journal abort left errors.
+- `nvmeof.maxSectorsKB: off` disables the clamp; a whole number sets another
+  ceiling (only ever lowered, never raised).
+
 ### Session/Connection Issues
 
 #### Symptom: Duplicate iSCSI/NVMe-oF sessions
@@ -251,7 +309,7 @@ generation). If it persists:
        timeout: 30
    ```
 
-### Snapshot Issues
+### Snapshots
 
 #### Symptom: Snapshot creation fails
 
@@ -508,5 +566,5 @@ Gated alerts (only rendered when the named feature is on):
 | `ScaleCSIScheduledSnapshotTaskEnsureFailed` | warning | `zfs.snapshotSchedule` | [Driver-managed periodic snapshots](reference/storageclass.md#driver-managed-periodic-snapshots-gf2e2) |
 | `ScaleCSIScheduledSnapshotTaskDeleteFailed` | warning | `zfs.snapshotSchedule` | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
 | `ScaleCSINASTimezoneUnresolved` | warning | `zfs.snapshotSchedule` | [Periodic-snapshot tasks](production.md#rollback-runbook-driver-managed-periodic-snapshot-tasks) |
-| `ScaleCSISnapshotHoldFailed` | warning | `zfs.holdCsiSnapshots` | [Snapshot Issues](#snapshot-issues) |
+| `ScaleCSISnapshotHoldFailed` | warning | `zfs.holdCsiSnapshots` | [Snapshots](#snapshots) |
 | `ScaleCSIClonePromoteRefused` | warning | `zfs.promoteRestoredClones` | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |

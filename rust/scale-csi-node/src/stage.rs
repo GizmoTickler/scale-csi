@@ -369,6 +369,11 @@ pub async fn node_stage(
         if !ublk {
             let event = node_volume_ref(&req.volume_context, volume_id, &state.node_name);
             nvme_kernel::converge_existing(state, &stage_context, event.as_ref(), deadline).await;
+            // The replay converges the request-size clamp too: a volume the
+            // Go plugin (or an older release) staged unclamped, or a path
+            // device the top-up above just created. Required and not in
+            // place, the replay fails rather than report the volume ready.
+            nvme_kernel::clamp_existing(state, &stage_context, event.as_ref(), deadline).await?;
         }
         info!("Volume {volume_id} is already staged compatibly at {staging}");
         return Ok(());

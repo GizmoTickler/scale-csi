@@ -1,283 +1,138 @@
 # Scale CSI Driver
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/GizmoTickler/scale-csi/ci.yml?branch=main&style=flat-square)](https://github.com/GizmoTickler/scale-csi/actions)
+[![Release](https://img.shields.io/github/v/release/GizmoTickler/scale-csi?style=flat-square)](https://github.com/GizmoTickler/scale-csi/releases/latest)
 [![License](https://img.shields.io/github/license/GizmoTickler/scale-csi?style=flat-square)](LICENSE)
 
-A Kubernetes CSI driver purpose-built for TrueNAS SCALE. Unlike general-purpose storage drivers that support multiple backends, Scale CSI focuses exclusively on TrueNAS SCALE 25.04+ and its modern WebSocket API.
+A Kubernetes [CSI](https://kubernetes-csi.github.io/docs/) driver built for
+TrueNAS SCALE. It provisions ZFS-backed persistent volumes over **NFS**,
+**iSCSI**, and **NVMe-oF (NVMe/TCP)** and talks to TrueNAS only through its
+WebSocket JSON-RPC 2.0 API (`wss://<host>/api/current`) — no SSH, no REST.
 
-## Why Scale CSI?
+- **One driver, three protocols** — every StorageClass uses the provisioner
+  `csi.scale.io` and selects `protocol: nfs | iscsi | nvmeof`.
+- **Full volume lifecycle** — dynamic provisioning, online expansion,
+  snapshots, restores (clone or fully detached copy), PVC-to-PVC clones, and
+  raw block volumes.
+- **Safe by default** — the driver only touches datasets under the one parent
+  you give it, refuses to delete data it cannot prove it owns, and keeps
+  durable per-volume publication records for single-node attach exclusivity.
+- **Production features** — optional backend fencing, iSCSI CHAP, ZFS-native
+  encryption at rest, NFS session trunking, iSCSI and NVMe-oF multipath,
+  Prometheus metrics, alerts, and a Grafana dashboard.
+- **Two node agents in one image** — a Rust node agent (default) and the Go
+  node plugin; switching between them needs no volume work.
 
-- **Zero SSH** - Communicates entirely via WebSocket JSON-RPC 2.0 (`wss://host/api/current`)
-- **Single Focus** - Optimized specifically for TrueNAS SCALE, not a multi-backend abstraction
-- **Modern API** - Built for SCALE 25.04+ versioned API from day one
-- **Full Featured** - Snapshots, clones, volume expansion, and raw block
-  volumes; snapshot restores are per-StorageClass `clone` or `detached`
-- **Publication Tracking & Backend Fencing** - CSI publish state is always
-  tracked in durable per-volume publication records (single-node exclusivity is
-  enforced in every mode); `fencing.mode` optionally enforces it through
-  per-volume NFS, iSCSI, and NVMe-oF transport allowlists
+## Compatibility
 
-## Supported Protocols
+| Component | Supported |
+|---|---|
+| TrueNAS SCALE / Community Edition | 25.10, 26.x, 27.0 |
+| Kubernetes | 1.20+ (chart floor); use a release still in upstream support |
+| Helm | 3.8+ (OCI chart support) |
+| Node architectures | `linux/amd64` images |
 
-| StorageClass `protocol` | TrueNAS version | Use case |
-|---|---|---|
-| `nfs` | 25.04+ | Shared filesystem access (ReadWriteMany) |
-| `iscsi` | 25.04+ | Single-path block storage |
-| `nvmeof` | 25.10+ | High-performance block storage |
+> **TrueNAS 27 needs scale-csi v1.25.0 or later.** The REST API removal does not
+> affect scale-csi (it speaks only the WebSocket JSON-RPC API), but TrueNAS 27's
+> NVMe/TCP target rejects writes over 4 MiB and its dataset API changed for
+> encrypted volumes; v1.25.0 handles both. Upgrade the driver first — see
+> [upgrades](docs/guides/upgrades.md).
 
-All classes use the unified provisioner name `csi.scale.io`. A multi-protocol
-deployment requires the `protocol` StorageClass parameter so an omitted value
-cannot accidentally provision NFS.
+| `protocol` | Access modes | Volume modes | Node requirement |
+|---|---|---|---|
+| `nfs` | RWO, ROX, RWX | Filesystem | Kernel NFS client |
+| `iscsi` | RWO | Filesystem, Block | `open-iscsi` (`iscsiadm` + running `iscsid`) |
+| `nvmeof` | RWO | Filesystem, Block | `nvme-cli` + `nvme-tcp` kernel module |
 
-## Quick Start
+Details, including what is and is not tested, are in the
+[compatibility reference](docs/reference/compatibility.md).
 
-```bash
-helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
-  --namespace scale-csi --create-namespace \
-  --values values.yaml
-```
+## Quick start
 
-Publication tracking is always on: the driver records every publish in durable
-per-volume properties and enforces CSI single-node exclusivity, same-node
-idempotency, stale-record takeover, and empty-node-id unpublish in every mode.
-`fencing.mode` defaults to `off`, which keeps that tracking but leaves the
-transport allowlists untouched; `additive` and `strict` additionally enforce the
-publication state through the backend allowlists. `additive` is the explicit
-migration mode: upgrade the node DaemonSet first, wait for every CSINode to
-re-register its versioned transport identity, and only then enable `additive`.
-Enable `strict` only after `scale_csi_fencing_deferred_total` remains zero.
-Follow the complete
-[rolling-upgrade procedure](charts/scale-csi/README.md#publication-fencing-and-ownership).
-
-## Requirements
-
-### TrueNAS SCALE Setup
-
-1. **Generate an API Key**: Settings → API Keys → Add
-2. **Create the parent dataset** for your volumes:
-   ```
-   tank/k8s/volumes    # zfs.parentDataset — the exclusive CSI parent
-   ```
-   This is the only dataset you create. There is no separate snapshot dataset:
-   CSI snapshots are ZFS snapshots taken directly on each volume dataset
-   (`<parent>/<volume>@<snapshot>`).
-3. **Enable the storage service** you plan to use (NFS, iSCSI, or NVMe-oF)
-
-The driver handles all share/target/subsystem creation automatically.
-
-### Kubernetes Node Requirements
-
-Your cluster nodes need the appropriate client tools installed for your chosen protocol.
-
-<details>
-<summary><strong>NFS Client Setup</strong></summary>
-
-The NFS client package is required to mount NFS exports.
-
-**Debian/Ubuntu:**
-```bash
-apt-get install -y nfs-common
-```
-
-**RHEL/Fedora:**
-```bash
-dnf install -y nfs-utils
-```
-
-**Verification:**
-```bash
-# Should return without error
-showmount --version
-```
-
-</details>
-
-<details>
-<summary><strong>iSCSI Client Setup</strong></summary>
-
-Block storage via iSCSI requires the initiator tools. Single-portal operation is
-the default. The optional multi-portal flow also requires host device-mapper and
-`multipathd`; see [production prerequisites](docs/production.md#iscsi-multipath-host-prerequisites)
-before enabling it.
-
-**Debian/Ubuntu:**
-```bash
-apt-get install -y open-iscsi
-systemctl enable --now iscsid
-```
-
-**RHEL/Fedora:**
-```bash
-dnf install -y iscsi-initiator-utils
-systemctl enable --now iscsid
-```
-
-**Verification:**
-```bash
-iscsiadm --version
-cat /etc/iscsi/initiatorname.iscsi  # Should show iqn.* identifier
-```
-
-iSCSI CHAP is supported as a default-off, controller-wide feature gate
-(`iscsi.chap.enabled`) with per-StorageClass CSI provisioner and node-stage
-Secret refs. One-way and mutual session authentication are supported; discovery
-authentication remains unsupported. Optional dm-multipath is independent of
-CHAP and requires the host prerequisites linked above. CHAP authenticates the
-session but does not encrypt TCP 3260, so still restrict it to the Kubernetes
-nodes on a dedicated storage network (for example, a storage VLAN plus firewall
-or SGACL policy). See the
-[StorageClass CHAP reference](docs/reference/storageclass.md#iscsi-chap).
-
-</details>
-
-<details>
-<summary><strong>NVMe-oF Client Setup</strong></summary>
-
-NVMe over Fabrics requires kernel module support and the nvme-cli tools.
-
-**Load kernel modules:**
-```bash
-modprobe nvme-tcp  # For NVMe/TCP (most common)
-# modprobe nvme-rdma  # For NVMe/RDMA
-# modprobe nvme-fc    # For NVMe/FC
-
-# Persist across reboots
-echo "nvme-tcp" >> /etc/modules-load.d/nvme.conf
-```
-
-**Install management tools:**
-```bash
-# Debian/Ubuntu
-apt-get install -y nvme-cli
-
-# RHEL/Fedora
-dnf install -y nvme-cli
-```
-
-**Verification:**
-```bash
-nvme version
-lsmod | grep nvme_tcp
-```
-
-The chart configures one NVMe-oF address and service ID. Multi-path NVMe-oF has
-not been validated as a scale-csi deployment mode.
-
-**Optional userspace data path (ublk):** instead of the kernel initiator, a
-volume can be staged through `nvmeublkd`, a per-node userspace NVMe/TCP daemon
-that serves it as `/dev/ublkbN`. It needs the `ublk_drv` module (zero copy
-needs kernel >= 6.16) on every node; the chart deploys the daemon with it. It
-is selected per StorageClass (`nvmeof/dataPath: ublk`) or install-wide
-(`nvmeof.dataPath: ublk`).
-See the chart README's "Userspace NVMe/TCP data path (ublk)" section.
-
-</details>
-
-<details>
-<summary><strong>Talos Linux</strong></summary>
-
-Talos is not currently a turnkey chart target. The node pod already sets
-`hostPID: true`, and the only supported environment override path is
-`node.extraEnv`; values such as `node.hostPID`, `node.driver.extraEnv`, and
-`node.iscsiDirHostPath` do not exist. The chart currently mounts the host's
-`/etc/iscsi` and `/var/lib/iscsi` paths directly, so validate tool and state-path
-compatibility on the exact Talos release before treating it as supported.
-
-</details>
-
-### Namespace Configuration
-
-The CSI node driver requires privileged access. Label your namespace accordingly:
+You need a TrueNAS parent dataset, an API key, and the protocol's service
+running. The [Getting started guide](docs/getting-started.md) walks through all
+of it, including TrueNAS setup and node packages; the short version for NFS:
 
 ```bash
+# 1. Namespace (the node plugin is privileged) and API-key Secret
+kubectl create namespace scale-csi
 kubectl label namespace scale-csi pod-security.kubernetes.io/enforce=privileged
+kubectl -n scale-csi create secret generic truenas-api-key \
+  --from-literal=api-key='<your-truenas-api-key>'
+
+# 2. Install the chart from the OCI registry (latest release)
+helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+  --namespace scale-csi \
+  --set truenas.host=truenas.example.com \
+  --set truenas.existingSecret=truenas-api-key \
+  --set zfs.parentDataset=tank/k8s/volumes \
+  --set iscsi.enabled=false
+
+# 3. Try it
+kubectl apply -f https://raw.githubusercontent.com/GizmoTickler/scale-csi/main/examples/workloads/nfs-pvc-pod.yaml
+kubectl get pvc scale-nfs-test -w
 ```
+
+The chart creates a `scale-nfs` StorageClass by default. For iSCSI or
+NVMe-oF, start from the matching values file in
+[`examples/helm/`](examples/helm/).
 
 ## Documentation
 
-Deletion is fail-safe by default: if a volume has snapshots that were not
-created by the CSI driver, `DeleteVolume` leaves the dataset intact. Set
-`zfs.destroyForeignSnapshotsOnDelete: true` only when those snapshots are
-deliberately disposable. To advertise a scheduler attach limit, set
-`node.maxVolumesPerNode` to a positive value; its default `0` remains unlimited.
+| | |
+|---|---|
+| **Start here** | [Getting started](docs/getting-started.md) — zero to a working PVC |
+| **Examples** | [examples/](examples/README.md) — Helm values, Flux, Argo CD, workload manifests |
+| **Guides** | [Installation](docs/guides/installation.md) · [Upgrades & TrueNAS upgrades](docs/guides/upgrades.md) · [Snapshots](docs/guides/snapshots.md) · [Encryption](docs/guides/encryption.md) · [Disaster recovery](docs/guides/disaster-recovery.md) · [Topology](docs/guides/topology.md) · [Nomad](docs/guides/nomad.md) |
+| **Operations** | [Production checklist](docs/production.md) · [Observability](docs/observability.md) · [Troubleshooting](docs/troubleshooting.md) |
+| **Reference** | [StorageClass parameters](docs/reference/storageclass.md) · [Chart values](charts/scale-csi/README.md) · [Compatibility](docs/reference/compatibility.md) · [TrueNAS API map](docs/reference/truenas-api-map.md) |
+| **Development** | [Architecture](docs/development/architecture.md) · [Contributing](.github/CONTRIBUTING.md) · [Fuzzing](docs/development/fuzzing.md) |
+| **Changes** | [Release notes](docs/release-notes-next.md) · [GitHub releases](https://github.com/GizmoTickler/scale-csi/releases) |
 
-### Resource sizing
+The full index is [docs/README.md](docs/README.md).
 
-Steady-state use is approximately 15Mi memory and 1m CPU per driver container.
-The Helm chart defaults each driver container to requests of 10m CPU and 32Mi
-memory with a 256Mi memory limit. Each CSI sidecar requests 10m CPU and 32Mi
-memory with a 128Mi memory limit. All resource maps are overridable. The Go
-runtime adapts `GOMAXPROCS` and `GOMEMLIMIT` from the driver container cgroups.
+## Network ports
 
-CSI liveness now reports driver-process health rather than TrueNAS reachability,
-so a NAS outage or slow reconnect does not cause a kubelet restart loop. Monitor
-`/readyz` or `scale_csi_truenas_connection_status` for backend availability.
+| Port | From | Purpose |
+|---|---|---|
+| TCP 443 | Controller pods only | TrueNAS WebSocket API (node pods hold no API credentials) |
+| TCP 2049 | Every node | NFS |
+| TCP 3260 | Every node | iSCSI |
+| TCP 4420 | Every node | NVMe/TCP |
 
-### Verify release signatures
+## Verifying releases
 
-Tag builds keyless-sign the image (linux/amd64), keyless-sign the OCI Helm
-chart, and attach an SLSA provenance attestation to the chart. Substitute the
-release being installed:
+Release images and the OCI chart are keyless-signed with cosign, and the
+chart carries an SLSA provenance attestation:
 
 ```bash
-VERSION=vX.Y.Z
-IMAGE="ghcr.io/gizmotickler/scale-csi:${VERSION}"
-CHART="ghcr.io/gizmotickler/charts/scale-csi:${VERSION#v}"
+# The latest release; set VERSION=vX.Y.Z instead to verify a pinned one.
+VERSION=$(curl -fsSL https://api.github.com/repos/GizmoTickler/scale-csi/releases/latest | jq -r .tag_name)
 ISSUER="https://token.actions.githubusercontent.com"
+REPO="https://github.com/GizmoTickler/scale-csi/.github/workflows"
 
 cosign verify \
-  --certificate-identity "https://github.com/GizmoTickler/scale-csi/.github/workflows/ci.yml@refs/tags/${VERSION}" \
-  --certificate-oidc-issuer "$ISSUER" \
-  "$IMAGE"
+  --certificate-identity "${REPO}/ci.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer "${ISSUER}" \
+  "ghcr.io/gizmotickler/scale-csi:${VERSION}"
 cosign verify \
-  --certificate-identity "https://github.com/GizmoTickler/scale-csi/.github/workflows/helm-release.yml@refs/tags/${VERSION}" \
-  --certificate-oidc-issuer "$ISSUER" \
-  "$CHART"
-cosign verify-attestation \
-  --type slsaprovenance \
-  --certificate-identity "https://github.com/GizmoTickler/scale-csi/.github/workflows/helm-release.yml@refs/tags/${VERSION}" \
-  --certificate-oidc-issuer "$ISSUER" \
-  "$CHART"
+  --certificate-identity "${REPO}/helm-release.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer "${ISSUER}" \
+  "ghcr.io/gizmotickler/charts/scale-csi:${VERSION#v}"
+cosign verify-attestation --type slsaprovenance \
+  --certificate-identity "${REPO}/helm-release.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer "${ISSUER}" \
+  "ghcr.io/gizmotickler/charts/scale-csi:${VERSION#v}"
 ```
 
-Release-image Trivy scans fail on unallowlisted HIGH or CRITICAL findings. The
-documented exception ledger is [`.trivyignore`](.trivyignore).
-
-| Guide | Description |
-|-------|-------------|
-| [Architecture](docs/architecture.md) | How the driver works internally |
-| [Deployment](docs/deployment.md) | Helm and Flux installation with full configuration reference |
-| [Production](docs/production.md) | HA, security, monitoring, upgrades, and known limitations |
-| [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover (CHAP volumes additionally need the `iscsi.auth` peer pre-created on the DR TrueNAS) |
-| [Topology](docs/guides/topology.md) | Zone/region-aware provisioning (advanced; single-backend usually doesn't need it) |
-| [Snapshots](docs/guides/snapshots.md) | Snapshot and clone/restore workflow |
-| [Release notes](docs/release-notes-next.md) | v1.6.0 changelog and upgrade actions |
-
-## Network Ports
-
-The **controller** pods need the TrueNAS WebSocket API path; the **node** pods
-need only the data path for the protocol(s) they mount (the node DaemonSet is
-credential-free and builds no management client, so do not expose the management
-API from every Kubernetes node):
-
-| Service | Port | Source | Required For |
-|---------|------|--------|--------------|
-| HTTPS | 443 | Controller pods only | WebSocket API (chart default; HTTPS strongly recommended) |
-| NFS | 2049 | Nodes | NFS volumes |
-| iSCSI | 3260 | Nodes | iSCSI volumes |
-| NVMe-TCP | 4420 | Nodes | NVMe-oF volumes |
-
-For raw driver config, `protocol: http` plus an omitted/zero port defaults the
-API port to 80. For the Helm chart there is **no** `truenas.protocol` key: it
-exposes `truenas.secure` (default `true`) and `truenas.port` (always rendered,
-default 443). To use plain HTTP set **both** `truenas.secure=false` **and**
-`truenas.port=80`; changing `secure` alone continues to use port 443. HTTPS is
-strongly recommended for the API key in transit.
+Release-image Trivy scans fail on unallowlisted HIGH or CRITICAL findings; the
+documented exceptions are in [`.trivyignore`](.trivyignore).
 
 ## License
 
-MIT - see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE).
 
 ---
 
-*This project is not affiliated with iXsystems. TrueNAS is a registered trademark of iXsystems, Inc.*
+*This project is not affiliated with iXsystems. TrueNAS is a registered
+trademark of iXsystems, Inc.*

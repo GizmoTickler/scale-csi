@@ -1,125 +1,79 @@
-# Deployment and configuration
+# Installation and configuration
 
-This guide covers the bundled OCI Helm chart, based on the v1.6.0 release line.
-The chart and image use the same release number: chart `1.6.0` deploys image
-`v1.6.0` unless `image.tag` or `image.digest` is overridden. (The in-tree
-`Chart.yaml` carries a `0.0.0-dev` placeholder that CI stamps with the tag at
-release time.)
+This guide covers installing the chart in each supported way and the
+configuration decisions you make at install time. For a guided first install,
+including TrueNAS and node preparation, start with
+[Getting started](../getting-started.md).
 
-## Supported deployment matrix
+## Where the chart lives
 
-| Protocol | TrueNAS SCALE | Node requirements | Kubernetes volume modes |
-|---|---|---|---|
-| NFS | 25.04+ | NFS client and kernel support | Filesystem; RWO, ROX, RWX |
-| iSCSI | 25.04+ | `iscsiadm`, `iscsid`, `iscsi_tcp` | Filesystem or Block; RWO |
-| NVMe-oF | 25.10+ | `nvme-cli`, `nvme_tcp`/`nvme_fabrics` | Filesystem or Block; RWO |
+The chart is published as an OCI artifact with every release:
 
-The NFS and iSCSI API clients also understand snapshot API generations found
-on older and newer TrueNAS releases, but that is not a claim of full driver
-support outside the matrix. Validate the exact TrueNAS patch and node data path
-in staging.
+```text
+oci://ghcr.io/gizmotickler/charts/scale-csi
+```
+
+Chart version `X.Y.Z` deploys driver image `ghcr.io/gizmotickler/scale-csi:vX.Y.Z`
+unless `image.tag` or `image.digest` is overridden. The in-tree `Chart.yaml`
+carries a `0.0.0-dev` placeholder that CI stamps with the tag at release time,
+so install from the registry rather than from a checkout unless you are
+developing the chart. List the published versions on the
+[releases page](https://github.com/GizmoTickler/scale-csi/releases), and verify
+signatures with the commands in the [root README](../../README.md#verifying-releases).
 
 ## Helm
 
-Create the API-key Secret first:
-
 ```bash
 kubectl create namespace scale-csi
-kubectl -n scale-csi create secret generic truenas-creds \
-  --from-literal=api-key='1-replace-me'
-```
+kubectl label namespace scale-csi pod-security.kubernetes.io/enforce=privileged
+kubectl -n scale-csi create secret generic truenas-api-key \
+  --from-literal=api-key='<your-truenas-api-key>'
 
-Create `values.yaml`:
-
-```yaml
-truenas:
-  host: nas.example.com
-  existingSecret: truenas-creds
-zfs:
-  parentDataset: tank/k8s/volumes
-nfs:
-  enabled: true
-iscsi:
-  enabled: false
-nvmeof:
-  enabled: false
-storageClasses:
-  - name: scale-nfs
-    protocol: nfs
-    isDefault: true
-    reclaimPolicy: Delete
-    allowVolumeExpansion: true
-    volumeBindingMode: Immediate
-    mountOptions: [nfsvers=4, noatime]
-    extraParameters: {}
-```
-
-Install the chart:
-
-```bash
-helm install scale-csi \
-  oci://ghcr.io/gizmotickler/charts/scale-csi \
+helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --namespace scale-csi \
+  --version <X.Y.Z> \
   --values values.yaml
 ```
 
-The example deliberately avoids a soon-stale version literal. For a controlled
-production rollout, verify the release signature and add the exact reviewed
-version, for example `--version 1.6.0`. See the root README for image, chart,
-and provenance verification commands.
+Start `values.yaml` from one of the files in
+[`examples/helm/`](../../examples/helm/): minimal NFS, iSCSI, or NVMe-oF;
+multi-protocol; production; encryption; or a second driver instance. The chart
+validates values against its JSON schema, so an unknown or misspelled key fails
+the install.
 
 ## Flux
 
-The current Flux OCI source shape uses `OCIRepository` plus `HelmRelease`. Pin
-the exact release you reviewed; this example uses the v1.6.0 baseline:
+[`examples/gitops/flux/scale-csi.yaml`](../../examples/gitops/flux/scale-csi.yaml)
+is a complete Namespace + `OCIRepository` + `HelmRelease`. Two settings matter
+beyond the values:
 
-```yaml
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: OCIRepository
-metadata:
-  name: scale-csi
-  namespace: scale-csi
-spec:
-  interval: 1h
-  url: oci://ghcr.io/gizmotickler/charts/scale-csi
-  layerSelector:
-    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
-    operation: copy
-  ref:
-    semver: "1.6.0"
----
-apiVersion: helm.toolkit.fluxcd.io/v2
-kind: HelmRelease
-metadata:
-  name: scale-csi
-  namespace: scale-csi
-spec:
-  interval: 1h
-  releaseName: scale-csi
-  chartRef:
-    kind: OCIRepository
-    name: scale-csi
-  values:
-    truenas:
-      host: nas.example.com
-      existingSecret: truenas-creds
-    zfs:
-      parentDataset: tank/k8s/volumes
-    nfs:
-      enabled: true
-    iscsi:
-      enabled: false
-    nvmeof:
-      enabled: false
-```
+- `install.crds` and `upgrade.crds` set to `CreateReplace`. The chart ships the
+  `VolumePublication` CRD in `crds/`, which Helm installs only on first install;
+  without `CreateReplace` an upgrade that changes the CRD never applies it.
+- The API-key Secret comes from your secret tooling (SOPS, Sealed Secrets,
+  External Secrets) and must contain `api-key`.
 
-The referenced Secret must already exist in `scale-csi` and contain `api-key`.
+## Argo CD
+
+[`examples/gitops/argocd/application.yaml`](../../examples/gitops/argocd/application.yaml)
+sources the public OCI chart (`repoURL: ghcr.io/gizmotickler/charts`,
+`chart: scale-csi`). Argo CD renders `crds/` by default, so the CRD is applied
+on every sync. Create the namespace (with the `privileged` Pod Security label)
+and the API-key Secret outside the Application, or from a separate one.
+
+## Nomad and other orchestrators
+
+The driver binary also runs without the chart; see [Nomad](nomad.md) and the
+complete driver configuration files
+[`examples/scale-nfs.yaml`](../../examples/scale-nfs.yaml),
+[`scale-iscsi.yaml`](../../examples/scale-iscsi.yaml), and
+[`scale-nvmeof.yaml`](../../examples/scale-nvmeof.yaml).
 
 ## Configuration truth
 
 The schema-enforced source of truth is
-[`charts/scale-csi/values.yaml`](../charts/scale-csi/values.yaml), with the
-maintained table in the [chart README](../charts/scale-csi/README.md). Important
+[`charts/scale-csi/values.yaml`](../../charts/scale-csi/values.yaml), with the
+maintained table in the [chart README](../../charts/scale-csi/README.md). Important
 settings are:
 
 | Setting | Meaning | Default |
@@ -189,7 +143,7 @@ A StorageClass may also set `snapshotRestoreMode: clone` or `detached` to choose
 how snapshot restores are materialized (clone pins the source snapshot; detached
 is an independent copy). Chart `storageClasses[]` entries expose it as a
 first-class field; it is only emitted when set. See the
-[StorageClass reference](reference/storageclass.md#restore-mode).
+[StorageClass reference](../reference/storageclass.md#restore-mode).
 
 ## Capacity-aware scheduling
 
@@ -225,7 +179,7 @@ The full `capacity.*` surface (all default off):
 | `capacity.reportMaximumVolumeSize` | Set `GetCapacityResponse.maximum_volume_size` to the parent dataset's available bytes. Appropriate **only** for thick/reserved zvol deployments (`zfs.zvolEnableReservation: true`); under thin overcommit a hard maximum makes the scheduler wrongly reject legitimate volumes |
 | `capacity.gaugeEnabled` | Run a controller-only poll loop exporting `scale_csi_pool_available_bytes` / `scale_csi_pool_capacity_bytes` |
 | `capacity.gaugeInterval` | Gauge cadence; default `60s`, values below `30s` clamp to `30s` |
-| `csidriver.fsGroupPolicy` | `CSIDriver.spec.fsGroupPolicy`; default `File` (unchanged). Set `None` only on a fresh install committed to driver-applied NFSv4 ACLs — see `docs/reference/storageclass.md` |
+| `csidriver.fsGroupPolicy` | `CSIDriver.spec.fsGroupPolicy`; default `File` (unchanged). Set `None` only on a fresh install committed to driver-applied NFSv4 ACLs — see the [StorageClass reference](../reference/storageclass.md#nfsv4-acls) |
 | `nfs.shareSecurity` | Default `sharing.nfs` security list (`SYS`/`KRB5`/`KRB5I`/`KRB5P`); empty omits the field, keeping the TrueNAS default. `KRB5*` requires `nfs.krbEnabled=true`, enforced by the chart schema **and** at driver config load — the controller refuses to start otherwise |
 | `nfs.shareExposeSnapshots` | Publish the read-only `.zfs/snapshot` tree through new exports |
 | `nfs.krbEnabled` | Acknowledge that Kerberos is configured on the NFS service; required before `KRB5*` share security is accepted anywhere (global default or StorageClass parameter) |
@@ -260,27 +214,11 @@ singleton writers; chart schema and template guards enforce that invariant.
 
 Topology is auto-detected per node from the standard
 `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` labels. There
-is no `node.topology` chart value. See the [topology guide](guides/topology.md).
+is no `node.topology` chart value. See the [topology guide](topology.md).
 
-## Upgrade notes
+## Upgrades
 
-- StorageClass `parameters` are immutable. To add the now-required `protocol`
-  parameter, create a replacement StorageClass (often with a temporary name),
-  move workload manifests to it, then delete/recreate the old class only after
-  no manifests depend on its name. Existing PVs keep their original class and
-  are not reprovisioned by this metadata migration.
-- The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. A node-only
-  pod constructs **no TrueNAS management client at all** — stage, publish,
-  unpublish, unstage, and local expansion use host tools exclusively, so a node
-  pod initializes and reports ready even while TrueNAS is unreachable. There is
-  no deferred/lazy API connection on node pods; do not assume the controller
-  Secret is present on them after upgrading.
-- ConfigMap changes restart controller and node pods. Rotating an externally
-  managed `truenas.existingSecret` does not change the pod-template checksum;
-  restart the **controller** workload explicitly after rotation (only the
-  controller holds the TrueNAS API key — the node builds no API client, so it does
-  not need a restart for that credential). CHAP Secrets are request-scoped CSI
-  Secrets and need no driver rollout at all.
-
-For fencing's node-first migration and the full production contract,
-read [Production deployment](production.md).
+Upgrading the chart, rotating credentials, migrating StorageClasses, and
+upgrading TrueNAS underneath the driver are covered in [Upgrades](upgrades.md).
+For the production contract (fencing, HA, security, monitoring) read
+[Production](../production.md).

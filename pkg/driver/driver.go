@@ -1123,6 +1123,11 @@ func (d *Driver) runSessionGCWithProtocols(ctx context.Context, gracePeriod time
 	if ctx.Err() == nil {
 		d.reconcileNVMeoFControllerTunables(dryRun)
 	}
+	// Same for the request-size clamp: a path device created after the stage
+	// (a connect made outside the stage) is lowered here.
+	if ctx.Err() == nil {
+		d.reconcileNVMeoFMaxSectors(ctx, dryRun)
+	}
 }
 
 func (d *Driver) observeISCSISessions() ([]util.ISCSISessionInfo, error) {

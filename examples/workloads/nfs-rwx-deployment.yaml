@@ -1,0 +1,76 @@
+# ReadWriteMany: one NFS volume shared by every replica of a Deployment,
+# across nodes.
+#
+#   kubectl apply -f nfs-rwx-deployment.yaml
+#   kubectl exec deploy/scale-nfs-shared -- sh -c 'tail -n 5 /shared/log.txt'
+#   kubectl delete -f nfs-rwx-deployment.yaml
+#
+# Only the nfs protocol supports ReadWriteMany; iSCSI and NVMe-oF volumes are
+# ReadWriteOnce.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scale-nfs-shared
+spec:
+  storageClassName: scale-nfs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scale-nfs-shared
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scale-nfs-shared
+  template:
+    metadata:
+      labels:
+        app: scale-nfs-shared
+    spec:
+      # Spread the replicas so the volume is really mounted on several nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: scale-nfs-shared
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: writer
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - while true; do echo "$(date) $(hostname)" >> /shared/log.txt; sleep 10; done
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: scale-nfs-shared

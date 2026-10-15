@@ -60,7 +60,7 @@ capacity:
 # a storageClasses[] entry and docs/reference/storageclass.md).
 #
 # AVAILABILITY HAZARD: a locked dataset serves ZERO I/O. Because TrueNAS does not
-# persist a passphrase key (the key is not in the TrueNAS database), a nas01
+# persist a passphrase key (the key is not in the TrueNAS database), a TrueNAS
 # reboot leaves every encrypted volume LOCKED until the controller's unlock
 # reconciler re-unlocks it best-effort; pods on those volumes see I/O errors
 # during the window. Lost Secret = permanent data loss (no TrueNAS-side escrow).
@@ -140,13 +140,13 @@ controller:
   # that combination is a genuine Kubernetes-level contradiction, not a
   # limitation of this chart.
   #
-  # If you need real disruption protection, the supported path is
-  # controller.replicas: 2 with fencing.mode additive or strict (the sidecars
-  # use leader election, so exactly one controller is ever active; see the
-  # "Additive/strict fencing requires exactly one non-overlapping controller"
-  # note above). At replicas: 2 this
-  # same maxUnavailable: 1 default already gives you real protection: one
-  # replica may always be evicted/drained while the other keeps serving.
+  # controller.replicas: 2 is only possible with fencing.mode off: additive and
+  # strict fencing require replicas: 1 (the chart fails to render otherwise,
+  # because the background fencing reconcilers are singleton writers; see the
+  # note on controller.replicas above). With fencing off and replicas: 2, the
+  # sidecars use leader election so exactly one controller is active, and this
+  # maxUnavailable: 1 default gives real protection: one replica may always be
+  # evicted/drained while the other keeps serving.
   podDisruptionBudget:
     enabled: true
     # Set maxUnavailable to "" when using minAvailable.
@@ -730,6 +730,24 @@ nvmeof:
     nrWriteQueues: null
     # --keep-alive-tmo (seconds). Unset (null, default) omits the flag.
     keepAliveTmo: null
+
+  # Request-size clamp for the kernel initiator (both node agents). The node
+  # writes queue/max_sectors_kb on the multipath head AND every path device
+  # (nvme<S>c<C>n<N>) of a subsystem after its paths are connected and before
+  # the volume is formatted, mounted or published, re-applies it on every
+  # re-stage and once per sessionGC.interval, and only ever LOWERS a value.
+  #   auto (default) — NVMe/TCP subsystems whose controller reports MDTS=0
+  #     are clamped to 4096 KiB. TrueNAS 27 (Linux 6.18 nvmet) rejects any
+  #     command larger than 4 MiB with "SGL invalid data" (sc 0xf, DNR) while
+  #     still reporting MDTS=0, and the initiator otherwise issues up to
+  #     32 MiB commands: I/O errors, ext4 remounts read-only. A controller
+  #     that reports MDTS is left to the kernel, which honors it.
+  #   a whole number (KiB, at least 4) — that ceiling on every subsystem,
+  #     whatever the transport or MDTS.
+  #   off (or 0) — never touch max_sectors_kb.
+  # A required clamp that cannot be applied fails the stage (retried by
+  # kubelet) instead of mounting unprotected. Not used by the ublk data path.
+  maxSectorsKB: auto
 
   # commandTimeout was removed: it was never wired to anything. The nvme CLI
   # timeout is commandTimeouts.nvme. The schema still accepts the old key
