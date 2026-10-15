@@ -659,3 +659,57 @@ func TestMockEncryptionSummaryIsEmptyForANonRoot(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, stubbed, 1, "the knob exists only to isolate the driver's own gate in a test")
 }
+
+// TestMockDatasetCreateEncryptionAlgorithmByVersion pins the mock to the
+// version-dependent create model: 25.10 honors encryption_options.algorithm,
+// 26.0 discards it (always AES-256-GCM), and 27.0 rejects it as an extra input
+// (NAS-142001, extra="forbid") — even the default suite. Omitting it yields
+// AES-256-GCM everywhere.
+func TestMockDatasetCreateEncryptionAlgorithmByVersion(t *testing.T) {
+	create := func(m *MockClient, name, algorithm string) (*Dataset, error) {
+		return m.DatasetCreate(context.Background(), &DatasetCreateParams{
+			Name: name, Type: "FILESYSTEM",
+			Encryption:        boolPtr(true),
+			InheritEncryption: boolPtr(false),
+			EncryptionOptions: &EncryptionOptions{Algorithm: algorithm, Passphrase: "drill-pass-1"},
+		})
+	}
+	for _, tc := range []struct {
+		version  string
+		sent     string
+		wantErr  bool
+		wantAlgo string
+	}{
+		{"TrueNAS-SCALE-25.10.0", "AES-128-GCM", false, "AES-128-GCM"},
+		{"TrueNAS-26.0.0", "AES-128-GCM", false, "AES-256-GCM"},
+		{"TrueNAS-27.0.0-RC.1", "AES-128-GCM", true, ""},
+		{"TrueNAS-27.0.0-RC.1", "AES-256-GCM", true, ""},
+		{"TrueNAS-27.0.0-RC.1", "", false, "AES-256-GCM"},
+		{"TrueNAS-26.0.0", "", false, "AES-256-GCM"},
+		{"TrueNAS-SCALE-25.10.0", "", false, "AES-256-GCM"},
+	} {
+		t.Run(tc.version+"/"+tc.sent, func(t *testing.T) {
+			m := NewMockClient()
+			m.SystemVersion = tc.version
+			ds, err := create(m, "pool/enc", tc.sent)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "encryption_options.algorithm")
+				assert.Contains(t, err.Error(), "Extra inputs are not permitted")
+				assert.Empty(t, m.Datasets)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAlgo, ds.EncryptionAlgorithm)
+		})
+	}
+	t.Run("system info reports the configured version", func(t *testing.T) {
+		m := NewMockClient()
+		m.SystemVersion = "TrueNAS-27.0.0-RC.1"
+		info, err := m.GetSystemInfo(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, 27, info.VersionMajor)
+		assert.Equal(t, 0, info.VersionMinor)
+		assert.Equal(t, 1, m.GetSystemInfoCalls)
+	})
+}

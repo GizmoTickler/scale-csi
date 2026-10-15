@@ -1137,17 +1137,24 @@ metadata:
 stringData:
   passphrase:         "correct-horse-battery"   # required, >= 8 characters (ZFS minimum)
   passphrasePrevious: "old-passphrase-here"     # optional; opens the rotation window
-  algorithm:          "AES-256-GCM"             # optional; default AES-256-GCM
+  algorithm:          "AES-256-GCM"             # optional; omit it (TrueNAS 26+ is always AES-256-GCM)
   pbkdf2iters:        "1300000"                 # optional; positive integer override
 ```
 
 - `passphrase` is required and must be **at least 8 characters** — the ZFS
   minimum. The driver enforces this on the exact, untrimmed value before any API
   call.
-- `algorithm` defaults to `AES-256-GCM`. The accepted set is exactly what
-  `pool.dataset.encryption_algorithm_choices` returns on the probed backend:
-  `AES-128-CCM`, `AES-192-CCM`, `AES-256-CCM`, `AES-128-GCM`, `AES-192-GCM`,
-  `AES-256-GCM`. Anything else is rejected before any API call.
+- `algorithm` is optional and defaults to `AES-256-GCM`; leave it out. On
+  TrueNAS 26.0 and later every new encrypted dataset is `AES-256-GCM`: 26.0
+  ignores a requested suite and 27.0 no longer accepts the option at all. The
+  driver therefore never sends the algorithm for `AES-256-GCM` (absent or
+  explicit), and a Secret that names any other suite fails `CreateVolume` with
+  `InvalidArgument` on TrueNAS 26+ (or when the version cannot be identified),
+  before anything is created. Only TrueNAS 25.10 still honors a non-default
+  suite from `AES-128-CCM`, `AES-192-CCM`, `AES-256-CCM`, `AES-128-GCM`,
+  `AES-192-GCM`; anything outside that set is rejected before any API call.
+  Existing volumes created with another suite are unaffected — unlock and
+  publish never send the algorithm.
 - `pbkdf2iters` overrides the key-derivation iteration count (the backend
   default is 1,300,000). Higher values add unlock CPU latency; unlock is off the
   steady-state I/O path, so the default is acceptable.

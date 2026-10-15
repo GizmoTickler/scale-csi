@@ -136,6 +136,20 @@ type MockClient struct {
 	FailSnapshotListAfter int
 	snapshotListCalls     int
 
+	// SystemVersion is the version string GetSystemInfo reports (default
+	// "TrueNAS-SCALE-25.10.0"), parsed exactly as the real client parses
+	// system.info. It ALSO selects the version-dependent pool.dataset.create
+	// encryption model:
+	//   - < 26: encryption_options.algorithm is honored.
+	//   - 26.x: algorithm is accepted but silently discarded — every new
+	//     encrypted dataset is AES-256-GCM.
+	//   - >= 27: algorithm is no longer part of the model (NAS-142001,
+	//     extra="forbid"), so a create that sends it is a validation error.
+	// SystemInfoErr makes GetSystemInfo fail; GetSystemInfoCalls counts calls.
+	SystemVersion      string
+	SystemInfoErr      error
+	GetSystemInfoCalls int
+
 	// SystemTimezoneName is the IANA zone SystemTimezone reports (default UTC).
 	// SystemTimezoneErr makes it unreadable, for the fail-closed path.
 	SystemTimezoneName string
@@ -646,6 +660,15 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	if err := validateDatasetPayloadKeys(params, datasetCreateKeyScopes, datasetType); err != nil {
 		return nil, fmt.Errorf("failed to create dataset: %w", err)
 	}
+	// TrueNAS 27 removed encryption_options.algorithm from the create model
+	// (NAS-142001) and the model is extra="forbid", so sending it at all — even
+	// the AES-256-GCM default — is a schema error, raised before the
+	// already-exists check like every other schema error.
+	mockMajor := m.systemInfoLocked().VersionMajor
+	if params.EncryptionOptions != nil && params.EncryptionOptions.Algorithm != "" && mockMajor >= 27 {
+		return nil, fmt.Errorf("failed to create dataset: %w",
+			UnsupportedDatasetPropertyError(datasetType, "encryption_options.algorithm"))
+	}
 	if existing, exists := m.Datasets[params.Name]; exists {
 		// Match the real client's idempotent AlreadyExists fallback while
 		// preserving the response-local fact that this call did not create the
@@ -700,7 +723,11 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 			// The key goes into the mock's own side table, never onto the *Dataset
 			// the driver receives.
 			m.datasetPassphrases[params.Name] = opts.Passphrase
-			ds.EncryptionAlgorithm = opts.Algorithm
+			// Only 25.x honors a requested suite; 26.0 silently discards it and
+			// 27 rejected it above. Either way the result is AES-256-GCM.
+			if mockMajor < 26 {
+				ds.EncryptionAlgorithm = opts.Algorithm
+			}
 		}
 		if ds.EncryptionAlgorithm == "" {
 			ds.EncryptionAlgorithm = "AES-256-GCM"
@@ -2418,14 +2445,25 @@ func (m *MockClient) ServiceReload(ctx context.Context, service string) error {
 
 // System information methods
 func (m *MockClient) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
-	// Return a mock TrueNAS SCALE 25.10+ version for testing
-	return &SystemInfo{
-		Version:      "TrueNAS-SCALE-25.10.0",
-		VersionMajor: 25,
-		VersionMinor: 10,
-		VersionPatch: 0,
-		Hostname:     "truenas-mock",
-	}, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.GetSystemInfoCalls++
+	if m.SystemInfoErr != nil {
+		return nil, m.SystemInfoErr
+	}
+	return m.systemInfoLocked(), nil
+}
+
+// systemInfoLocked builds the mock's system.info answer from SystemVersion
+// (default TrueNAS SCALE 25.10.0). Caller holds m.mu.
+func (m *MockClient) systemInfoLocked() *SystemInfo {
+	version := m.SystemVersion
+	if version == "" {
+		version = "TrueNAS-SCALE-25.10.0"
+	}
+	info := &SystemInfo{Version: version, Hostname: "truenas-mock"}
+	parseTrueNASVersion(version, info)
+	return info
 }
 
 // SystemTimezone returns the mock NAS's civil timezone. SystemTimezoneName

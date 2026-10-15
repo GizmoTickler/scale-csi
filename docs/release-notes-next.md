@@ -1,6 +1,50 @@
-# Release notes — next (v1.24.1 draft)
+# Release notes — next (v1.24.2 draft)
 
-## v1.24.1 (draft) — an NVMe-oF head disk outlives its first path, also on expand
+## v1.24.2 (draft) — encrypted volumes can be created on TrueNAS 27
+
+Nothing to configure, unless an encryption Secret names a suite other than
+`AES-256-GCM` (below).
+
+TrueNAS 27 removed `encryption_options.algorithm` from `pool.dataset.create`
+(NAS-142001), and that request model rejects keys it does not know. The driver
+sent `"algorithm": "AES-256-GCM"` on every encrypted create, so on TrueNAS 27
+every encrypted `CreateVolume` failed with a validation error. Plaintext volumes
+were not affected, nor were existing encrypted volumes: unlock, publish, key
+rotation and delete never send the algorithm.
+
+- **The default suite is no longer sent.** For `AES-256-GCM`, whether the
+  Secret leaves `algorithm` out or names it, the create carries no algorithm.
+  Every supported TrueNAS release creates `AES-256-GCM` when none is given, so
+  the dataset and its `scale-csi:encryption` stamp are the same as before on
+  25.10 and 26.0.
+- **Another suite is refused on TrueNAS 26 and later.** TrueNAS 26.0 accepted
+  a requested suite but created `AES-256-GCM` anyway, so the volume's stamp
+  named a suite the data did not use; 27.0 rejects the option. A Secret whose
+  `algorithm` is anything but `AES-256-GCM` now fails a new volume's
+  `CreateVolume` with `InvalidArgument` on 26+ before anything is created, and
+  the message says to remove the key. On 25.10 the suite is still sent and
+  honored. If the TrueNAS version does not parse, the request is refused as on
+  26+; if it cannot be read, `CreateVolume` returns `Unavailable` and is
+  retried. Only a non-default suite reads the version, from the client's
+  cached `system.info`; the default path makes no extra call.
+- **A replay of an existing volume is not refused.** The check runs only when
+  a dataset is about to be created. A retried `CreateVolume` for a volume that
+  already exists sends no create, so it behaves as before whatever the Secret
+  says.
+
+On TrueNAS 26.0, a volume created from a Secret that named another suite is
+`AES-256-GCM` on disk while its `scale-csi:encryption` stamp names the requested
+suite, and so does the `encryption` key of its volume context. The driver only
+checks that the stamp is present; nothing passes the suite back to TrueNAS, so
+unlock and rotation work. `zfs get encryption <dataset>` shows the real suite.
+
+### Rolling back to v1.24.1
+
+Encrypted creates fail on TrueNAS 27 again. On 25.10 and 26.0 nothing changes
+for a Secret without `algorithm` or with `AES-256-GCM`.
+
+
+## v1.24.1 — an NVMe-oF head disk outlives its first path, also on expand
 
 Nothing to configure. Two fixes to the same mistake, in both node agents
 (the Rust agent, the default since v1.21.0, and the Go node plugin): a

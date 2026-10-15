@@ -3,6 +3,7 @@ package driver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -205,9 +206,27 @@ func TestApplyEncryptionToCreateParams(t *testing.T) {
 		require.NotNil(t, params.InheritEncryption)
 		assert.False(t, *params.InheritEncryption)
 		require.NotNil(t, params.EncryptionOptions)
-		assert.Equal(t, "AES-256-GCM", params.EncryptionOptions.Algorithm)
 		assert.Equal(t, "longenough1", params.EncryptionOptions.Passphrase)
 		assert.Equal(t, 310000, params.EncryptionOptions.Pbkdf2Iters)
+	})
+	// TrueNAS 27 removed encryption_options.algorithm (NAS-142001,
+	// extra="forbid"), so the default suite must never be on the wire.
+	t.Run("the default suite sends no algorithm", func(t *testing.T) {
+		ctx := withEncryptionResolution(context.Background(), &encryptionResolution{Algorithm: "AES-256-GCM", Passphrase: "longenough1"})
+		params := &truenas.DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME"}
+		applyEncryptionToCreateParams(ctx, params)
+		require.NotNil(t, params.EncryptionOptions)
+		assert.Empty(t, params.EncryptionOptions.Algorithm)
+		encoded, err := json.Marshal(params)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), `"algorithm"`)
+	})
+	t.Run("a non-default suite is sent", func(t *testing.T) {
+		ctx := withEncryptionResolution(context.Background(), &encryptionResolution{Algorithm: "AES-128-GCM", Passphrase: "longenough1"})
+		params := &truenas.DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME"}
+		applyEncryptionToCreateParams(ctx, params)
+		require.NotNil(t, params.EncryptionOptions)
+		assert.Equal(t, "AES-128-GCM", params.EncryptionOptions.Algorithm)
 	})
 	t.Run("no-op for a plaintext create", func(t *testing.T) {
 		params := &truenas.DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME"}

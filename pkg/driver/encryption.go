@@ -47,20 +47,31 @@ const (
 	encryptionSecretKeyPbkdf2Iters        = "pbkdf2iters" //nolint:gosec // Kubernetes Secret key name, not a credential value
 )
 
-// encryptionDefaultAlgorithm is the default create algorithm. P-0 probed the
-// full choice set {AES-128-CCM, AES-192-CCM, AES-256-CCM, AES-128-GCM,
-// AES-192-GCM, AES-256-GCM}; AES-256-GCM is present, so it is the default.
+// encryptionDefaultAlgorithm is the suite every supported TrueNAS release
+// applies to a new encrypted dataset when no algorithm is sent. It is never put
+// on the wire (see applyEncryptionToCreateParams): TrueNAS 27 removed
+// encryption_options.algorithm from pool.dataset.create (NAS-142001) and that
+// model is extra="forbid", so even the default is a validation error there.
 const encryptionDefaultAlgorithm = "AES-256-GCM"
+
+// encryptionFixedAlgorithmMajor is the first TrueNAS major release on which a
+// new encrypted dataset is ALWAYS AES-256-GCM. 26.0 accepts
+// encryption_options.algorithm but silently discards it; 27.0 rejects it. Only
+// 25.10 honors a requested suite.
+const encryptionFixedAlgorithmMajor = 26
 
 // encryptionMinPassphraseLen is the ZFS minimum passphrase length. ZFS rejects a
 // passphrase shorter than 8 characters; the driver enforces it before any API
 // call so a bad secret fails fast with InvalidArgument.
 const encryptionMinPassphraseLen = 8
 
-// encryptionAlgorithms is the P-0 probed set pool.dataset.encryption_algorithm_choices
-// returns on nas01 26.0.0-BETA.1. A requested algorithm outside this set is
-// rejected with InvalidArgument before any API call. Do not "correct" this set
-// from ZFS documentation — it is pinned to the probe.
+// encryptionAlgorithms is the set an explicit `algorithm` secret key may name.
+// It is the set pool.dataset.encryption_algorithm_choices returned when it
+// existed (P-0 probe, nas01 26.0.0-BETA.1; TrueNAS 27 removed that method). A
+// value outside this set is rejected with InvalidArgument before any API call.
+// A member other than encryptionDefaultAlgorithm is only creatable on TrueNAS
+// < 26 (see preflightEncryptionAlgorithm); on 26+ every new encrypted dataset is
+// AES-256-GCM.
 var encryptionAlgorithms = map[string]struct{}{
 	"AES-128-CCM": {},
 	"AES-192-CCM": {},
@@ -723,6 +734,11 @@ func (d *Driver) destroyRefusedEncryptedContentSource(
 // resolution is present, so a plaintext create payload is byte-identical to
 // pre-encryption (+0 RTT). The passphrase rides in this single create call and
 // is never stamped as a property.
+//
+// encryption_options.algorithm is sent ONLY for a non-default suite, which
+// preflightEncryptionAlgorithm admits only on TrueNAS < 26. The default
+// (AES-256-GCM) is what every supported release applies when the key is
+// absent, and TrueNAS 27 rejects the key outright (extra="forbid").
 func applyEncryptionToCreateParams(ctx context.Context, params *truenas.DatasetCreateParams) {
 	res := encryptionResolutionFromContext(ctx)
 	if res == nil {
@@ -733,10 +749,53 @@ func applyEncryptionToCreateParams(ctx context.Context, params *truenas.DatasetC
 	params.Encryption = &encrypted
 	params.InheritEncryption = &inherit
 	params.EncryptionOptions = &truenas.EncryptionOptions{
-		Algorithm:   res.Algorithm,
 		Passphrase:  res.Passphrase,
 		Pbkdf2Iters: res.Pbkdf2Iters,
 	}
+	if res.Algorithm != encryptionDefaultAlgorithm {
+		params.EncryptionOptions.Algorithm = res.Algorithm
+	}
+}
+
+// preflightEncryptionAlgorithm refuses a fresh encrypted create that names a
+// non-default suite on a backend that cannot honor it. TrueNAS 26.0 accepts
+// encryption_options.algorithm but silently creates AES-256-GCM anyway (so the
+// stamp would lie), and TrueNAS 27 rejects the key (NAS-142001). Only 25.x
+// honors it.
+//
+// The default suite costs nothing: no system.info read, +0 RTT. A non-default
+// suite reads the version through the client's cached system.info. It fails
+// CLOSED: a version that does not parse is treated as >= 26, and an unreadable
+// one is Unavailable (retryable) — the non-default suite is never sent blind.
+//
+// It runs below the already-exists check, like the other create preflights: a
+// replay of an already-provisioned volume sends no create, so the backend's
+// current version says nothing about it, and refusing it would wedge a volume
+// that exists.
+func (d *Driver) preflightEncryptionAlgorithm(ctx context.Context) error {
+	res := encryptionResolutionFromContext(ctx)
+	if res == nil || res.Algorithm == encryptionDefaultAlgorithm {
+		return nil
+	}
+	info, err := d.truenasClient.GetSystemInfo(ctx)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"encryption algorithm %q requires TrueNAS < %d.0, but the TrueNAS version could not be read: %v",
+			res.Algorithm, encryptionFixedAlgorithmMajor, err)
+	}
+	if info == nil || info.VersionMajor == 0 || info.VersionMajor >= encryptionFixedAlgorithmMajor {
+		version := "unknown"
+		if info != nil && info.Version != "" {
+			version = info.Version
+		}
+		return status.Errorf(codes.InvalidArgument,
+			"encryption algorithm %q cannot be honored by TrueNAS %s: TrueNAS %d.0 and later always create "+
+				"encrypted datasets with %s (27.0 rejects the algorithm option outright). Remove the %q key from "+
+				"the StorageClass encryption Secret, or set it to %s",
+			res.Algorithm, version, encryptionFixedAlgorithmMajor, encryptionDefaultAlgorithm,
+			encryptionSecretKeyAlgorithm, encryptionDefaultAlgorithm)
+	}
+	return nil
 }
 
 // encryptionSummaryLocked reads the P-3 summary for datasetName and reports
