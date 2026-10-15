@@ -1,34 +1,82 @@
 # Scale CSI Helm Chart
 
-A Helm chart for deploying the Scale CSI driver for TrueNAS SCALE.
+Deploys the [scale-csi](https://github.com/GizmoTickler/scale-csi) Kubernetes
+CSI driver for TrueNAS SCALE: the controller Deployment, the node DaemonSet,
+the `CSIDriver` object, StorageClasses, and optional VolumeSnapshotClass,
+monitoring, and cleanup resources.
+
+- First install? Follow [Getting started](../../docs/getting-started.md).
+- Ready-made values files: [`examples/helm/`](../../examples/helm/) (per protocol,
+  multi-protocol, production, encryption) and GitOps manifests in
+  [`examples/gitops/`](../../examples/gitops/).
+- Every value with its default: [All values](#all-values) at the end of this page.
 
 ## Prerequisites
 
-- Kubernetes 1.20+ — this is the floor the chart actually enforces
-  (`Chart.yaml` `kubeVersion: ">=1.20.0-0"`), consistent with the pinned
-  external-provisioner v6.3 and external-snapshotter v8.6 (both document a
-  Kubernetes 1.20 minimum). Note that `CSIDriver.spec.storageCapacity` is
-  immutable on Kubernetes 1.20–1.22, so toggling `capacity.enabled` on those
-  versions requires a `CSIDriver` delete/recreate; it is mutable from 1.23+.
-- Helm 3.8+
-- TrueNAS SCALE with API access enabled
-- The external snapshot CRDs/controller when `snapshotClass.create` is enabled
-- `open-iscsi` on nodes that use iSCSI
-- `nvme-cli` on nodes that use NVMe-oF
+- A supported TrueNAS release and Kubernetes 1.20+ (the chart's
+  `kubeVersion` floor); see the
+  [compatibility reference](../../docs/reference/compatibility.md).
+  `CSIDriver.spec.storageCapacity` is immutable on Kubernetes 1.20–1.22, so
+  toggling `capacity.enabled` there requires a `CSIDriver` delete/recreate.
+- Helm 3.8+ (OCI registry support).
+- A namespace that allows `privileged` pods
+  (`pod-security.kubernetes.io/enforce: privileged`).
+- A TrueNAS API key in a Secret under the key `api-key` (or `truenas.apiKey`).
+- Host tools on the nodes for the protocols you enable: kernel NFS client;
+  `open-iscsi` with `iscsid` running; `nvme-cli` with the `nvme-tcp` module.
+- The VolumeSnapshot CRDs and snapshot-controller when you use snapshots or
+  `snapshotClass.create`.
 
-## Quick start
+## Install
 
 ```bash
+kubectl create namespace scale-csi
+kubectl label namespace scale-csi pod-security.kubernetes.io/enforce=privileged
+kubectl -n scale-csi create secret generic truenas-api-key \
+  --from-literal=api-key='<your-truenas-api-key>'
+
 helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --namespace scale-csi \
-  --create-namespace \
-  --set truenas.host=truenas.local \
-  --set truenas.apiKey=1-xxxxx \
+  --set truenas.host=truenas.example.com \
+  --set truenas.existingSecret=truenas-api-key \
   --set zfs.parentDataset=tank/k8s/volumes
 ```
 
-The driver supports API-key authentication only. If `truenas.existingSecret` is
-used, that Secret must contain an `api-key` key.
+Add `--version X.Y.Z` to pin a release (see the
+[releases page](https://github.com/GizmoTickler/scale-csi/releases)); chart
+`X.Y.Z` deploys image `vX.Y.Z`. The defaults enable NFS and iSCSI and create one
+`scale-nfs` StorageClass; disable the protocols you do not use. The driver
+supports API-key authentication only, and the values are validated against
+`values.schema.json`, so unknown keys fail the install.
+
+## Upgrade
+
+The controller keeps publication records as `VolumePublication` objects (CRD
+in `crds/`). Helm installs `crds/` on a first install but never on an upgrade,
+and the controller refuses to start without the current CRD, so apply it from
+the target release first (with Flux, set the HelmRelease's `install.crds` and
+`upgrade.crds` to `CreateReplace` instead):
+
+```bash
+VERSION=v<X.Y.Z>
+kubectl apply -f "https://raw.githubusercontent.com/GizmoTickler/scale-csi/${VERSION}/charts/scale-csi/crds/volumepublications.scale-csi.io.yaml"
+helm upgrade scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
+  --namespace scale-csi --version "${VERSION#v}" -f values.yaml
+```
+
+Read the release's upgrade notes first. Verification, rollback, credential
+rotation, and upgrading TrueNAS itself are in the
+[upgrade guide](../../docs/guides/upgrades.md).
+
+## Uninstall
+
+```bash
+helm uninstall scale-csi --namespace scale-csi
+```
+
+Delete the PVCs first if you want the volumes gone: PVCs, PVs, and the
+datasets/zvols on TrueNAS are not deleted when the chart is uninstalled. Helm
+also leaves the `VolumePublication` CRD in place.
 
 ### Images and immutable deployment
 
@@ -101,14 +149,15 @@ attachment still has a legacy node ID, additive startup reconciliation defers
 that per-node fence and increments
 `scale_csi_fencing_deferred_total{reason="missing_identity",protocol="..."}`.
 
-> **Required upgrade sequence for v1.2.23:** keep `fencing.mode=off`; upgrade the
+> **Required sequence when moving off `fencing.mode=off`** (and when upgrading
+> from a release older than v1.2.23): keep `fencing.mode=off`; upgrade the
 > node DaemonSet/image first; wait until every node's CSINode has re-registered;
 > then enable `additive`. Move to `strict` only after
 > `scale_csi_fencing_deferred_total` stays at zero. Strict mode gates controller
 > readiness while background reconciliation retries transient dual-VA states;
 > it does not terminate the CSI process.
 >
-> Roll the ConfigMap and v1.2.23 image together. A ConfigMap containing new
+> Roll the ConfigMap and the new image together. A ConfigMap containing new
 > fencing keys can make older strict-YAML driver pods fail their config parse.
 
 Because the chart uses one image value for controller and node, perform the
@@ -117,13 +166,13 @@ release is not named `scale-csi`):
 
 ```bash
 kubectl -n scale-csi set image daemonset/scale-csi-node \
-  scale-csi=ghcr.io/gizmotickler/scale-csi:v1.2.23
+  scale-csi=ghcr.io/gizmotickler/scale-csi:v<X.Y.Z>
 kubectl -n scale-csi rollout status daemonset/scale-csi-node
 kubectl get csinode -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.drivers[?(@.name=="csi.scale.io")]}{.nodeID}{end}{"\n"}{end}'
 ```
 
 Every listed driver node ID must begin with `sc1.`. Then update the release
-values with the v1.2.23 image, the two new duration keys, and
+values with the new image, the fencing duration keys, and
 `fencing.mode=additive`, and run the Helm upgrade. That upgrade rolls the
 controller image and ConfigMap as one release operation; do not apply the new
 ConfigMap separately to old controller pods.
@@ -154,7 +203,7 @@ new ownership boundary.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `truenas.host` | TrueNAS hostname or IP (required; the driver refuses to start without it) | `""` |
+| `truenas.host` | TrueNAS hostname or IP for the API (required; the driver refuses to start without it). With TLS verification on it must match the certificate | `""` |
 | `truenas.port` | API port | `443` |
 | `truenas.secure` | Use HTTPS | `true` |
 | `truenas.skipTLSVerify` | Skip TLS verification | `false` |
@@ -805,37 +854,295 @@ writers.
   target namespace with `pod-security.kubernetes.io/enforce: privileged` before
   installing the chart.
 
-## Existing Secret example
+## All values
 
-```bash
-kubectl create secret generic truenas-credentials \
-  --namespace scale-csi \
-  --from-literal=api-key=1-xxxxx
-```
+Generated from [`values.yaml`](values.yaml) by
+[`hack/chart-values-table.py`](../../hack/chart-values-table.py); the
+description is the first sentence of the comment above each key, and the
+curated tables above explain how the important ones interact. Lists of objects
+(for example `storageClasses`) are summarized; see `values.yaml` for them.
 
-```yaml
-truenas:
-  host: truenas.local
-  existingSecret: truenas-credentials
-zfs:
-  parentDataset: tank/k8s/volumes
-```
+<!-- BEGIN GENERATED VALUES TABLE (hack/chart-values-table.py) -->
 
-## Upgrade and uninstall
+| Key | Default | Description |
+|---|---|---|
+| `csiDriverName` | `csi.scale.io` | CSI Driver name (should match the driver name in StorageClass) |
+| `capacity.enabled` | `false` | Advertise CSIDriver.spec.storageCapacity=true and add the provisioner's --enable-capacity flag plus its csistoragecapacities RBAC. |
+| `capacity.forImmediateBinding` | `false` | Opt-in: also publish CSIStorageCapacity for Immediate-binding StorageClasses (renders the provisioner's --capacity-for-immediate-binding). |
+| `capacity.reportMaximumVolumeSize` | `false` | Set GetCapacityResponse.maximum_volume_size. |
+| `capacity.gaugeEnabled` | `false` | Run a controller-only poll loop publishing scale_csi_pool_available_bytes and scale_csi_pool_capacity_bytes. |
+| `capacity.gaugeInterval` | `60s` | Poll cadence for the capacity gauge loop. |
+| `encryption.enabled` | `false` | Opt the controller into encryption-at-rest management (create-time folding, publish-time unlock, the locked-volume reconciler, and the locked VolumeCondition signal). |
+| `driverInstanceId` | `""` | Stable ownership identity stamped on newly-created datasets/zvols. |
+| `fencing.mode` | `"off"` |  |
+| `fencing.startupReconcileTimeout` | `10m` | Timeout for one background startup convergence attempt. |
+| `fencing.staleRecordGracePeriod` | `10m` | Continuous VolumeAttachment absence required before a stale publication record left by a force-removed VA finalizer can be revoked. |
+| `image.repository` | `ghcr.io/gizmotickler/scale-csi` |  |
+| `image.tag` | `""` | Defaults to v&lt;Chart.appVersion&gt; (matches the v-prefixed published image) |
+| `image.digest` | `""` | Optional immutable manifest digest. |
+| `image.pullPolicy` | `IfNotPresent` |  |
+| `imagePullSecrets` | `[]` |  |
+| `revisionHistoryLimit` | `2` | Number of old Controller ReplicaSets and Node DaemonSet revisions to retain. |
+| `startupConnectTimeout` | `5m` | Maximum time the driver retries its initial TrueNAS connection with exponential backoff. |
+| `controller.enabled` | `true` |  |
+| `controller.replicas` | `1` | Additive/strict fencing requires exactly one non-overlapping controller writer; the chart uses Recreate rollouts in those modes. |
+| `controller.priorityClassName` | `system-cluster-critical` | Priority class for controller pods |
+| `controller.podDisruptionBudget.enabled` | `true` |  |
+| `controller.podDisruptionBudget.minAvailable` | `""` | Set maxUnavailable to "" when using minAvailable. |
+| `controller.podDisruptionBudget.maxUnavailable` | `1` |  |
+| `controller.containerSecurityContext.runAsNonRoot` | `true` |  |
+| `controller.containerSecurityContext.runAsUser` | `65532` |  |
+| `controller.containerSecurityContext.allowPrivilegeEscalation` | `false` |  |
+| `controller.containerSecurityContext.readOnlyRootFilesystem` | `true` |  |
+| `controller.containerSecurityContext.capabilities.drop` | `[ALL]` |  |
+| `controller.podSecurityContext.seccompProfile.type` | `RuntimeDefault` |  |
+| `controller.resources.requests.cpu` | `10m` |  |
+| `controller.resources.requests.memory` | `32Mi` |  |
+| `controller.resources.limits.memory` | `256Mi` |  |
+| `controller.nodeSelector` | `{}` | Node selector for controller pod |
+| `controller.tolerations` | `list of 2 (see values.yaml)` | Tolerations for controller pod |
+| `controller.affinity` | `{}` |  |
+| `controller.extraEnv` | `[]` | Additional environment variables |
+| `controller.extraVolumeMounts` | `[]` | Additional volume mounts |
+| `controller.extraVolumes` | `[]` | Additional volumes |
+| `node.enabled` | `true` |  |
+| `node.implementation` | `rust` | Which node plugin the DaemonSet runs, from the same image: rust (scale-csi-node, the Rust node agent; the default since v1.21.0) or go (scale-csi, the Go node plugin). |
+| `node.rustNodes` | `[]` | With implementation: go, a canary of the Rust agent: node names (kubernetes.io/hostname) that run it in a second DaemonSet, &lt;fullname&gt;-node-rust, while the Go DaemonSet avoids them. |
+| `node.priorityClassName` | `system-node-critical` | Priority class for node pods |
+| `node.sessionCleanupDelay` | `500` | Delay in milliseconds before retrying after stale session cleanup |
+| `node.maxVolumesPerNode` | `0` | Maximum volumes Kubernetes may schedule to one node. |
+| `node.terminationGracePeriodSeconds` | `90` | Seconds kubelet waits after SIGTERM before SIGKILL. |
+| `node.updateStrategy.type` | `RollingUpdate` |  |
+| `node.updateStrategy.rollingUpdate.maxUnavailable` | `1` |  |
+| `node.updateStrategy.rollingUpdate.maxSurge` | `0` |  |
+| `node.resources.requests.cpu` | `10m` |  |
+| `node.resources.requests.memory` | `32Mi` |  |
+| `node.resources.limits.memory` | `256Mi` |  |
+| `node.nodeSelector` | `{}` | Node selector for node pods |
+| `node.tolerations` | `list of 1 (see values.yaml)` | Tolerations for node pods (allow scheduling on all nodes) |
+| `node.affinity` | `{}` |  |
+| `node.extraEnv` | `[]` | Additional environment variables |
+| `node.extraVolumeMounts` | `[]` | Additional volume mounts |
+| `node.extraVolumes` | `[]` | Additional volumes |
+| `kubeletDir` | `/var/lib/kubelet` | Host kubelet directory used for CSI sockets and registration |
+| `truenas.host` | `""` | TrueNAS host (required — the driver refuses to start without it) |
+| `truenas.port` | `443` | API port (80 for HTTP, 443 for HTTPS) |
+| `truenas.secure` | `true` | Use HTTPS |
+| `truenas.skipTLSVerify` | `false` | Skip TLS verification (not recommended for production) |
+| `truenas.caCert` | `""` | Optional PEM-encoded CA certificate for verifying the TrueNAS API. |
+| `truenas.caCertFile` | `""` | Optional path to a mounted PEM-encoded CA certificate file. |
+| `truenas.apiKey` | `""` | API key authentication (recommended; required unless existingSecret is set — the driver refuses to start without one) |
+| `truenas.existingSecret` | `""` | Use existing secret for credentials Secret must contain the key: api-key |
+| `truenas.requestTimeout` | `60` | Request timeout in seconds (default: 60) |
+| `truenas.connectTimeout` | `10` | Connection establishment timeout in seconds (default: 10) |
+| `truenas.writeTimeout` | `30` | WebSocket write timeout in seconds (default: 30) |
+| `truenas.maxConcurrentRequests` | `10` | Maximum concurrent API requests to TrueNAS (default: 10) Lower this if TrueNAS becomes overloaded with many PVC operations. |
+| `truenas.maxConnections` | `null` | Size of the TrueNAS WebSocket connection pool the controller multiplexes API calls across (valid range 1..16). |
+| `zfs.parentDataset` | `""` | Parent dataset for volumes (required — the driver refuses to start without it) |
+| `zfs.datasetProperties` | `{}` | Additional ZFS properties to set on newly created datasets/zvols, e.g. |
+| `zfs.zvolBlocksize` | `16K` | Block size for newly-created zvols |
+| `zfs.zvolEnableReservation` | `false` | Thick-provision block zvols with a full refreservation. |
+| `zfs.enforceQuota` | `true` | Dataset quota enforcement |
+| `zfs.detachedVolumesFromSnapshots` | `false` | Create independent volumes from snapshots using a local ZFS send/receive. |
+| `zfs.zvolReadyTimeout` | `60` | Timeout in seconds for waiting for a zvol to be ready after cloning Increase this for slow systems, heavily loaded TrueNAS, or large clones (default: 60 seconds) |
+| `zfs.destroyForeignSnapshotsOnDelete` | `false` | Allow DeleteVolume to recursively destroy snapshots not created by the CSI driver. |
+| `zfs.observeBusyBeforeDelete` | `on-failure` | Ask TrueNAS whether anything still uses a dataset (pool.dataset.attachments and pool.dataset.processes) around its delete. |
+| `zfs.holdCsiSnapshots` | `false` | Place a deletion-proof ZFS hold (the fixed `truenas` tag) on every CSI VolumeSnapshot at create so foreign actors — a box-wide periodic-snapshot task's pruning, an admin, replication retention — cannot destroy it… |
+| `zfs.snapshotSchedule` | `""` | Controller-wide DEFAULT schedule for driver-managed periodic snapshots (GF2/E2): a five-field cron string "minute hour dom month dow". |
+| `zfs.snapshotRetention` | `""` | Controller-wide DEFAULT bounded retention for driver-managed periodic snapshots (GF2/E2), e.g. |
+| `zfs.promoteRestoredClones` | `false` | Promote clone-restored volumes in the background reconcile pass to drop their origin-snapshot pin once each is the sole dependent of its origin (GF2/E3), letting the tombstone reaper reclaim the source snapshot and… |
+| `zfs.reportVolumeUsage` | `false` | Report per-volume quota/usage from ControllerGetVolume (GF2/E4): one extra pool.dataset.query per ControllerGetVolume feeds the volume_used_bytes / volume_quota_bytes / volume_near_quota metrics and a near-quota… |
+| `nfs.enabled` | `true` | Enable NFS support |
+| `nfs.server` | `""` | NFS server address (defaults to TrueNAS host) |
+| `nfs.nconnect` | `null` | Optional number of TCP connections to EACH server IP. |
+| `nfs.trunking` | `false` | NFSv4.1+ session trunking across multiple server IPs. |
+| `nfs.addresses` | `[]` | Additional server IP literals. |
+| `nfs.shareAllowedNetworks` | `[]` | Networks allowed to mount dynamically-created shares. |
+| `nfs.nodeIdentityNetworks` | `[]` | Storage networks (CIDRs, or single IPs) the nodes reach the NFS server over, when that is not the Kubernetes node network. |
+| `nfs.shareMaprootUser` | `root` | Maproot_* and mapall_* are MUTUALLY EXCLUSIVE in TrueNAS: sharing.nfs.create rejects a payload carrying both. |
+| `nfs.shareMaprootGroup` | `wheel` |  |
+| `nfs.shareMapallUser` | `""` |  |
+| `nfs.shareMapallGroup` | `""` |  |
+| `nfs.shareSecurity` | `[]` | Default `security` list for newly created exports: SYS, KRB5, KRB5I, KRB5P. |
+| `nfs.shareExposeSnapshots` | `false` | Publish the dataset's read-only .zfs/snapshot tree through new exports. |
+| `nfs.krbEnabled` | `false` | Explicit acknowledgement that this TrueNAS has Kerberos configured for NFSv4 (nfs.config v4_krb plus a keytab). |
+| `nfs.versionPreflight` | `false` | Validate a StorageClass's pinned NFS version (its `vers=`/`nfsvers=` mountOption) against the GLOBAL nfs.config protocols, so a class asking for a version the server does not enable fails with a clear message instead… |
+| `nfs.ensureProtocols` | `[]` | HARD RULE — opt-in only. |
+| `iscsi.enabled` | `true` | Enable iSCSI support |
+| `iscsi.portal` | `""` | Target portal address (defaults to TrueNAS host) |
+| `iscsi.portalPort` | `3260` | Target portal port |
+| `iscsi.multipath` | `false` | Multi-portal iSCSI. |
+| `iscsi.portals` | `[]` | Additional portal IP literals. |
+| `iscsi.targetGroups` | `[]` | Explicit TrueNAS portal/initiator group associations for created targets (install-specific database IDs). |
+| `iscsi.extentBlocksize` | `512` | Logical block size for NEWLY created extents only. |
+| `iscsi.extentDisablePhysicalBlocksize` | `false` | Disable physical block size reporting on created extents. |
+| `iscsi.extentRpm` | `SSD` |  |
+| `iscsi.deviceWaitTimeout` | `60` | Timeout in seconds to wait for iSCSI device to appear after login Increase this for heavily loaded nodes or slow networks |
+| `iscsi.serviceReloadDebounce` | `2000` | Debounce window in milliseconds for iSCSI service reloads Multiple volume creations within this window will trigger a single reload This prevents reload storms during bulk volume provisioning (default: 2000ms) |
+| `iscsi.chap.enabled` | `false` | Opt the controller into CHAP peer management. |
+| `iscsi.chap.tag` | `0` | Optional operator-pinned iscsi.auth tag. |
+| `iscsi.chap.mutual` | `false` | Default authmethod hint for the controller. |
+| `nvmeof.enabled` | `false` | Enable NVMe-oF support |
+| `nvmeof.transport` | `tcp` | Transport type (tcp, rdma) |
+| `nvmeof.address` | `""` | Target address (defaults to TrueNAS host) |
+| `nvmeof.port` | `4420` | Target port |
+| `nvmeof.subsystemHosts` | `[]` | Allowed host NQNs. |
+| `nvmeof.subsystemAllowAnyHost` | `false` | Allow any host NQN to connect. |
+| `nvmeof.portPerf.inlineDataSize` | `null` | Inline write cutoff in bytes. |
+| `nvmeof.portPerf.maxQueueSize` | `null` | Queue entries per connection. |
+| `nvmeof.portPerf.piEnable` | `null` | Enable T10-PI (protection information) on the port. |
+| `nvmeof.multipath` | `false` | NVMe-oF multi-port multipath (GF-Sprint 4, E-6). |
+| `nvmeof.addresses` | `[]` | Additional storage transport addresses to expose when multipath=true. |
+| `nvmeof.connect.fastIOFailTmo` | `0` | --fast_io_fail_tmo (seconds). |
+| `nvmeof.connect.nrIOQueues` | `null` | --nr-io-queues / --nr-write-queues. |
+| `nvmeof.connect.nrWriteQueues` | `null` |  |
+| `nvmeof.connect.keepAliveTmo` | `null` | --keep-alive-tmo (seconds). |
+| `nvmeof.dataPath` | `kernel` | Node data path for volumes whose StorageClass does not set the `nvmeof/dataPath` parameter: kernel (default) — `nvme connect` plus native kernel NVMe multipath. |
+| `nvmeof.ublk.enabled` | `false` | Make the ublk data path available to StorageClasses that opt in with `nvmeof/dataPath: ublk` while dataPath above stays kernel. |
+| `nvmeof.ublk.maxVolumesPerNode` | `32` | Volumes one node must be able to serve through this data path at once. |
+| `nvmeof.ublk.queues` | `0` | Ublk queues per device. |
+| `nvmeof.ublk.depth` | `0` | Per-queue ublk depth. |
+| `nvmeof.ublk.zeroCopy` | `true` | Ublk zero copy (UBLK_F_AUTO_BUF_REG). |
+| `nvmeof.ublk.napiUs` | `200` | NAPI busy-poll budget in microseconds while I/O is in flight; 0 disables. |
+| `nvmeof.ublk.attachTimeout` | `60` | Seconds one attach may take (it connects every path). |
+| `nvmeof.ublk.daemon.enabled` | `true` |  |
+| `nvmeof.ublk.daemon.image.repository` | `ghcr.io/gizmotickler/scale-csi-nvmeublk` | Published (amd64) with every release under the driver's tag. |
+| `nvmeof.ublk.daemon.image.tag` | `""` | Defaults to v&lt;Chart.appVersion&gt;, the daemon released with this chart, so a chart upgrade also rolls the daemon (a handover on every node, one at a time). |
+| `nvmeof.ublk.daemon.image.digest` | `""` | Optional immutable manifest digest; takes precedence over tag. |
+| `nvmeof.ublk.daemon.image.pullPolicy` | `IfNotPresent` |  |
+| `nvmeof.ublk.daemon.terminationGracePeriodSeconds` | `15` | Seconds kubelet waits after SIGTERM. |
+| `nvmeof.ublk.daemon.priorityClassName` | `system-node-critical` |  |
+| `nvmeof.ublk.daemon.resources.requests.cpu` | `50m` |  |
+| `nvmeof.ublk.daemon.resources.requests.memory` | `256Mi` |  |
+| `nvmeof.ublk.daemon.extraEnv` | `[]` | Extra environment for the daemon (NVMEUBLK_* tuning; the defaults are the measured profile). |
+| `storageClasses` | `list of 7 (see values.yaml)` | Storage classes to create. |
+| `csidriver.fsGroupPolicy` | `File` | FsGroupPolicy is effectively IMMUTABLE on a live CSIDriver and is a driver-global choice — it cannot be set per StorageClass. |
+| `storageClass` | `{}` | Deprecated single-StorageClass configuration. |
+| `snapshotClass.create` | `false` |  |
+| `snapshotClass.name` | `scale-csi` |  |
+| `snapshotClass.deletionPolicy` | `Delete` |  |
+| `snapshotClass.labels` | `{}` |  |
+| `snapshotClass.annotations` | `{}` |  |
+| `sidecars.securityContext.allowPrivilegeEscalation` | `false` |  |
+| `sidecars.securityContext.readOnlyRootFilesystem` | `true` |  |
+| `sidecars.securityContext.capabilities.drop` | `[ALL]` |  |
+| `sidecars.leaderElection.leaseDuration` | `60s` | How long a leader lease is valid (default: 60s, upstream default: 15s) |
+| `sidecars.leaderElection.renewDeadline` | `40s` | How long a leader waits before renewing (default: 40s, upstream default: 10s) Must be less than leaseDuration |
+| `sidecars.leaderElection.retryPeriod` | `10s` | How often to retry acquiring the lock (default: 10s, upstream default: 5s) Must be less than renewDeadline |
+| `sidecars.retryIntervalMax` | `30s` | Caps the exponential backoff the provisioner/attacher/resizer sidecars use to retry a FAILED CSI call (e.g. |
+| `sidecars.provisioner.securityContext.runAsNonRoot` | `true` |  |
+| `sidecars.provisioner.securityContext.runAsUser` | `65532` |  |
+| `sidecars.provisioner.image` | `registry.k8s.io/sig-storage/csi-provisioner:v6.3.0` |  |
+| `sidecars.provisioner.timeout` | `300s` |  |
+| `sidecars.provisioner.workerThreads` | `10` |  |
+| `sidecars.provisioner.extraArgs` | `[]` |  |
+| `sidecars.provisioner.resources.requests.cpu` | `10m` |  |
+| `sidecars.provisioner.resources.requests.memory` | `32Mi` |  |
+| `sidecars.provisioner.resources.limits.memory` | `128Mi` |  |
+| `sidecars.attacher.securityContext.runAsNonRoot` | `true` |  |
+| `sidecars.attacher.securityContext.runAsUser` | `65532` |  |
+| `sidecars.attacher.image` | `registry.k8s.io/sig-storage/csi-attacher:v4.13.0` |  |
+| `sidecars.attacher.timeout` | `120s` | Bounds the ControllerPublish/Unpublish (attach/detach) deadline. |
+| `sidecars.attacher.workerThreads` | `10` |  |
+| `sidecars.attacher.extraArgs` | `[]` |  |
+| `sidecars.attacher.resources.requests.cpu` | `10m` |  |
+| `sidecars.attacher.resources.requests.memory` | `32Mi` |  |
+| `sidecars.attacher.resources.limits.memory` | `128Mi` |  |
+| `sidecars.resizer.securityContext.runAsNonRoot` | `true` |  |
+| `sidecars.resizer.securityContext.runAsUser` | `65532` |  |
+| `sidecars.resizer.image` | `registry.k8s.io/sig-storage/csi-resizer:v2.2.1` |  |
+| `sidecars.resizer.timeout` | `120s` | Bounds the ControllerExpandVolume deadline (see attacher note). |
+| `sidecars.resizer.workerThreads` | `10` |  |
+| `sidecars.resizer.extraArgs` | `[]` |  |
+| `sidecars.resizer.resources.requests.cpu` | `10m` |  |
+| `sidecars.resizer.resources.requests.memory` | `32Mi` |  |
+| `sidecars.resizer.resources.limits.memory` | `128Mi` |  |
+| `sidecars.snapshotter.securityContext.runAsNonRoot` | `true` |  |
+| `sidecars.snapshotter.securityContext.runAsUser` | `65532` |  |
+| `sidecars.snapshotter.image` | `registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0` |  |
+| `sidecars.snapshotter.timeout` | `300s` |  |
+| `sidecars.snapshotter.workerThreads` | `10` |  |
+| `sidecars.snapshotter.extraArgs` | `[]` |  |
+| `sidecars.snapshotter.resources.requests.cpu` | `10m` |  |
+| `sidecars.snapshotter.resources.requests.memory` | `32Mi` |  |
+| `sidecars.snapshotter.resources.limits.memory` | `128Mi` |  |
+| `sidecars.nodeDriverRegistrar.securityContext` | `{}` | The registrar creates and removes its registration socket below the mounted /registration hostPath. |
+| `sidecars.nodeDriverRegistrar.healthProbe.enabled` | `true` |  |
+| `sidecars.nodeDriverRegistrar.healthProbe.port` | `9810` |  |
+| `sidecars.nodeDriverRegistrar.image` | `registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0` |  |
+| `sidecars.nodeDriverRegistrar.resources.requests.cpu` | `10m` |  |
+| `sidecars.nodeDriverRegistrar.resources.requests.memory` | `32Mi` |  |
+| `sidecars.nodeDriverRegistrar.resources.limits.memory` | `128Mi` |  |
+| `sidecars.livenessProbe.securityContext.runAsNonRoot` | `true` |  |
+| `sidecars.livenessProbe.securityContext.runAsUser` | `65532` |  |
+| `sidecars.livenessProbe.image` | `registry.k8s.io/sig-storage/livenessprobe:v2.20.0` |  |
+| `sidecars.livenessProbe.resources.requests.cpu` | `10m` |  |
+| `sidecars.livenessProbe.resources.requests.memory` | `32Mi` |  |
+| `sidecars.livenessProbe.resources.limits.memory` | `128Mi` |  |
+| `serviceAccount.create` | `true` | Create service accounts |
+| `serviceAccount.annotations` | `{}` | Annotations for service accounts |
+| `serviceAccount.controllerName` | `""` | Names to use for created or existing component ServiceAccounts |
+| `serviceAccount.nodeName` | `""` |  |
+| `rbac.create` | `true` | Create RBAC resources |
+| `rbac.controllerSecretGet` | `false` | Force the controller's `get` on Secrets on, independently of what the currently rendered StorageClasses declare. |
+| `podSecurityContext.runAsNonRoot` | `false` | Required for mount operations |
+| `podSecurityContext.fsGroup` | `0` |  |
+| `securityContext.privileged` | `true` |  |
+| `securityContext.capabilities.add` | `[SYS_ADMIN]` |  |
+| `health.cacheTTL` | `5s` |  |
+| `debug.listenAddress` | `""` |  |
+| `logging.verbosity` | `2` | Verbosity level (0-10, higher is more verbose) |
+| `metrics.enabled` | `true` | Enable metrics services (creates ClusterIP services for scraping) |
+| `metrics.port` | `9809` | Metrics port (must match health-port in driver args) |
+| `metrics.service.annotations` | `{}` |  |
+| `metrics.serviceMonitor.enabled` | `false` | Create ServiceMonitor resources |
+| `metrics.serviceMonitor.labels` | `{}` | Additional labels for ServiceMonitor (for Prometheus selector) |
+| `metrics.serviceMonitor.interval` | `30s` | Scrape interval |
+| `metrics.serviceMonitor.scrapeTimeout` | `10s` | Scrape timeout |
+| `metrics.prometheusRule.enabled` | `false` |  |
+| `metrics.prometheusRule.additionalLabels` | `{}` |  |
+| `metrics.prometheusRule.rules` | `[]` | Replaces the bundled rules when non-empty |
+| `metrics.prometheusRule.poolUsageThreshold` | `0.85` | Pool-usage alert threshold (fraction 0..1) for ScaleCSIPoolNearFull. |
+| `metrics.prometheusRule.tombstoneBacklogThreshold` | `500` | ScaleCSITombstoneBacklog fires when more than this many tombstones await reap for 30m. |
+| `metrics.prometheusRule.tombstoneOldestAgeSeconds` | `86400` | ScaleCSITombstoneOldestStuck: age in seconds of the oldest tombstone. |
+| `metrics.prometheusRule.tombstoneReapStaleSeconds` | `43200` | ScaleCSITombstoneReapStale: seconds since the last recorded delete-capable pass. |
+| `metrics.dashboards.enabled` | `false` |  |
+| `metrics.dashboards.annotations` | `{}` | ConfigMap annotations such as a Grafana folder selector |
+| `reconcile.enabled` | `true` | Driver-owned replication.run_onetime zombie-job cleanup runs on controller startup and every interval regardless of enabled or delete.enabled. |
+| `reconcile.interval` | `1h` | Interval between controller reconcile passes (including the job sweep). |
+| `reconcile.minOrphanAge` | `24h` | Managed backend objects must be older than this before they are orphaned. |
+| `reconcile.tombstoneMinAge` | `"1h"` | Minimum age of a LEDGER-PROVEN deferred-deletion tombstone before the reaper may destroy it. |
+| `reconcile.alertAfter` | `2h5m` | Prometheus alert hold time. |
+| `reconcile.spentRestore.enabled` | `true` | Classify and (under delete.enabled) reap spent VolSync restore VolumeSnapshots — the volsync-*-dst-dest* objects whose source PVC is Released or gone. |
+| `reconcile.bookkeeping.enabled` | `false` |  |
+| `reconcile.bookkeeping.cleanupParent` | `false` |  |
+| `reconcile.tombstoneReaper.scanFallback.enabled` | `false` |  |
+| `reconcile.repair.maxPerRun` | `5` |  |
+| `reconcile.delete.enabled` | `false` | SAFETY: guarded deletion is opt-in and disabled by default. |
+| `reconcile.delete.schedule` | `"20 4,10,16,22 * * *"` | ~6-hourly with a :20 offset (the production cadence), not hourly or daily. |
+| `reconcile.delete.activeDeadlineSeconds` | `3600` | Guards against concurrencyPolicy: Forbid silently stopping ALL future reconciliation forever: Forbid means a wedged Job is never superseded, only killed by its own deadline. |
+| `reconcile.delete.startingDeadlineSeconds` | `900` | Bounds how late a missed schedule fire (e.g. |
+| `reconcile.delete.maxPerRun` | `1000` | Per-helper DESTRUCTIVE deletion allowance, NOT a single pass-wide ceiling and NOT the always-on repair budget. |
+| `reconcile.delete.reapRecordPollInterval` | `5m` | How often the long-lived controller re-reads the durable last-reap record from .csi-bookkeeping. |
+| `sessionGC.enabled` | `true` | Enable periodic garbage collection (default: true). |
+| `sessionGC.interval` | `300` | Interval between GC runs in seconds (default: 300 = 5 minutes) |
+| `sessionGC.gracePeriod` | `60` | Grace period before cleaning up orphaned sessions in seconds (default: 60) Sessions must be orphaned for this duration before cleanup |
+| `sessionGC.dryRun` | `false` | Dry run mode - logs orphaned sessions without disconnecting (default: false) Useful for monitoring without taking action |
+| `sessionGC.runOnStartup` | `true` | Run garbage collection once during startup |
+| `sessionGC.startupDelay` | `5` | Delay before startup garbage collection in seconds |
+| `sessionGC.iscsiEnabled` | `true` | Enable protocol-specific session collection |
+| `sessionGC.nvmeofEnabled` | `true` |  |
+| `resilience.circuitBreaker.enabled` | `false` | The driver currently defaults to disabled when this key is absent |
+| `resilience.circuitBreaker.failureThreshold` | `5` |  |
+| `resilience.circuitBreaker.timeout` | `30` |  |
+| `resilience.retry.maxAttempts` | `3` |  |
+| `resilience.retry.initialDelay` | `500` |  |
+| `resilience.retry.maxDelay` | `5000` |  |
+| `resilience.retry.backoffMultiplier` | `2.0` |  |
+| `resilience.rateLimiting.maxConcurrentLogins` | `2` | MaxConcurrentRequests was removed: it was never wired to anything. |
+| `commandTimeouts.mount` | `30` |  |
+| `commandTimeouts.format` | `300` |  |
+| `commandTimeouts.iscsi` | `10` |  |
+| `commandTimeouts.nvme` | `30` |  |
 
-The controller keeps publication records as `VolumePublication` objects (CRD
-in `crds/`). Helm installs `crds/` on a first install but never on an upgrade:
-apply the CRD before upgrading from a release without it, or with Flux set the
-HelmRelease's `install.crds` and `upgrade.crds` to `CreateReplace`. The
-controller refuses to start without it.
-
-```bash
-kubectl apply -f https://raw.githubusercontent.com/GizmoTickler/scale-csi/<tag>/charts/scale-csi/crds/volumepublications.scale-csi.io.yaml
-helm upgrade scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
-  --namespace scale-csi \
-  -f values.yaml
-
-helm uninstall scale-csi --namespace scale-csi
-```
-
-PVCs and their data are not deleted merely because the chart is uninstalled.
+<!-- END GENERATED VALUES TABLE -->
