@@ -1,5 +1,88 @@
 # Release notes — next (v1.24.1 draft)
 
+## v1.25.0 (draft) — NVMe/TCP request-size clamp for TrueNAS 27 (`nvmeof.maxSectorsKB`)
+
+New chart value `nvmeof.maxSectorsKB` (default `auto`); nothing to configure
+for the fix to apply. Both node agents (the Rust agent, the default, and the Go
+node plugin).
+
+### Problem
+
+TrueNAS 27.0.0-RC.1 ships Linux 6.18.52. Its NVMe/TCP target
+(`nvmet_tcp_map_data()`) now rejects any command carrying more than
+`NVMET_TCP_MAXH2CDATA` (4 MiB) of data with `NVME_SC_SGL_INVALID_DATA | DNR`,
+while Identify Controller still reports MDTS=0 (no limit). A Linux initiator
+trusts MDTS, leaves `max_sectors_kb` at 32768 and issues commands of up to
+32 MiB: `I/O Error (sct 0x0 / sc 0xf) DNR`, ext4 aborts its journal and
+remounts read-only, Postgres crash-loops. A freshly staged volume failed
+within about five seconds of mounting.
+
+The size that reaches the wire is bounded by the hidden PATH devices
+(`nvme<S>c<C>n<N>`), not only by the multipath head (`nvme<S>n<N>`): with the
+head capped at 4096 KiB and the paths left at 32768, a 12 MiB write still went
+out on a path (its request queue merges bios back up to its own limit). Path
+devices have no `/dev` node and send no uevents, so udev cannot fix this, and
+there is no `nvme_core`/`nvme_tcp` module parameter for it.
+
+### Fix
+
+- **The stage clamps every device of the subsystem before anything uses it.**
+  After the paths are connected and before the volume is formatted, mounted
+  or linked for raw-block publish, the node writes `queue/max_sectors_kb` on
+  the head and on every path device under every controller of the subsystem
+  (found through `/sys/class/nvme-subsystem/<subsys>/<controller>/`; every
+  subsystem directory carrying the NQN, so `nvme_core.multipath=N` is covered
+  too). It waits (up to 10 s) for every live controller's path device, since
+  the namespace scan that creates it runs after `nvme connect` returns.
+- **`auto` (default):** NVMe/TCP subsystems are clamped to 4096 KiB when the
+  controller reports MDTS=0 (`nvme id-ctrl -o json`, asked of one live
+  controller, and only when some device is above 4096, so a converged
+  subsystem costs sysfs reads only). If MDTS cannot be read the clamp applies
+  anyway. A controller that reports MDTS is left alone: the kernel honors it.
+  RDMA is left alone. **A whole number** is a fixed ceiling for every
+  subsystem, any transport. **`off` / `0`** disables it. A value is only ever
+  lowered, never raised.
+- **Fail-safe.** A clamp that is required and cannot be proven in place (a
+  write fails or reads back higher, the subsystem or a live path's device is
+  missing) fails the stage with `Internal` and a `NVMeMaxSectorsClampFailed`
+  event naming the device; kubelet retries. The volume is never mounted
+  unprotected.
+- **Re-stage and interchange.** Every replay of a stage (already mounted, raw
+  block already linked, kubelet retry, plugin restart) re-applies the clamp
+  after topping up missing paths, so a path device the top-up just created is
+  covered. The clamp reads and writes kernel state only, so a volume connected
+  by one node agent and re-staged by the other converges the same way; both
+  run the same vectors (`pkg/util/testdata/nvme_max_sectors_vectors.json`).
+- **Path devices created later.** A controller reconnect keeps its path
+  device (`ctrl_loss_tmo=-1` never deletes a controller), so new path devices
+  come only from a connect: the re-stage top-up (clamped inline) or a connect
+  made outside the plugin, which the session-GC tick (`sessionGC.interval`,
+  default 300 s) clamps on subsystems staged under this driver. `sessionGC.dryRun`
+  only logs.
+- **Observability.** One info line per stage with every device's before and
+  after value (`NVMe-oF max_sectors_kb for <nqn>: policy=auto transport=tcp
+  mdts=0 limit=4096KiB changed=5 devices=[nvme3c3n1 32768->4096, ...]`);
+  `scale_csi_nvme_controller_tunable_corrections_total{tunable="max_sectors_kb"}`
+  counts lowered devices (`corrected`) and failed clamps (`error`).
+- The ublk data path is unaffected (its own initiator, no kernel path devices).
+
+### Upgrade notes
+
+- Upgrade the node plugin before, or together with, TrueNAS 27. Volumes staged
+  by an older release are clamped on their next re-stage or the next
+  session-GC tick after the upgrade; to protect a node immediately, write
+  `4096` to `queue/max_sectors_kb` of each head and path device by hand (see
+  the troubleshooting entry).
+- The ConfigMap carries `maxSectorsKB` only when it is not `auto`, so a
+  default install's ConfigMap is unchanged. A rolled-back binary rejects the
+  key (strict parsing): remove a non-default value before rolling back.
+- Chart schema: a string `auto`, `off`, or a whole number (0, or at least 4).
+
+### Rolling back
+
+Rolled back, nothing clamps any more; values already written stay until the
+device goes away (a disconnect, a reboot).
+
 ## v1.24.1 (draft) — an NVMe-oF head disk outlives its first path, also on expand
 
 Nothing to configure. Two fixes to the same mistake, in both node agents

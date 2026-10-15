@@ -698,3 +698,169 @@ async fn a_stage_right_after_a_handover_waits_for_the_current_node() {
         }
     }
 }
+
+fn kernel<R>(n: &Node, f: impl FnOnce(&mut crate::testing::FakeKernel) -> R) -> R {
+    f(n.host.0.lock().unwrap().kernel.as_mut().unwrap())
+}
+
+fn all_at(n: &Node, kb: &str) -> bool {
+    kernel(n, |k| k.max_sectors_kb(NQN)).values().all(|v| v == kb)
+}
+
+/// The TrueNAS 27 incident: MDTS=0 over TCP leaves the head and every path
+/// device at 32768 KiB, and the target rejects anything above 4 MiB. The
+/// stage clamps the head AND every path device before mkfs and the mount.
+#[tokio::test]
+async fn a_multipath_stage_clamps_every_path_before_the_filesystem_is_touched() {
+    let n = kernel_node(MULTI);
+    node_stage(&n.state, &stage_request(&n, filesystem(), Some(HINT)), None)
+        .await
+        .unwrap();
+    let values = kernel(&n, |k| k.max_sectors_kb(NQN));
+    assert_eq!(values.len(), 4, "the head and three path devices: {values:?}");
+    assert!(values.values().all(|v| v == "4096"), "{values:?}");
+    let calls = n.host.calls();
+    let at = |prefix: &str| calls.iter().position(|c| c.starts_with(prefix));
+    let id_ctrl = at("nvme id-ctrl").expect("MDTS was read");
+    assert!(id_ctrl > at("nvme connect").unwrap());
+    assert!(id_ctrl < at("mkfs.ext4").unwrap(), "{calls:?}");
+    assert!(id_ctrl < at("mount").unwrap(), "{calls:?}");
+    assert_eq!(n.state.metrics.tunable_corrections("max_sectors_kb", "corrected"), 4);
+}
+
+#[tokio::test]
+async fn a_raw_block_stage_is_clamped_before_its_link_exists() {
+    let n = kernel_node(SINGLE);
+    node_stage(&n.state, &stage_request(&n, block(), None), None)
+        .await
+        .unwrap();
+    assert!(all_at(&n, "4096"), "{:?}", kernel(&n, |k| k.max_sectors_kb(NQN)));
+}
+
+/// A controller that reports MDTS is honored by the kernel; auto leaves it.
+#[tokio::test]
+async fn a_reported_mdts_is_left_to_the_kernel() {
+    let n = kernel_node(MULTI);
+    kernel(&n, |k| k.mdts = Some(5));
+    node_stage(&n.state, &stage_request(&n, filesystem(), Some(HINT)), None)
+        .await
+        .unwrap();
+    assert!(all_at(&n, "32768"));
+}
+
+#[tokio::test]
+async fn the_clamp_can_be_turned_off() {
+    let n = kernel_node(&format!("{MULTI}  maxSectorsKB: \"off\"\n"));
+    node_stage(&n.state, &stage_request(&n, filesystem(), Some(HINT)), None)
+        .await
+        .unwrap();
+    assert!(all_at(&n, "32768"));
+    assert!(!nvme_calls(&n).iter().any(|c| c.starts_with("nvme id-ctrl")));
+}
+
+#[tokio::test]
+async fn a_fixed_ceiling_applies_whatever_the_mdts() {
+    let n = kernel_node(&format!("{MULTI}  maxSectorsKB: 1024\n"));
+    kernel(&n, |k| k.mdts = Some(5));
+    node_stage(&n.state, &stage_request(&n, filesystem(), Some(HINT)), None)
+        .await
+        .unwrap();
+    assert!(all_at(&n, "1024"));
+}
+
+/// A clamp that is required and cannot be written fails the stage: nothing is
+/// formatted, mounted or linked.
+#[tokio::test]
+async fn a_clamp_that_cannot_be_applied_fails_the_stage() {
+    for capability in [filesystem(), block()] {
+        let n = kernel_node(MULTI);
+        let controller = kernel(&n, |k| {
+            k.add_live(NQN, "192.0.2.20");
+            k.subsystems[NQN].1[0].0.clone()
+        });
+        let queue = n
+            .dir
+            .path()
+            .join("sys/class/nvme")
+            .join(&controller)
+            .join("nvme0c0n1/queue/max_sectors_kb");
+        std::fs::remove_file(&queue).unwrap();
+        std::fs::create_dir(&queue).unwrap();
+        let err = node_stage(&n.state, &stage_request(&n, capability, Some(HINT)), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(
+            err.message().contains("without its request-size clamp") && err.message().contains("nvme0c0n1"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            !n.host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mkfs") || c.starts_with("mount"))
+        );
+        assert!(
+            !std::fs::symlink_metadata(n.path("staging/globalmount")).is_ok_and(|m| m.file_type().is_symlink()),
+            "no raw-block link for a pod to publish"
+        );
+        assert!(!n.host.is_mounted(&n.path("staging/globalmount")));
+        assert!(
+            n.events
+                .take()
+                .iter()
+                .any(|(_, reason, _)| reason == events::REASON_NVME_MAX_SECTORS_CLAMP_FAILED)
+        );
+        assert_eq!(n.state.metrics.tunable_corrections("max_sectors_kb", "error"), 1);
+    }
+}
+
+/// A replay converges a subsystem staged without the clamp (by an older
+/// release, or by the Go plugin with the clamp off) and a path device that
+/// appeared since: the clamp reads kernel state, not agent records.
+#[tokio::test]
+async fn a_replay_converges_a_subsystem_staged_without_the_clamp() {
+    for capability in [filesystem(), block()] {
+        let n = kernel_node(MULTI);
+        kernel(&n, |k| k.unreachable = vec!["192.0.2.22".into()]);
+        node_stage(&n.state, &stage_request(&n, capability.clone(), Some(HINT)), None)
+            .await
+            .unwrap();
+        // Another agent had staged it unclamped.
+        let sys = n.dir.path().join("sys");
+        let paths: Vec<_> = kernel(&n, |k| k.max_sectors_kb(NQN)).into_keys().collect();
+        for entry in walk(&sys) {
+            if entry.ends_with("queue/max_sectors_kb") {
+                std::fs::write(&entry, "32768\n").unwrap();
+            }
+        }
+        assert_eq!(paths.len(), 3);
+        // The missing path comes back: the replay connects it, and its new path
+        // device is clamped with the rest.
+        kernel(&n, |k| k.unreachable.clear());
+        node_stage(&n.state, &stage_request(&n, capability, Some(HINT)), None)
+            .await
+            .unwrap();
+        let values = kernel(&n, |k| k.max_sectors_kb(NQN));
+        assert_eq!(values.len(), 4, "{values:?}");
+        assert!(values.values().all(|v| v == "4096"), "{values:?}");
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Real directories only: the subsystem links its controllers.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => out.extend(walk(&path)),
+            Ok(t) if t.is_file() => out.push(path),
+            _ => {}
+        }
+    }
+    out
+}

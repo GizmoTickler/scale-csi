@@ -187,6 +187,12 @@ pub struct NvmeofConfig {
     pub device_wait_timeout: i64,
     pub connect: ConnectConfig,
     pub ublk: UblkConfig,
+    /// `maxSectorsKB` as written: `auto`, `off`, or a number (string or
+    /// integer). Parsed into `max_sectors` by `parse`.
+    #[serde(rename = "maxSectorsKB")]
+    pub max_sectors_kb: Option<Value>,
+    #[serde(skip)]
+    pub max_sectors: crate::max_sectors::Policy,
 }
 
 /// `nvmeof.connect`: knobs for `nvme connect`.
@@ -337,6 +343,8 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
     };
     let mut nvmeof: NvmeofConfig = serde_json::from_value(section("nvmeof")).context("config nvmeof")?;
     nvmeof.enabled = enabled("nvmeof")?;
+    nvmeof.max_sectors =
+        crate::max_sectors::Policy::from_config(nvmeof.max_sectors_kb.as_ref()).map_err(anyhow::Error::msg)?;
     let nfs: NfsConfig = serde_json::from_value(section("nfs")).context("config nfs")?;
     let node: NodeConfig = serde_json::from_value(section("node")).context("config node")?;
     let command_timeouts: CommandTimeouts =
@@ -622,10 +630,27 @@ mod tests {
             "nvmeof: {enabled: maybe}",
             "node: {maxVolumesPerNode: -1}",
             "nvmeof: {ublk: {enabled: true, depth: 4097}}",
+            "nvmeof: {maxSectorsKB: 3}",
+            "nvmeof: {maxSectorsKB: -1}",
+            "nvmeof: {maxSectorsKB: 4k}",
+            "nvmeof: {maxSectorsKB: true}",
             "- a list",
         ] {
             assert!(parse(bad, env).is_err(), "{bad:?} was accepted");
         }
+    }
+
+    #[test]
+    fn max_sectors_kb() {
+        use crate::max_sectors::Policy;
+        let policy = |yaml: &str| parse(yaml, env).unwrap().nvmeof.max_sectors;
+        assert_eq!(policy("nvmeof: {}"), Policy::Auto, "absent is auto");
+        assert_eq!(policy("nvmeof: {maxSectorsKB: null}"), Policy::Auto);
+        assert_eq!(policy("nvmeof: {maxSectorsKB: auto}"), Policy::Auto);
+        assert_eq!(policy("nvmeof: {maxSectorsKB: off}"), Policy::Off);
+        assert_eq!(policy("nvmeof: {maxSectorsKB: 0}"), Policy::Off);
+        assert_eq!(policy("nvmeof: {maxSectorsKB: 2048}"), Policy::Fixed(2048));
+        assert_eq!(policy("nvmeof: {maxSectorsKB: \"2048\"}"), Policy::Fixed(2048));
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //! identity cannot be read makes the set incomplete, and the pass is skipped.
 //!
 //! Every tick also converges `fast_io_fail_tmo` on controllers this driver
-//! staged, to the value a fresh connect would set.
+//! staged, to the value a fresh connect would set, and the request-size clamp
+//! (`nvmeof.maxSectorsKB`) on the subsystems this driver staged.
 //!
 //! The kubelet directory comes from the CSI socket path
 //! (`<kubelet>/plugins/<driver>/csi.sock`); the Go node hard-codes
@@ -530,6 +531,60 @@ pub async fn reconcile_tunables(state: &State) {
     }
 }
 
+/// Re-applies the request-size clamp to every subsystem staged under this
+/// driver (Go reconcileNVMeoFMaxSectors). Path devices survive a controller
+/// reconnect (ctrl_loss_tmo=-1 never deletes a controller, and on current
+/// kernels the block layer keeps a user-set max_sectors_kb across the
+/// namespace revalidation),
+/// so the only new path devices are those of controllers connected after the
+/// stage: a re-stage top-up, which clamps inline, or a connect made outside
+/// this plugin, which this pass catches. A dry run only logs.
+pub async fn reconcile_max_sectors(state: &State) {
+    let n = &state.config.nvmeof;
+    if n.transport_address.is_empty() || n.max_sectors == crate::max_sectors::Policy::Off {
+        return;
+    }
+    let owned = match staged_by_this_driver(state).await {
+        Ok(owned) => owned,
+        Err(e) => {
+            warn!("NVMe-oF max_sectors_kb: cannot prove subsystem ownership, skipping this pass: {e:#}");
+            return;
+        }
+    };
+    if state.config.session_gc.dry_run {
+        if !owned.is_empty() {
+            info!(
+                "NVMe-oF max_sectors_kb (dry run): would converge {} staged subsystem(s) to nvmeof.maxSectorsKB={}",
+                owned.len(),
+                n.max_sectors
+            );
+        }
+        return;
+    }
+    let mut owned: Vec<String> = owned.into_iter().collect();
+    owned.sort();
+    for nqn in owned {
+        let options = crate::max_sectors::ClampOptions {
+            policy: n.max_sectors,
+            transport: &n.transport,
+            path_wait: std::time::Duration::ZERO,
+            deadline: None,
+        };
+        match crate::max_sectors::clamp(&state.nvme, &nqn, &options).await {
+            Ok(report) => {
+                crate::nvme_kernel::record_max_sectors(state, &report, false);
+                if report.changed() > 0 {
+                    info!("NVMe-oF max_sectors_kb for {nqn} (reconcile): {report}");
+                }
+            }
+            Err(failure) => {
+                crate::nvme_kernel::record_max_sectors(state, &failure.report, true);
+                warn!("NVMe-oF max_sectors_kb: {failure}");
+            }
+        }
+    }
+}
+
 /// One tick: iSCSI GC, NVMe-oF GC (or only their gauges), then the tunables.
 pub async fn pass(state: &State, cleanup: bool, stop: &watch::Receiver<bool>) {
     let gc = &state.config.session_gc;
@@ -556,6 +611,9 @@ pub async fn pass(state: &State, cleanup: bool, stop: &watch::Receiver<bool>) {
     }
     if !*stop.borrow() {
         reconcile_tunables(state).await;
+    }
+    if !*stop.borrow() {
+        reconcile_max_sectors(state).await;
     }
 }
 

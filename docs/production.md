@@ -165,6 +165,18 @@ iSCSI; or `nvme-cli` and the `nvme_tcp`/`nvme_fabrics` modules for NVMe/TCP.
 The chart mounts the host device, sysfs, udev, kubelet, and iSCSI paths; it does
 not install host packages or load modules.
 
+### NVMe/TCP request size on TrueNAS 27
+
+TrueNAS 27.0 (Linux 6.18 nvmet) rejects NVMe/TCP commands larger than 4 MiB
+with "SGL invalid data" while still reporting MDTS=0. Linux initiators then
+issue up to 32 MiB commands, and the volume's filesystem goes read-only on the
+first one. The node plugin clamps `queue/max_sectors_kb` to 4096 KiB on the
+multipath head and every path device before a volume is mounted or published
+(`nvmeof.maxSectorsKB: auto`, the default; both node agents). Keep it on for
+TrueNAS 27; it is a no-op for targets that report MDTS and for RDMA. Releases
+before v1.25.0 have no clamp: upgrade the node plugin before (or together with)
+TrueNAS 27. See the troubleshooting entry "NVMe-oF I/O errors (`sc 0xf`)".
+
 ### iSCSI multipath host prerequisites
 
 `iscsi.multipath` is an opt-in dm-multipath flow, not an imitation of NVMe's

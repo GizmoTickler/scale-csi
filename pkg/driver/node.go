@@ -741,6 +741,17 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			// its own multipath.
 			if !d.isNVMeUblkStaged(stagingPath) {
 				d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
+				// The replay converges the request-size clamp too: a volume
+				// the Rust agent (or an older release) staged unclamped, or a
+				// path device the top-up above just created. Required and
+				// not in place, the replay fails rather than report ready.
+				transport := stageContext["transport"]
+				if transport == "" {
+					transport = "tcp"
+				}
+				if err := d.clampNVMeoFMaxSectors(ctx, stageContext["nqn"], transport, eventObject); err != nil {
+					return nil, err
+				}
 			}
 		}
 		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
@@ -2514,6 +2525,13 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 		if len(multipathAddresses) > 0 {
 			d.convergeExistingNVMeoFPaths(ctx, volumeContext, eventObjects...)
 		}
+		// A replay (kubelet retry, plugin restart, or a volume the other node
+		// agent staged) still converges the clamp: the top-up above may have
+		// added a path device, and a volume staged before the clamp existed
+		// is protected from here on.
+		if clampErr := d.clampNVMeoFMaxSectors(ctx, nqn, transport, eventObjects...); clampErr != nil {
+			return clampErr
+		}
 		klog.Infof("NVMe-oF volume already mounted at %s", stagingPath)
 		return nil
 	}
@@ -2530,6 +2548,9 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 			if infoErr == nil && findErr == nil && stagedNQN == nqn {
 				if len(multipathAddresses) > 0 {
 					d.convergeExistingNVMeoFPaths(ctx, volumeContext, eventObjects...)
+				}
+				if clampErr := d.clampNVMeoFMaxSectors(ctx, nqn, transport, eventObjects...); clampErr != nil {
+					return clampErr
 				}
 				klog.Infof("NVMe-oF block volume already staged at %s", stagingPath)
 				return nil
@@ -2578,6 +2599,13 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 		d.recordNVMePathFailures(firstEventObject(eventObjects), nqn, pathFailures)
 	}
 
+	// Every requested path is connected (or has failed) at this point; clamp
+	// the request size on the head and every path device BEFORE anything can
+	// issue I/O through them: mkfs, the mount's journal replay, or a pod on
+	// the raw-block link.
+	if err := d.clampNVMeoFMaxSectors(ctx, nqn, transport, eventObjects...); err != nil {
+		return err
+	}
 	if err := d.finalizeStagedDevice(ctx, devicePath, stagingPath, volCap, eventObjects...); err != nil {
 		return err
 	}

@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::session_gc::{gc_nvmeof, kubelet_dir_of, pass, reconcile_tunables, staged_block_devices};
+use crate::session_gc::{
+    gc_nvmeof, kubelet_dir_of, pass, reconcile_max_sectors, reconcile_tunables, staged_block_devices,
+};
 use crate::testing::{FakeKernel, HOST_NQN, NQN, Node, node};
 
 const GC: &str = "nvmeof:\n  transportAddress: 192.0.2.20\nsessionGC:\n  enabled: true\n  gracePeriod: 1\n";
@@ -249,4 +251,47 @@ fn staged_links_are_found_and_mounts_are_not_descended() {
     std::os::unix::fs::symlink("/nonexistent/nvme3n1", root.join("drv/a/dev/stale")).unwrap();
     assert!(staged_block_devices(&root, &dev).is_err());
     assert!(staged_block_devices(&dir.path().join("none"), &dev).unwrap().is_empty());
+}
+
+/// A path device created after the stage (a connect made outside it) keeps
+/// the 32 MiB default; the tick clamps it, on this driver's subsystems only.
+#[tokio::test]
+async fn max_sectors_converges_on_this_drivers_subsystems_only() {
+    let n = gc_node("nvmeof:\n  transportAddress: 192.0.2.20\n");
+    kernel(&n, |k| {
+        k.add_live(NQN, "192.0.2.20");
+        k.add_live(NQN, "192.0.2.21");
+        k.add_live("nqn.foreign", "192.0.2.20");
+    });
+    let device = kernel(&n, |k| k.device(NQN).unwrap());
+    stage_link(&n, &device);
+    reconcile_max_sectors(&n.state).await;
+    let ours = kernel(&n, |k| k.max_sectors_kb(NQN));
+    assert!(ours.values().all(|v| v == "4096"), "{ours:?}");
+    let foreign = kernel(&n, |k| k.max_sectors_kb("nqn.foreign"));
+    assert!(foreign.values().all(|v| v == "32768"), "not ours: {foreign:?}");
+    assert_eq!(n.state.metrics.tunable_corrections("max_sectors_kb", "corrected"), 3);
+
+    // Converged: nothing more to do, and no id-ctrl.
+    let id_ctrl = |n: &Node| n.host.calls().iter().filter(|c| c.starts_with("nvme id-ctrl")).count();
+    let before = id_ctrl(&n);
+    reconcile_max_sectors(&n.state).await;
+    assert_eq!(id_ctrl(&n), before);
+    assert_eq!(n.state.metrics.tunable_corrections("max_sectors_kb", "corrected"), 3);
+}
+
+#[tokio::test]
+async fn max_sectors_dry_run_and_off_write_nothing() {
+    for config in [
+        "nvmeof:\n  transportAddress: 192.0.2.20\nsessionGC:\n  dryRun: true\n",
+        "nvmeof:\n  transportAddress: 192.0.2.20\n  maxSectorsKB: \"off\"\n",
+    ] {
+        let n = gc_node(config);
+        kernel(&n, |k| k.add_live(NQN, "192.0.2.20"));
+        let device = kernel(&n, |k| k.device(NQN).unwrap());
+        stage_link(&n, &device);
+        pass(&n.state, true, &stop()).await;
+        let values = kernel(&n, |k| k.max_sectors_kb(NQN));
+        assert!(values.values().all(|v| v == "32768"), "{config}: {values:?}");
+    }
 }

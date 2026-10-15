@@ -17,6 +17,7 @@ pub mod iscsi_stage;
 pub mod kube_api;
 pub mod kube_events;
 pub mod locks;
+pub mod max_sectors;
 pub mod metrics;
 pub mod mount;
 pub mod nfs;

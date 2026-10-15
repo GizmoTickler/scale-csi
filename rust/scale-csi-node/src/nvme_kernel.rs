@@ -12,6 +12,10 @@
 //!   share one device-wait budget, the first missing one gets the full budget,
 //!   the rest share 5 s. Success needs one connected path and a device; a path
 //!   that failed is an `NVMePathDegraded` event, not a failure.
+//! - Before the device is formatted, mounted or linked, and on every replay,
+//!   the request size is clamped on the head and every path device
+//!   (`nvmeof.maxSectorsKB`, see [`crate::max_sectors`]); a clamp that is
+//!   required and not in place fails the stage.
 //! - After the stage, multipath subsystems get the `queue-depth` iopolicy, and
 //!   paths split across subsystem directories (nvme_core.multipath=N) are an
 //!   `NVMeMultipathUnaggregated` event.
@@ -25,6 +29,7 @@ use tonic::Status;
 
 use crate::csi;
 use crate::events::{self, ObjectRef};
+use crate::max_sectors;
 use crate::nvme::{self, ConnectOptions, Subsystem, Target};
 use crate::nvme_addresses::parse_multipath_addresses;
 use crate::service::State;
@@ -36,6 +41,66 @@ pub const REASON_MULTIPATH_UNAGGREGATED: &str = "NVMeMultipathUnaggregated";
 
 /// Secondary paths share this budget after the first missing path.
 pub const SECONDARY_PATH_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the clamp waits for every live controller of the subsystem to
+/// expose its path device: `nvme connect` returns before the namespace scan
+/// that creates it has finished, and a path device created after the clamp
+/// would keep the 32 MiB default.
+pub const MAX_SECTORS_PATH_WAIT: Duration = Duration::from_secs(10);
+
+pub(crate) fn record_max_sectors(state: &State, report: &max_sectors::Report, failed: bool) {
+    for _ in 0..report.changed() {
+        state.metrics.record_tunable_correction("max_sectors_kb", "corrected");
+    }
+    if failed {
+        state.metrics.record_tunable_correction("max_sectors_kb", "error");
+    }
+}
+
+/// Puts the request-size clamp in place on a subsystem that is about to be
+/// (or already is) staged (Go clampNVMeoFMaxSectors). It reads and writes
+/// kernel state only, so it converges a subsystem whichever node agent
+/// connected it. A required clamp that is not in place fails the stage rather
+/// than mount a volume whose next large write the target would reject.
+pub(crate) async fn clamp_max_sectors(
+    state: &State,
+    nqn: &str,
+    transport: &str,
+    event: Option<&ObjectRef>,
+    deadline: Option<Instant>,
+) -> Result<(), Status> {
+    let policy = state.config.nvmeof.max_sectors;
+    if policy == max_sectors::Policy::Off {
+        debug!("NVMe-oF max_sectors_kb for {nqn}: clamp disabled (nvmeof.maxSectorsKB=off)");
+        return Ok(());
+    }
+    let options = max_sectors::ClampOptions {
+        policy,
+        transport,
+        path_wait: MAX_SECTORS_PATH_WAIT,
+        deadline,
+    };
+    match max_sectors::clamp(&state.nvme, nqn, &options).await {
+        Ok(report) => {
+            record_max_sectors(state, &report, false);
+            info!("NVMe-oF max_sectors_kb for {nqn}: {report}");
+            Ok(())
+        }
+        Err(failure) => {
+            record_max_sectors(state, &failure.report, true);
+            let status = Status::internal(format!(
+                "refusing to stage NVMe-oF subsystem {nqn} without its request-size clamp (nvmeof.maxSectorsKB={policy}); kubelet retries the stage: {failure}"
+            ));
+            warn_event(
+                state,
+                event,
+                events::REASON_NVME_MAX_SECTORS_CLAMP_FAILED,
+                status.message(),
+            );
+            Err(status)
+        }
+    }
+}
 
 /// `nvme connect`'s knobs from the config (Go nvmeConnectOptions):
 /// `fast_io_fail_tmo` 0 means 15 s with multipath configured and omitted
@@ -422,6 +487,18 @@ pub async fn converge_existing(
     tune_multipath(state, nqn, subsystems, event, deadline).await;
 }
 
+/// The request-size clamp on a volume that is already staged (a replay).
+pub async fn clamp_existing(
+    state: &State,
+    context: &HashMap<String, String>,
+    event: Option<&ObjectRef>,
+    deadline: Option<Instant>,
+) -> Result<(), Status> {
+    let nqn = context.get("nqn").map(String::as_str).unwrap_or_default();
+    let (transport, _) = transport_and_port(context);
+    clamp_max_sectors(state, nqn, &transport, event, deadline).await
+}
+
 /// Stages a volume through the kernel initiator.
 pub async fn stage(state: &State, req: StageRequest<'_>) -> Result<(), Status> {
     let get = |k: &str| req.context.get(k).map(String::as_str).unwrap_or_default();
@@ -458,6 +535,11 @@ pub async fn stage(state: &State, req: StageRequest<'_>) -> Result<(), Status> {
         if !addresses.is_empty() {
             converge_existing(state, req.context, req.event, req.deadline).await;
         }
+        // A replay (a kubelet retry, a restart, or a volume the Go plugin
+        // staged) converges the clamp too: the top-up may have added a path
+        // device, and a volume staged before the clamp existed is protected
+        // from here on.
+        clamp_max_sectors(state, nqn, &transport, req.event, req.deadline).await?;
         info!("NVMe-oF volume already mounted at {}", req.staging);
         return Ok(());
     }
@@ -472,6 +554,7 @@ pub async fn stage(state: &State, req: StageRequest<'_>) -> Result<(), Status> {
         if !addresses.is_empty() {
             converge_existing(state, req.context, req.event, req.deadline).await;
         }
+        clamp_max_sectors(state, nqn, &transport, req.event, req.deadline).await?;
         info!("NVMe-oF block volume already staged at {}", req.staging);
         return Ok(());
     }
@@ -532,6 +615,11 @@ pub async fn stage(state: &State, req: StageRequest<'_>) -> Result<(), Status> {
     state.metrics.record_node_connect(TRANSPORT_LABEL, "success");
     record_path_failures(state, req.event, nqn, &failures);
 
+    // Every requested path is connected (or has failed): clamp the request
+    // size on the head and every path device BEFORE anything issues I/O
+    // through them (mkfs, the mount's journal replay, a pod on the raw-block
+    // link).
+    clamp_max_sectors(state, nqn, &transport, req.event, req.deadline).await?;
     finalize_staged_device(&state.mounter, &device, req.staging, req.capability, req.deadline).await?;
     if !addresses.is_empty() {
         tune_multipath(state, nqn, subsystems, req.event, req.deadline).await;

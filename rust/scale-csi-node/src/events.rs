@@ -10,6 +10,9 @@ use log::warn;
 
 pub const REASON_NVME_CONNECT_FAILED: &str = "NVMeConnectFailed";
 pub const REASON_NVME_PATH_DEGRADED: &str = "NVMePathDegraded";
+/// A stage refused: the request-size clamp (`nvmeof.maxSectorsKB`) is required
+/// and is not in place on every device of the subsystem.
+pub const REASON_NVME_MAX_SECTORS_CLAMP_FAILED: &str = "NVMeMaxSectorsClampFailed";
 pub const REASON_NFS_MOUNT_FAILED: &str = "NFSMountFailed";
 pub const REASON_NFS_TRUNKING_DEGRADED: &str = "NFSTrunkingDegraded";
 pub const REASON_NFS_TRUNKING_UNAVAILABLE: &str = "NFSTrunkingUnavailable";
