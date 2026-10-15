@@ -1,0 +1,425 @@
+{
+  "_comment": "nvmeof.maxSectorsKB clamp vectors. Both node agents run every vector against a fake sysfs built from it: pkg/util/nvme_max_sectors_test.go (TestNVMeMaxSectorsVectors) and rust/scale-csi-node/src/max_sectors.rs (vectors_match_the_go_agent). A volume may be staged by either agent on the same node, so both must leave the same queue limits behind. mdts null means `nvme id-ctrl` fails; an unwritable device's max_sectors_kb is neither readable nor writable (-1 after). after lists every device in the tree, including other subsystems.",
+  "vectors": [
+    {
+      "name": "auto, MDTS=0, head and four paths are all lowered",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys3",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme3n1": 32768},
+          "controllers": [
+            {"name": "nvme3", "state": "live", "transport": "tcp", "paths": {"nvme3c3n1": 32768}},
+            {"name": "nvme4", "state": "live", "transport": "tcp", "paths": {"nvme3c4n1": 32768}},
+            {"name": "nvme5", "state": "live", "transport": "tcp", "paths": {"nvme3c5n1": 32768}},
+            {"name": "nvme6", "state": "live", "transport": "tcp", "paths": {"nvme3c6n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme3n1": 4096, "nvme3c3n1": 4096, "nvme3c4n1": 4096, "nvme3c5n1": 4096, "nvme3c6n1": 4096}
+      }
+    },
+    {
+      "name": "auto, the head already clamped but a path is not (the live incident shape)",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys3",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme3n1": 4096},
+          "controllers": [
+            {"name": "nvme3", "state": "live", "transport": "tcp", "paths": {"nvme3c3n1": 32768}},
+            {"name": "nvme4", "state": "live", "transport": "tcp", "paths": {"nvme3c4n1": 4096}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme3n1": 4096, "nvme3c3n1": 4096, "nvme3c4n1": 4096}
+      }
+    },
+    {
+      "name": "auto, a value below the ceiling is never raised",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys1",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme1n1": 32768},
+          "controllers": [
+            {"name": "nvme1", "state": "live", "transport": "tcp", "paths": {"nvme1c1n1": 1024}},
+            {"name": "nvme2", "state": "live", "transport": "tcp", "paths": {"nvme1c2n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme1n1": 4096, "nvme1c1n1": 1024, "nvme1c2n1": 4096}
+      }
+    },
+    {
+      "name": "auto, MDTS reported: the kernel honors it, nothing is touched",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 11,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 8192},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 8192}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 0,
+        "skipped": true,
+        "after": {"nvme0n1": 8192, "nvme0c0n1": 8192}
+      }
+    },
+    {
+      "name": "auto, MDTS cannot be read: clamp anyway",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": null,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme0n1": 4096, "nvme0c0n1": 4096}
+      }
+    },
+    {
+      "name": "auto, everything already within the ceiling: MDTS is not even asked",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 4096},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 512}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": false,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme0n1": 4096, "nvme0c0n1": 512}
+      }
+    },
+    {
+      "name": "auto leaves an RDMA subsystem alone",
+      "policy": "auto",
+      "transport": "rdma",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "rdma", "paths": {"nvme0c0n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": false,
+        "limitKB": 0,
+        "skipped": true,
+        "after": {"nvme0n1": 32768, "nvme0c0n1": 32768}
+      }
+    },
+    {
+      "name": "fixed value lowers whatever the transport and MDTS, never raises",
+      "policy": "2048",
+      "transport": "rdma",
+      "mdts": 11,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "rdma", "paths": {"nvme0c0n1": 1024}},
+            {"name": "nvme1", "state": "live", "transport": "rdma", "paths": {"nvme0c1n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": false,
+        "limitKB": 2048,
+        "skipped": false,
+        "after": {"nvme0n1": 2048, "nvme0c0n1": 1024, "nvme0c1n1": 2048}
+      }
+    },
+    {
+      "name": "fixed value above the current one changes nothing",
+      "policy": "65536",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": false,
+        "limitKB": 65536,
+        "skipped": false,
+        "after": {"nvme0n1": 32768, "nvme0c0n1": 32768}
+      }
+    },
+    {
+      "name": "off touches nothing",
+      "policy": "off",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": false,
+        "limitKB": 0,
+        "skipped": true,
+        "after": {"nvme0n1": 32768, "nvme0c0n1": 32768}
+      }
+    },
+    {
+      "name": "0 is off",
+      "policy": "0",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": false,
+        "limitKB": 0,
+        "skipped": true,
+        "after": {"nvme0n1": 32768, "nvme0c0n1": 32768}
+      }
+    },
+    {
+      "name": "a device that cannot be written fails the clamp",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}},
+            {"name": "nvme1", "state": "live", "transport": "tcp", "paths": {"nvme0c1n1": 32768}}
+          ]
+        }
+      ],
+      "unwritable": ["nvme0c1n1"],
+      "expect": {
+        "error": true,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme0n1": 4096, "nvme0c0n1": 4096, "nvme0c1n1": -1}
+      }
+    },
+    {
+      "name": "a subsystem missing from sysfs fails the clamp",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "nqn": "nqn.test:absent",
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": true,
+        "mdtsQueried": false,
+        "limitKB": 0,
+        "skipped": false,
+        "after": {"nvme0n1": 32768, "nvme0c0n1": 32768}
+      }
+    },
+    {
+      "name": "a live controller without its path device fails the clamp",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}},
+            {"name": "nvme1", "state": "live", "transport": "tcp", "paths": {}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": true,
+        "mdtsQueried": false,
+        "limitKB": 0,
+        "skipped": false,
+        "after": {"nvme0n1": 32768, "nvme0c0n1": 32768}
+      }
+    },
+    {
+      "name": "a reconnecting controller that never had a path device is reported, not waited for",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}},
+            {"name": "nvme1", "state": "connecting", "transport": "tcp", "paths": {}},
+            {"name": "nvme2", "state": "connecting", "transport": "tcp", "paths": {"nvme0c2n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "waiting": ["nvme1"],
+        "after": {"nvme0n1": 4096, "nvme0c0n1": 4096, "nvme0c2n1": 4096}
+      }
+    },
+    {
+      "name": "nvme_core.multipath=N: two subsystem directories, one namespace device per controller",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0n1": 32768}}
+          ]
+        },
+        {
+          "name": "nvme-subsys1",
+          "nqn": "nqn.test:vol",
+          "heads": {},
+          "controllers": [
+            {"name": "nvme1", "state": "live", "transport": "tcp", "paths": {"nvme1n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme0n1": 4096, "nvme1n1": 4096}
+      }
+    },
+    {
+      "name": "another subsystem on the node is left alone",
+      "policy": "auto",
+      "transport": "tcp",
+      "mdts": 0,
+      "subsystems": [
+        {
+          "name": "nvme-subsys0",
+          "nqn": "nqn.test:vol",
+          "heads": {"nvme0n1": 32768},
+          "controllers": [
+            {"name": "nvme0", "state": "live", "transport": "tcp", "paths": {"nvme0c0n1": 32768}}
+          ]
+        },
+        {
+          "name": "nvme-subsys1",
+          "nqn": "nqn.test:other",
+          "heads": {"nvme1n1": 32768},
+          "controllers": [
+            {"name": "nvme1", "state": "live", "transport": "tcp", "paths": {"nvme1c1n1": 32768}}
+          ]
+        }
+      ],
+      "expect": {
+        "error": false,
+        "mdtsQueried": true,
+        "limitKB": 4096,
+        "skipped": false,
+        "after": {"nvme0n1": 4096, "nvme0c0n1": 4096, "nvme1n1": 32768, "nvme1c1n1": 32768}
+      }
+    }
+  ]
+}

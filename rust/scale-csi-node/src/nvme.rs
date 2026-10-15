@@ -595,6 +595,23 @@ impl Nvme {
         bail!("could not find NQN for device {device}")
     }
 
+    /// A controller's MDTS, from `nvme id-ctrl /dev/nvmeN -o json`.
+    pub async fn id_ctrl_mdts(&self, controller: &str, deadline: Option<Instant>) -> Result<u32> {
+        if !is_controller_name(controller) {
+            bail!("invalid NVMe controller name {controller:?}");
+        }
+        let path = self.dev.join(controller);
+        let path = path.to_string_lossy();
+        let out = self
+            .runner
+            .run("nvme", &["id-ctrl", &path, "-o", "json"], self.limits(deadline))
+            .await?;
+        if !out.success() {
+            return Err(failure(&format!("NVMe id-ctrl {controller} failed"), &out));
+        }
+        crate::max_sectors::parse_mdts(&out.stdout).map_err(|e| anyhow!("{e}"))
+    }
+
     /// Writes a native multipath policy (`queue-depth`) for one subsystem.
     pub fn set_iopolicy(&self, subsystem: &str, policy: &str) -> Result<()> {
         if subsystem.is_empty() || subsystem == "." || subsystem == ".." || subsystem.contains('/') {

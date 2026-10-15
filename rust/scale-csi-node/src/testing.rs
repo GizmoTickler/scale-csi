@@ -627,6 +627,12 @@ pub struct FakeKernel {
     pub stale_polls: u32,
     /// Device name -> stats left that report the stale number.
     pub stale: BTreeMap<String, u32>,
+    /// What `nvme id-ctrl` reports as MDTS; `None` fails the command.
+    /// Default 0, as a TrueNAS 27 target does.
+    pub mdts: Option<u32>,
+    /// `queue/max_sectors_kb` of every new head and path device (the kernel's
+    /// default with MDTS=0 over TCP).
+    pub default_max_sectors_kb: u32,
     next_subsystem: u32,
     next_controller: u32,
 }
@@ -645,6 +651,8 @@ impl FakeKernel {
             on_rescan: None,
             stale_polls: 0,
             stale: BTreeMap::new(),
+            mdts: Some(0),
+            default_max_sectors_kb: 32768,
             next_subsystem: 0,
             next_controller: 0,
         }
@@ -689,6 +697,7 @@ impl FakeKernel {
             let namespace = format!("nvme{index}n1");
             std::fs::create_dir_all(dir.join(&namespace)).unwrap();
             std::fs::write(dir.join(&namespace).join("dev"), sysfs_dev(&namespace)).unwrap();
+            self.queue(&dir.join(&namespace));
             std::fs::write(dir.join("subsysnqn"), format!("{nqn}\n")).unwrap();
             std::fs::write(dir.join("iopolicy"), "numa").unwrap();
             std::fs::write(self.dev.join(&namespace), b"").unwrap();
@@ -699,6 +708,9 @@ impl FakeKernel {
         }
         // The subsystem links each of its controllers by name, as in the kernel.
         let index = self.subsystems[nqn].0;
+        // The controller's path device: a hidden gendisk, nvme<S>c<C>n<N>.
+        let number = controller.trim_start_matches("nvme");
+        self.queue(&dir.join(format!("nvme{index}c{number}n1")));
         let subsystem = self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}"));
         std::os::unix::fs::symlink(&dir, subsystem.join(&controller)).unwrap();
         let entry = self.subsystems.get_mut(nqn).unwrap();
@@ -706,6 +718,38 @@ impl FakeKernel {
             .1
             .push((controller.clone(), address.to_string(), state.to_string()));
         controller
+    }
+
+    fn queue(&self, disk: &Path) {
+        let queue = disk.join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(
+            queue.join("max_sectors_kb"),
+            format!("{}\n", self.default_max_sectors_kb),
+        )
+        .unwrap();
+    }
+
+    /// `queue/max_sectors_kb` of every head and path device of a subsystem,
+    /// by device name.
+    pub fn max_sectors_kb(&self, nqn: &str) -> BTreeMap<String, String> {
+        let (index, paths) = &self.subsystems[nqn];
+        let mut out = BTreeMap::new();
+        let head = format!("nvme{index}n1");
+        let subsystem = self.sys.join(format!("class/nvme-subsystem/nvme-subsys{index}"));
+        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap().trim().to_string();
+        out.insert(head.clone(), read(subsystem.join(&head).join("queue/max_sectors_kb")));
+        for (controller, _, _) in paths {
+            let disk = format!("nvme{index}c{}n1", controller.trim_start_matches("nvme"));
+            let queue = self
+                .sys
+                .join("class/nvme")
+                .join(controller)
+                .join(&disk)
+                .join("queue/max_sectors_kb");
+            out.insert(disk, read(queue));
+        }
+        out
     }
 
     /// The controller that founded a subsystem goes away while its other
@@ -792,6 +836,13 @@ impl FakeKernel {
                     output(1, &format!("{nqn} not found"))
                 }
             }
+            Some("id-ctrl") => match self.mdts {
+                Some(mdts) => output(
+                    0,
+                    &format!("{{\"vid\":0,\"sn\":\"fake\",\"mdts\":{mdts},\"subnqn\":\"nqn\"}}"),
+                ),
+                None => output(1, "identify controller: Input/output error"),
+            },
             Some("ns-rescan") => {
                 if let Some((file, content)) = &self.on_rescan {
                     std::fs::write(file, content).unwrap();

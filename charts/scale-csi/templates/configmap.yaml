@@ -223,6 +223,17 @@ data:
         keepAliveTmo: {{ $nvmeofConnect.keepAliveTmo }}
         {{- end }}
       {{- end }}
+      {{- /* Request-size clamp: renders ONLY when not auto (the drivers'
+           default), so a default install's ConfigMap carries no new key and
+           stays parseable by a rolled-back binary. A bare YAML `off` arrives
+           as boolean false, which the drivers also read as off. */}}
+      {{- $maxSectorsKB := "auto" }}
+      {{- if not (kindIs "invalid" $nvmeof.maxSectorsKB) }}
+      {{- $maxSectorsKB = toString $nvmeof.maxSectorsKB | trim | lower }}
+      {{- end }}
+      {{- if and (ne $maxSectorsKB "auto") (ne $maxSectorsKB "") }}
+      maxSectorsKB: {{ $maxSectorsKB | quote }}
+      {{- end }}
       {{- /* Userspace NVMe/TCP data path: renders ONLY when ublk is in use, so
            a default install's ConfigMap carries neither key and stays
            parseable by a rolled-back binary that has no such field. */}}

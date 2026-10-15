@@ -45,6 +45,10 @@ const (
 	EventReasonNVMeConnectFailed         = "NVMeConnectFailed"
 	EventReasonNVMePathDegraded          = "NVMePathDegraded"
 	EventReasonNVMeMultipathUnaggregated = "NVMeMultipathUnaggregated"
+	// EventReasonNVMeMaxSectorsClampFailed is emitted when a stage is refused
+	// because the NVMe-oF request-size clamp (nvmeof.maxSectorsKB) is required
+	// and could not be put in place on every device of the subsystem.
+	EventReasonNVMeMaxSectorsClampFailed = "NVMeMaxSectorsClampFailed"
 	EventReasonISCSIPathDegraded         = "ISCSIPathDegraded"
 	EventReasonISCSIMultipathUnavailable = "ISCSIMultipathUnavailable"
 	EventReasonNFSTrunkingDegraded       = "NFSTrunkingDegraded"

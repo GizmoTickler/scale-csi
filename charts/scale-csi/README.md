@@ -220,6 +220,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.port` | Target service ID/port | `4420` |
 | `nvmeof.subsystemHosts` | Allowed host NQNs | `[]` |
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
+| `nvmeof.maxSectorsKB` | Request-size clamp on the head and every path device of a kernel-initiator subsystem, applied before format/mount/publish and only ever lowered: `auto` (NVMe/TCP with MDTS=0, e.g. TrueNAS 27, to 4096 KiB), a whole number of KiB (>= 4), or `off`/`0` | `auto` |
 | `nvmeof.dataPath` | Node data path for volumes whose StorageClass does not set `nvmeof/dataPath`: `kernel` or `ublk` | `kernel` |
 | `nvmeof.ublk.enabled` | Allow StorageClasses to opt into the ublk data path while the default stays `kernel` | `false` |
 | `nvmeof.ublk.maxVolumesPerNode` | Volumes one node must be able to serve through ublk at once (`1..128`); sizes each volume's default layout, and is the advertised CSI volume limit when `dataPath=ublk` | `32` |

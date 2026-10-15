@@ -731,6 +731,24 @@ nvmeof:
     # --keep-alive-tmo (seconds). Unset (null, default) omits the flag.
     keepAliveTmo: null
 
+  # Request-size clamp for the kernel initiator (both node agents). The node
+  # writes queue/max_sectors_kb on the multipath head AND every path device
+  # (nvme<S>c<C>n<N>) of a subsystem after its paths are connected and before
+  # the volume is formatted, mounted or published, re-applies it on every
+  # re-stage and once per sessionGC.interval, and only ever LOWERS a value.
+  #   auto (default) — NVMe/TCP subsystems whose controller reports MDTS=0
+  #     are clamped to 4096 KiB. TrueNAS 27 (Linux 6.18 nvmet) rejects any
+  #     command larger than 4 MiB with "SGL invalid data" (sc 0xf, DNR) while
+  #     still reporting MDTS=0, and the initiator otherwise issues up to
+  #     32 MiB commands: I/O errors, ext4 remounts read-only. A controller
+  #     that reports MDTS is left to the kernel, which honors it.
+  #   a whole number (KiB, at least 4) — that ceiling on every subsystem,
+  #     whatever the transport or MDTS.
+  #   off (or 0) — never touch max_sectors_kb.
+  # A required clamp that cannot be applied fails the stage (retried by
+  # kubelet) instead of mounting unprotected. Not used by the ublk data path.
+  maxSectorsKB: auto
+
   # commandTimeout was removed: it was never wired to anything. The nvme CLI
   # timeout is commandTimeouts.nvme. The schema still accepts the old key
   # (ignored) so existing values files pass validation.
