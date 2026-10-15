@@ -1,6 +1,25 @@
-# Release notes — next (v1.25.0 draft)
+# Release notes — next (v1.25.1 draft)
 
-## v1.25.0 (draft) — TrueNAS 27 compatibility
+## v1.25.1 (draft) — dependency updates
+
+Nothing to configure; no behavior change. Dependency and CI maintenance on top of
+v1.25.0:
+
+- Kubernetes client libraries `k8s.io/{api,apimachinery,client-go}` v0.37.0 → v0.37.1.
+- `github.com/onsi/gomega` v1.43.1 → v1.44.0 (tests only).
+- Rust `libc` 0.2.190 (lockfile).
+- Runtime image `alpine:3.24` refreshed to the current digest.
+- CI: Helm v4.3.1; refreshed pinned digests for `github/codeql-action`,
+  `docker/setup-buildx-action`, `docker/build-push-action` and
+  `codecov/codecov-action`; the remaining unpinned `actions/checkout` is now
+  pinned by digest.
+
+### Rolling back to v1.25.0
+
+No configuration or data format changed; roll back by pinning the chart to
+1.25.0.
+
+## v1.25.0 — TrueNAS 27 compatibility
 
 Two fixes for TrueNAS 27.0 (Linux 6.18.52, middleware API v27): NVMe/TCP
 volumes no longer fail writes larger than 4 MiB, and encrypted volumes can be
