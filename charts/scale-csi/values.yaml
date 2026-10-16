@@ -1089,7 +1089,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+    image: registry.k8s.io/sig-storage/csi-provisioner:v6.4.0
     timeout: 300s
     workerThreads: 10
     extraArgs: []
