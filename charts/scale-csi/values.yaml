@@ -1089,7 +1089,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+    image: registry.k8s.io/sig-storage/csi-provisioner:v6.4.1
     timeout: 300s
     workerThreads: 10
     extraArgs: []
@@ -1106,7 +1106,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.13.1
     # Bounds the ControllerPublish/Unpublish (attach/detach) deadline. 120s keeps
     # a stuck TrueNAS publish from holding the external-attacher's --timeout for
     # 300s; the driver's own publish path is far faster after the P1 RTT cuts.
@@ -1126,7 +1126,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
+    image: registry.k8s.io/sig-storage/csi-resizer:v2.3.1
     # Bounds the ControllerExpandVolume deadline (see attacher note).
     timeout: 120s
     workerThreads: 10
@@ -1144,7 +1144,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.7.1
     timeout: 300s
     workerThreads: 10
     extraArgs: []
@@ -1170,7 +1170,7 @@ sidecars:
     healthProbe:
       enabled: true
       port: 9810
-    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.1
     resources:
       requests:
         cpu: 10m
@@ -1184,7 +1184,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.20.1
     resources:
       requests:
         cpu: 10m
